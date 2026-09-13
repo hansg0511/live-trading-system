@@ -1,5 +1,5 @@
 import pandas as pd
-from typing import Protocol, List
+from typing import Protocol, List, Any
 from datetime import datetime
 from .models import Order, Position, AccountBalance, MarketData, OrderStatus, Candlestick, TimeFrame
 
@@ -17,6 +17,18 @@ class BrokerAdapter(Protocol):
     def cancel_order(self, order_id: str) -> bool:
         ...
     def get_order_status(self, order_id: str) -> OrderStatus:
+        ...
+
+    # The execution engine uses these optional capabilities when present. They
+    # are deliberately kept small so fakes and other brokers can implement the
+    # safety workflow without importing the Moomoo SDK.
+    def get_open_orders(self) -> List[dict[str, Any]]:
+        ...
+
+    def get_recent_orders(self) -> List[dict[str, Any]]:
+        ...
+
+    def get_market_state(self, symbols: List[str]) -> dict[str, Any]:
         ...
 
 class MarketDataProvider(Protocol):

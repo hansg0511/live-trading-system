@@ -1,0 +1,48 @@
+# Credentials and local secrets
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Broker state, exports, and operational output
+data/*.db
+data/*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+logs/
+*.log
+account_exports/
+statements/
+
+# Session/agent/IDE state
+session-*.md
+.agents/
+.opencode/
+.vscode/
+.tmp_appdata/
+
+# Python/test/build caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
