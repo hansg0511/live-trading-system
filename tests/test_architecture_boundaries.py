@@ -51,9 +51,14 @@ PAIR_SPECIFIC_TOKENS = (
     "cointegration",
 )
 
-LEGACY_SMOKE_BLOBS = {
+HISTORICAL_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "9745ac57f654900128316d9d54a51705dc487cf9",
     "tests/test_sim_smoke.py": "25041eb2ed78cd6cc2a583d1d13109dbb724a945",
+}
+
+CURRENT_LEGACY_SMOKE_BLOBS = {
+    "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",
+    "tests/test_sim_smoke.py": "66ed2827b4ecc27b5447461495113a755d50e0e1",
 }
 
 
@@ -119,6 +124,16 @@ def _git_blob(root: Path, relative_path: str) -> str:
     return result.stdout.strip()
 
 
+def _git_blob_at_ref(root: Path, ref: str, relative_path: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{ref}:{relative_path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def _translator_sources() -> list[Path]:
     sources: list[Path] = []
     for path in _source_files(ROOT / "src"):
@@ -174,9 +189,9 @@ def test_translators_depend_on_core_when_present():
     assert not violations, "translator/core dependency direction is invalid:\n" + "\n".join(violations)
 
 
-@pytest.mark.parametrize("relative_path,expected_blob", LEGACY_SMOKE_BLOBS.items())
-def test_legacy_smoke_boundary_keeps_audit_blob(relative_path: str, expected_blob: str):
-    """The tagged legacy smoke script and its test are immutable boundaries."""
+@pytest.mark.parametrize("relative_path,expected_blob", CURRENT_LEGACY_SMOKE_BLOBS.items())
+def test_legacy_smoke_boundary_tracks_current_smoke_passed_blob(relative_path: str, expected_blob: str):
+    """The working legacy smoke artifacts remain an explicit revision."""
     git_root = _git_root()
     if git_root is None:
         pytest.skip("Git repository is not available; cannot verify audit blob")
@@ -188,6 +203,21 @@ def test_legacy_smoke_boundary_keeps_audit_blob(relative_path: str, expected_blo
     except (OSError, subprocess.CalledProcessError) as exc:
         pytest.skip(f"Git blob lookup unavailable: {exc}")
     assert actual_blob == expected_blob, (
-        f"{relative_path} changed from the broker-boundary-smoke-ready-20260913 "
-        f"baseline ({expected_blob}); create a separate smoke artifact for future generic routing"
+        f"{relative_path} changed from the current smoke-passed revision "
+        f"({expected_blob}); update the documented smoke boundary if intentional"
     )
+
+
+@pytest.mark.parametrize("relative_path,expected_blob", HISTORICAL_LEGACY_SMOKE_BLOBS.items())
+def test_legacy_smoke_historical_baseline_is_preserved(relative_path: str, expected_blob: str):
+    """The original smoke-ready tag remains available as an audit baseline."""
+    git_root = _git_root()
+    if git_root is None:
+        pytest.skip("Git repository is not available; cannot verify audit blob")
+    try:
+        actual_blob = _git_blob_at_ref(
+            git_root, "broker-boundary-smoke-ready-20260913", relative_path
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"Git historical blob lookup unavailable: {exc}")
+    assert actual_blob == expected_blob

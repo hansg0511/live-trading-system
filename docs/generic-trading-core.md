@@ -156,39 +156,47 @@ snapshot that proves the issue is absent. A failed or partial query must not
 clear an older block. REAL mutation remains blocked while any relevant issue
 is open; SIM smoke stages surface the same condition before submission.
 
-## Immutable legacy smoke boundary
+## Legacy smoke boundary and current broker evidence
 
-The existing supervised smoke harness is a tagged, legacy broker-boundary
-artifact. These files are the audit baseline and must remain byte-for-byte
-unchanged while generic-core work proceeds:
+The original supervised smoke harness is a tagged, legacy broker-boundary
+artifact. These files remain the historical audit baseline and are preserved
+byte-for-byte at the tag below:
 
 | Artifact | Baseline tag | Git blob |
 | --- | --- | --- |
 | `scripts/sim_smoke_test.py` | `broker-boundary-smoke-ready-20260913` | `9745ac57f654900128316d9d54a51705dc487cf9` |
 | `tests/test_sim_smoke.py` | `broker-boundary-smoke-ready-20260913` | `25041eb2ed78cd6cc2a583d1d13109dbb724a945` |
 
+The working branch contains a later smoke-hardened revision in commit
+`360e55c`. It adds the tightly scoped SIM external-order allowlist, OpenD
+order-query throttling protection, transient query-failure recovery, and
+regression tests. The revised legacy harness was then used for a supervised
+SIM entry/exit round trip that reconciled the broker flat. This is evidence
+for the legacy Moomoo boundary only; it is not evidence that the generic OMS
+has reached a broker.
+
 The legacy smoke path remains strategy-independent but is still wired to the
 existing `MooMooAdapter` + `ExecutionEngine` two-leg implementation. It is an
 integration boundary, not a generic-core consumer. Do not import it from the
 core, change it to exercise the new OMS, or use it as proof that generic
-multi-leg allocation works. A future generic smoke test must be a separate,
+multi-leg allocation works. A generic smoke test must remain a separate,
 explicit artifact with its own baseline.
 
-`smoke-ready` means only that the code checkpoint and its offline tests are
-ready for a future supervised US-session smoke. No OpenD preflight or broker
-submission was performed while creating the tag. It does **not** mean that an
-order was acknowledged, filled, exited, or reconciled flat. `smoke-passed`
-requires observing those broker facts during the later supervised test.
+`smoke-ready` refers only to the original tagged code checkpoint and its
+offline tests. `smoke-passed` now refers to the later supervised SIM run
+recorded by the smoke-hardened revision; it requires observing broker
+acknowledgement, fills, exit, and flat reconciliation. Neither designation
+proves generic-OMS broker integration.
 
 ## Migration status
 
 | Area | Status | Boundary statement |
 | --- | --- | --- |
 | Existing durable pair engine, SQLite ledger, fill idempotency, and Moomoo adapter | Implemented | Hardened two-leg path; remains legacy/pair-specific. |
-| Deterministic safety tests and legacy SIM smoke tests | Tested | Fake brokers and static gates; no broker proof. |
+| Deterministic safety tests and legacy SIM smoke tests | Tested | Fake-broker coverage plus a supervised SIM broker round trip. |
 | `src/trading_core/` provider-neutral domain boundary | Implemented and unit-tested | Domain, persistence, state machine, OMS, signed risk projection, and reconciliation primitives are SDK-free and strategy-free. |
 | Stat-arb intent translator | Implemented and unit-tested | Produces generic two-leg intents equivalent to representative legacy plans; it does not route them to a broker. |
-| Broker adapter translator into the generic port | Planned for Stage 4 | Keep the proven legacy path intact until a separate generic adapter boundary is implemented and supervised. |
+| Broker adapter translator into the generic port | Planned for roadmap Stage 1 | Keep the proven legacy path intact until a separate generic adapter boundary is implemented and supervised. |
 | Account books, virtual allocations, attempts, and UNKNOWN residual ledger | Implemented at contract/persistence depth | Allocations are updated from fill evidence and residual comparison is tested; production snapshot orchestration and operator workflows remain later work. |
 | Generic OMS against a real OpenD/broker account | Planned | Must be separately supervised and proven; generic OMS is currently fake-tested, not broker-proven. |
 
@@ -196,4 +204,5 @@ The generic layer is complete only when its durable intent/leg/attempt/fill
 model, account-wide signed risk projection, allocation ownership, and sticky
 reconciliation have deterministic tests and a separate supervised broker
 smoke. Passing the legacy smoke test is necessary evidence for the legacy
-adapter boundary but is not evidence that Stage 4 generic trading is complete.
+adapter boundary but is not evidence that generic Moomoo integration is
+complete.
