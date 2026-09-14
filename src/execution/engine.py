@@ -470,13 +470,15 @@ class ExecutionEngine:
         for issue in comparison.issues:
             self._record_issue(issue)
 
-        # Resolve only issues absent from this complete snapshot. A query
-        # failure never clears an old block.
+        # A complete broker snapshot proves that a prior transient query
+        # failure has recovered. Any actual broker/local mismatch is present
+        # in ``current_keys`` and remains open; a stale query-failure record
+        # must not permanently prevent a supervised recovery or exit.
         current_keys = {(issue.category, issue.entity_key) for issue in result.issues}
         current_keys.update(self._reconciliation_pass_issue_keys)
         for old in get_open_reconciliation_issues(self.db_path):
             key = (str(old["category"]), str(old["entity_key"]))
-            if key not in current_keys and key[0] != "broker_state_query_failed":
+            if key not in current_keys:
                 resolve_reconciliation_issue_by_key(key[0], key[1], self.db_path)
         # Persist the aggregate readiness after considering any old issues that
         # remain open (for example, a manually-created mismatch).

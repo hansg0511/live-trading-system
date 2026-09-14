@@ -117,6 +117,20 @@ class FakeNoTimestampAdapter(FakeSmokeAdapter):
         }
 
 
+class FakeKnownTerminalOrdersAdapter(FakeSmokeAdapter):
+    def __init__(self, *args, recent_orders=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recent_orders = recent_orders if recent_orders is not None else [
+            {"order_id": "3405094", "code": "US.AAPL", "trd_side": "SELL", "qty": 3, "order_status": "FILLED_ALL"},
+            {"order_id": "3404610", "code": "US.AAPL", "trd_side": "SELL", "qty": 3, "order_status": "CANCELLED_ALL"},
+            {"order_id": "3404570", "code": "US.EOG", "trd_side": "SELL", "qty": 46, "order_status": "FILLED_ALL"},
+            {"order_id": "3404609", "code": "US.SLB", "trd_side": "BUY", "qty": 218, "order_status": "FILLED_ALL"},
+        ]
+
+    def get_recent_orders(self):
+        return list(self._recent_orders)
+
+
 def _args(tmp_path, stage="preflight", **overrides):
     values = {
         "stage": stage,
@@ -245,6 +259,57 @@ def test_preflight_rejects_missing_snapshot_timestamp(tmp_path, monkeypatch):
 
     assert result["ready_for_submit"] is False
     assert any("no parseable update_time" in blocker for blocker in result["blockers"])
+
+
+def test_smoke_allowlist_permits_only_exact_known_terminal_orders(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUTU_TRD_ENV", "SIMULATE")
+
+    result = sim_smoke_test.run_stage(
+        _args(tmp_path, acc_id=5077333),
+        discoverer=lambda **_kwargs: [_account_row(5077333)],
+        adapter_factory=FakeKnownTerminalOrdersAdapter,
+        now_fn=_regular_monday,
+    )
+
+    assert result["ready_for_submit"] is True
+    assert result["reconciliation_ready"] is True
+    assert {row["order_id"] for row in result["permitted_terminal_external_orders"]} == {
+        "3405094", "3404610", "3404570", "3404609"
+    }
+
+
+def test_smoke_allowlist_does_not_permit_any_other_terminal_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUTU_TRD_ENV", "SIMULATE")
+    orders = [
+        {"order_id": "9999999", "code": "US.TSLA", "trd_side": "BUY", "qty": 1, "order_status": "FILLED_ALL"}
+    ]
+
+    result = sim_smoke_test.run_stage(
+        _args(tmp_path, acc_id=5077333),
+        discoverer=lambda **_kwargs: [_account_row(5077333)],
+        adapter_factory=lambda **kwargs: FakeKnownTerminalOrdersAdapter(recent_orders=orders, **kwargs),
+        now_fn=_regular_monday,
+    )
+
+    assert result["ready_for_submit"] is False
+    assert result["reconciliation_ready"] is False
+    assert result["permitted_terminal_external_orders"] == []
+    assert any(issue["entity_key"] == "9999999" for issue in result["reconciliation_issues"])
+
+
+def test_smoke_allowlist_is_disabled_for_any_other_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUTU_TRD_ENV", "SIMULATE")
+
+    result = sim_smoke_test.run_stage(
+        _args(tmp_path, acc_id=5077334),
+        discoverer=lambda **_kwargs: [_account_row(5077334)],
+        adapter_factory=FakeKnownTerminalOrdersAdapter,
+        now_fn=_regular_monday,
+    )
+
+    assert result["ready_for_submit"] is False
+    assert result["reconciliation_ready"] is False
+    assert result["permitted_terminal_external_orders"] == []
 
 
 def test_account_discovery_does_not_hide_second_eligible_account(monkeypatch):

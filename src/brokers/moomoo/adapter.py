@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import math
+import time
 from typing import Any, List
 
 import pandas as pd
@@ -42,6 +43,13 @@ _TRD_MARKET_NUMBER_TO_NAME = {
     "111": "MY",
     "112": "CA",
 }
+
+# OpenD limits ``order_list_query`` to 10 calls per 30 seconds.  A single
+# reconciliation pass reads the same broker-order snapshot several times
+# (recent orders, per-order status fallback, and open orders).  Keep that
+# pass coherent and within the broker limit, while refreshing frequently
+# enough for supervised order management.
+_ORDER_QUERY_CACHE_SECONDS = 3.5
 
 
 def _normalise_env(value: Any) -> str:
@@ -282,6 +290,7 @@ class MooMooAdapter(BrokerAdapter):
         # performing a second, potentially different account discovery call.
         self.account_rows: list[dict[str, Any]] = []
         self.account_row: dict[str, Any] | None = None
+        self._order_query_cache: tuple[float, list[dict[str, Any]]] | None = None
         self.trd_env = getattr(moo.TrdEnv, self.trd_env_name, None) if moo else None
         if self.trd_env_name == "REAL":
             if not self.enable_live_trading:
@@ -482,6 +491,7 @@ class MooMooAdapter(BrokerAdapter):
         create_time = str(_get(row, "create_time", "updated_time", default=""))
         order.order_id = str(order_id)
         order.status = OrderStatus.SUBMITTED
+        self._invalidate_order_query_cache()
         return order.order_id, create_time
 
     def cancel_order(self, order_id: str) -> bool:
@@ -493,6 +503,7 @@ class MooMooAdapter(BrokerAdapter):
         )
         if ret != 0:
             raise RuntimeError(f"cancel_order failed with ret={ret}: {data}")
+        self._invalidate_order_query_cache()
         return True
 
     def start_push(self) -> None:
@@ -508,13 +519,24 @@ class MooMooAdapter(BrokerAdapter):
             except Exception:
                 pass
 
+    def _invalidate_order_query_cache(self) -> None:
+        """Discard a stale order snapshot after a broker-side mutation."""
+        self._order_query_cache = None
+
     def _query_orders(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if self._order_query_cache is not None:
+            cached_at, cached_rows = self._order_query_cache
+            if now - cached_at < _ORDER_QUERY_CACHE_SECONDS:
+                return [dict(row) for row in cached_rows]
         ret, data = self.trade_context.order_list_query(
             trd_env=self.trd_env, acc_id=self._acc_id or 0, refresh_cache=True
         )
         if ret != 0:
             raise RuntimeError(f"order_list_query failed with ret={ret}: {data}")
-        return _as_records(data)
+        rows = _as_records(data)
+        self._order_query_cache = (now, rows)
+        return [dict(row) for row in rows]
 
     def get_open_orders(self) -> list[dict[str, Any]]:
         self._require_connected()

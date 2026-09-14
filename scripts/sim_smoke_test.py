@@ -69,6 +69,19 @@ HARD_MAX_GROSS_CAP = 5_000.0
 HARD_MAX_SNAPSHOT_AGE_SECONDS = 900
 REGULAR_STATES = {"MORNING", "AFTERNOON", "REGULAR", "OPEN"}
 ET_NAME = "America/New_York"
+# Temporary legacy-smoke exception for the terminal SIM orders manually
+# created while proving the app/OpenD extended-hours path. This is deliberately
+# not a general reconciliation policy: it applies only to this SIM account and
+# only if every field below still matches the broker response. Any unknown
+# order, non-terminal status, open order, or non-zero external position remains
+# a blocking condition.
+SMOKE_ALLOWLIST_ACCOUNT_ID = 5_077_333
+SMOKE_ALLOWED_TERMINAL_EXTERNAL_ORDERS = {
+    "3405094": {"symbol": "US.AAPL", "side": "SELL", "quantity": 3.0, "status": "FILLED_ALL"},
+    "3404610": {"symbol": "US.AAPL", "side": "SELL", "quantity": 3.0, "status": "CANCELLED_ALL"},
+    "3404570": {"symbol": "US.EOG", "side": "SELL", "quantity": 46.0, "status": "FILLED_ALL"},
+    "3404609": {"symbol": "US.SLB", "side": "BUY", "quantity": 218.0, "status": "FILLED_ALL"},
+}
 # ``OpenSecTradeContext.get_acc_list`` exposes ``trdmarket_auth`` as the
 # protobuf integer values in current moomoo-api releases (US=2, JP=15,
 # MY=111, ...), even though callers generally expect market names.
@@ -240,6 +253,74 @@ class SimAccount:
         result = asdict(self)
         result["trdmarket_auth"] = list(self.trdmarket_auth)
         return result
+
+
+class _SmokeTerminalOrderAllowlistAdapter:
+    """Expose a narrowly filtered broker-order view to the legacy smoke engine.
+
+    The underlying Moomoo account remains authoritative and all order actions
+    still go directly to it. Only four known, terminal external orders are
+    omitted from the engine's recent-order reconciliation input. This lets the
+    frozen smoke harness test its own submission path without treating our
+    already-flat, manually-created test activity as an unresolved mismatch.
+    """
+
+    def __init__(self, broker: Any, account_id: int):
+        self._broker = broker
+        self._allowlist_enabled = int(account_id) == SMOKE_ALLOWLIST_ACCOUNT_ID
+        self._permitted_terminal_orders: list[dict[str, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._broker, name)
+
+    @staticmethod
+    def _order_audit_row(row: Any, order_id: str, rule: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "order_id": order_id,
+            "symbol": _normalise_symbol(_get(row, "code", "symbol", default="")),
+            "side": _enum_name(_get(row, "trd_side", "side", default="")),
+            "quantity": _safe_float(_get(row, "qty", "quantity")),
+            "status": _enum_name(_get(row, "order_status", "status", default="")),
+            "allowlist_rule": dict(rule),
+        }
+
+    def _matches_known_terminal_order(self, row: Any) -> tuple[str, dict[str, Any]] | None:
+        if not self._allowlist_enabled:
+            return None
+        order_id = str(_get(row, "order_id", "id", "broker_order_id", default=""))
+        rule = SMOKE_ALLOWED_TERMINAL_EXTERNAL_ORDERS.get(order_id)
+        if rule is None:
+            return None
+        symbol = _normalise_symbol(_get(row, "code", "symbol", default=""))
+        side = _enum_name(_get(row, "trd_side", "side", default=""))
+        quantity = _safe_float(_get(row, "qty", "quantity"))
+        status = _enum_name(_get(row, "order_status", "status", default=""))
+        if (
+            symbol == rule["symbol"]
+            and side == rule["side"]
+            and quantity is not None
+            and math.isclose(quantity, rule["quantity"], rel_tol=0.0, abs_tol=1e-9)
+            and status == rule["status"]
+        ):
+            return order_id, rule
+        return None
+
+    def get_recent_orders(self) -> list[dict[str, Any]]:
+        rows = list(self._broker.get_recent_orders())
+        permitted: list[dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            match = self._matches_known_terminal_order(row)
+            if match is None:
+                filtered.append(row)
+                continue
+            order_id, rule = match
+            permitted.append(self._order_audit_row(row, order_id, rule))
+        self._permitted_terminal_orders = permitted
+        return filtered
+
+    def permitted_terminal_orders(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._permitted_terminal_orders]
 
 
 def _is_eligible_sim_account(row: Any, market: str = "US") -> bool:
@@ -734,12 +815,15 @@ def _prepare(
         except Exception:
             pass
         raise SmokeTestError("MooMooAdapter.connect() returned false")
-    engine = ExecutionEngine(adapter, config=config, db_path=db_path)
+    # Keep the legacy exception at the smoke-harness boundary. Neither the
+    # shared Moomoo adapter nor general reconciliation logic receives it.
+    smoke_adapter = _SmokeTerminalOrderAllowlistAdapter(adapter, account.acc_id)
+    engine = ExecutionEngine(smoke_adapter, config=config, db_path=db_path)
     return {
         "stage": stage,
         "db_path": db_path,
         "account": account,
-        "adapter": adapter,
+        "adapter": smoke_adapter,
         "engine": engine,
         "config": config,
         "symbols": symbols,
@@ -763,6 +847,11 @@ def _base_result(ctx: dict[str, Any]) -> dict[str, Any]:
         "blockers": [],
         "warnings": [],
     }
+
+
+def _add_permitted_terminal_order_audit(result: dict[str, Any], adapter: Any) -> None:
+    if isinstance(adapter, _SmokeTerminalOrderAllowlistAdapter):
+        result["permitted_terminal_external_orders"] = _as_output(adapter.permitted_terminal_orders())
 
 
 def _run_preflight(
@@ -894,6 +983,7 @@ def _run_preflight(
         result["reconciliation_issues"] = _as_output([asdict(issue) for issue in reconciliation.issues])
         if not reconciliation.ready:
             blockers.append(f"startup reconciliation has {len(reconciliation.issues)} unresolved issue(s)")
+    _add_permitted_terminal_order_audit(result, adapter)
 
     if ctx["stage"] == "exit":
         local_position = get_open_position(ctx["pair"], ctx["db_path"])
@@ -1080,6 +1170,7 @@ def _run_status(ctx: dict[str, Any]) -> dict[str, Any]:
             "broker_positions": [_position_output(item) for item in adapter.get_positions()],
             "open_orders": _as_output(list(adapter.get_open_orders())),
             "recent_orders": _as_output(list(adapter.get_recent_orders())),
+            "permitted_terminal_external_orders": _as_output(adapter.permitted_terminal_orders()),
             "local_open_positions": _as_output(get_all_open_positions(ctx["db_path"])),
             "local_orders": _as_output(get_all_orders(ctx["db_path"])),
             "ready_for_submit": False,

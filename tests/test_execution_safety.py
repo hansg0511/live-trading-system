@@ -508,6 +508,54 @@ def test_adapter_account_validation_is_fail_closed_for_sim_rows():
             adapter._validate_account_rows([invalid])
 
 
+def test_adapter_reuses_one_order_snapshot_until_invalidated():
+    class FakeTradeContext:
+        def __init__(self):
+            self.calls = 0
+
+        def order_list_query(self, **_kwargs):
+            self.calls += 1
+            return 0, [{"order_id": "broker-1", "order_status": "SUBMITTED"}]
+
+    adapter = MooMooAdapter(trd_env="SIMULATE", acc_id=123)
+    adapter._connected = True
+    adapter.trade_context = FakeTradeContext()
+
+    assert adapter.get_recent_orders() == [{"order_id": "broker-1", "order_status": "SUBMITTED"}]
+    assert adapter.get_open_orders() == [{"order_id": "broker-1", "order_status": "SUBMITTED"}]
+    assert adapter.trade_context.calls == 1
+
+    adapter._invalidate_order_query_cache()
+    adapter.get_recent_orders()
+    assert adapter.trade_context.calls == 2
+
+
+def test_successful_snapshot_clears_a_transient_broker_query_failure(tmp_path):
+    class FlakyBroker:
+        def __init__(self):
+            self.fail = True
+
+        def get_positions(self):
+            if self.fail:
+                raise RuntimeError("temporary OpenD throttle")
+            return []
+
+        def get_recent_orders(self):
+            return []
+
+    path = tmp_path / "transient-query.db"
+    init_db(path)
+    broker = FlakyBroker()
+    engine = ExecutionEngine(broker, config=make_config(path))
+
+    assert not engine.startup_reconcile().ready
+    assert any(issue["category"] == "broker_state_query_failed" for issue in get_open_reconciliation_issues(path))
+
+    broker.fail = False
+    assert engine.startup_reconcile().ready
+    assert not get_open_reconciliation_issues(path)
+
+
 def test_real_engine_allows_fake_order_only_when_armed(tmp_path):
     path = tmp_path / "real.db"
     init_db(path)
