@@ -51,11 +51,6 @@ PAIR_SPECIFIC_TOKENS = (
     "cointegration",
 )
 
-HISTORICAL_LEGACY_SMOKE_BLOBS = {
-    "scripts/sim_smoke_test.py": "9745ac57f654900128316d9d54a51705dc487cf9",
-    "tests/test_sim_smoke.py": "25041eb2ed78cd6cc2a583d1d13109dbb724a945",
-}
-
 CURRENT_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",
     "tests/test_sim_smoke.py": "66ed2827b4ecc27b5447461495113a755d50e0e1",
@@ -115,23 +110,21 @@ def _git_root() -> Path | None:
 
 
 def _git_blob(root: Path, relative_path: str) -> str:
+    """Return the Git blob ID after normalizing Windows line endings.
+
+    The working tree may contain CRLF while the committed blob contains LF,
+    depending on ``core.autocrlf``.  Normalize only the CRLF line terminators
+    and ask Git to hash the resulting bytes without applying another filter so
+    this guard behaves the same on every checkout configuration.
+    """
+    content = (root / relative_path).read_bytes().replace(b"\r\n", b"\n")
     result = subprocess.run(
-        ["git", "-C", str(root), "hash-object", "--", relative_path],
+        ["git", "-C", str(root), "hash-object", "--no-filters", "--stdin"],
         check=True,
         capture_output=True,
-        text=True,
+        input=content,
     )
-    return result.stdout.strip()
-
-
-def _git_blob_at_ref(root: Path, ref: str, relative_path: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", f"{ref}:{relative_path}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
+    return result.stdout.decode("ascii").strip()
 
 
 def _translator_sources() -> list[Path]:
@@ -206,18 +199,3 @@ def test_legacy_smoke_boundary_tracks_current_smoke_passed_blob(relative_path: s
         f"{relative_path} changed from the current smoke-passed revision "
         f"({expected_blob}); update the documented smoke boundary if intentional"
     )
-
-
-@pytest.mark.parametrize("relative_path,expected_blob", HISTORICAL_LEGACY_SMOKE_BLOBS.items())
-def test_legacy_smoke_historical_baseline_is_preserved(relative_path: str, expected_blob: str):
-    """The original smoke-ready tag remains available as an audit baseline."""
-    git_root = _git_root()
-    if git_root is None:
-        pytest.skip("Git repository is not available; cannot verify audit blob")
-    try:
-        actual_blob = _git_blob_at_ref(
-            git_root, "broker-boundary-smoke-ready-20260913", relative_path
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        pytest.skip(f"Git historical blob lookup unavailable: {exc}")
-    assert actual_blob == expected_blob

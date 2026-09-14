@@ -24,15 +24,19 @@ It does not provide atomic multi-leg execution: the two equity legs are
 separate broker orders and can fill at different times. The generic execution
 supervisor must therefore manage partial-fill states explicitly.
 
-## Stage 0 — Consolidate the baseline
+## Stage 0 — Consolidate the baseline (complete)
 
-Carry the smoke-tested commit `ab47c82` onto `generic-trading-core`. Update
-the generic-core documentation so it distinguishes the original legacy
-baseline from the current smoke-passed revision. Keep the legacy smoke test
-as a separate regression artifact.
+The `generic-trading-core` branch carries the generic domain/OMS baseline and
+the later smoke-hardened legacy revision (`360e55c`, equivalent to the
+source-branch revision `ab47c82`). The generic-core documentation distinguishes
+the original legacy baseline from the current smoke-passed revision, and the
+legacy smoke test remains a separate regression artifact. The completed
+checkpoint is tagged `generic-stage0-complete-20260915`.
 
-**Done when:** the generic branch is clean, its full test suite passes, and
-the documented baseline matches the code. This stage makes no broker calls.
+**Completed evidence:** the branch was clean when the checkpoint was created,
+the full offline test suite passed, and the documented baseline matched the
+code. This stage made no broker calls. Later maintenance commits do not alter
+the tagged checkpoint.
 
 ## Stage 1 — Build the generic Moomoo bridge
 

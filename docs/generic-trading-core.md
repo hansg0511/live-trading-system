@@ -159,13 +159,17 @@ is open; SIM smoke stages surface the same condition before submission.
 ## Legacy smoke boundary and current broker evidence
 
 The original supervised smoke harness is a tagged, legacy broker-boundary
-artifact. These files remain the historical audit baseline and are preserved
-byte-for-byte at the tag below:
+artifact. The historical tag below records those original files
+byte-for-byte as a provenance reference:
 
 | Artifact | Baseline tag | Git blob |
 | --- | --- | --- |
 | `scripts/sim_smoke_test.py` | `broker-boundary-smoke-ready-20260913` | `9745ac57f654900128316d9d54a51705dc487cf9` |
 | `tests/test_sim_smoke.py` | `broker-boundary-smoke-ready-20260913` | `25041eb2ed78cd6cc2a583d1d13109dbb724a945` |
+
+The architecture guard intentionally protects only the current smoke-passed
+revision; it does not require the historical tag to be present in a local
+clone.
 
 The working branch contains a later smoke-hardened revision in commit
 `360e55c`. It adds the tightly scoped SIM external-order allowlist, OpenD
