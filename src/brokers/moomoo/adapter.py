@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import ast
 import json
-import math
 import time
 from typing import Any, List
 
-import pandas as pd
 from src.core.interfaces import BrokerAdapter
 from src.core.models import AccountBalance, Order, OrderSide, OrderStatus, OrderType, Position
 from src.db.positions_db import (
@@ -17,6 +14,15 @@ from src.db.positions_db import (
     record_fill_event,
     resolve_db_path,
     update_order_status,
+)
+from .common import (
+    TRD_MARKET_NUMBER_TO_NAME as _TRD_MARKET_NUMBER_TO_NAME,
+    as_records as _as_records,
+    get_value as _get,
+    normalise_env as _normalise_env,
+    parse_market_auth as _parse_market_auth,
+    safe_float as _safe_float,
+    status_name as _status_name,
 )
 
 try:
@@ -28,109 +34,12 @@ except (ImportError, OSError, PermissionError):  # pragma: no cover - SDK/loggin
 _TradeOrderBase = moo.TradeOrderHandlerBase if moo is not None else object
 _TradeDealBase = moo.TradeDealHandlerBase if moo is not None else object
 
-# Current moomoo-api responses expose ``trdmarket_auth`` as protobuf integer
-# values. Keep account authorization checks independent of whether OpenD/SDK
-# has already converted those values to names.
-_TRD_MARKET_NUMBER_TO_NAME = {
-    "1": "HK",
-    "2": "US",
-    "3": "CN",
-    "4": "HKCC",
-    "5": "FUTURES",
-    "6": "SG",
-    "8": "AU",
-    "15": "JP",
-    "111": "MY",
-    "112": "CA",
-}
-
 # OpenD limits ``order_list_query`` to 10 calls per 30 seconds.  A single
 # reconciliation pass reads the same broker-order snapshot several times
 # (recent orders, per-order status fallback, and open orders).  Keep that
 # pass coherent and within the broker limit, while refreshing frequently
 # enough for supervised order management.
 _ORDER_QUERY_CACHE_SECONDS = 3.5
-
-
-def _normalise_env(value: Any) -> str:
-    if value is None:
-        return ""
-    name = getattr(value, "name", None)
-    value = name or value
-    text = str(value).upper()
-    return text.split(".")[-1]
-
-
-def _as_records(data: Any) -> list[dict[str, Any]]:
-    if data is None:
-        return []
-    if isinstance(data, pd.DataFrame):
-        return data.to_dict("records")
-    if isinstance(data, list):
-        return [dict(item) if isinstance(item, dict) else item for item in data]
-    if hasattr(data, "to_dict"):
-        try:
-            return data.to_dict("records")
-        except Exception:
-            return []
-    return []
-
-
-def _get(row: Any, *keys: str, default: Any = None) -> Any:
-    if row is None:
-        return default
-    if isinstance(row, dict):
-        for key in keys:
-            if key in row and row[key] is not None:
-                return row[key]
-        return default
-    for key in keys:
-        try:
-            value = row[key]
-            if value is not None:
-                return value
-        except Exception:
-            pass
-        if hasattr(row, key):
-            value = getattr(row, key)
-            if value is not None:
-                return value
-    return default
-
-
-def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return number if math.isfinite(number) else default
-
-
-def _parse_market_auth(value: Any) -> set[str]:
-    def _market_name(item: Any) -> str:
-        normalized = _normalise_env(item)
-        return _TRD_MARKET_NUMBER_TO_NAME.get(normalized, normalized)
-
-    if value is None:
-        return set()
-    if isinstance(value, (list, tuple, set)):
-        return {_market_name(item) for item in value}
-    text = str(value).strip()
-    try:
-        parsed = ast.literal_eval(text)
-        if isinstance(parsed, (list, tuple, set)):
-            return {_market_name(item) for item in parsed}
-    except (SyntaxError, ValueError):
-        pass
-    return {
-        _TRD_MARKET_NUMBER_TO_NAME.get(part.strip().upper().split(".")[-1], part.strip().upper().split(".")[-1])
-        for part in text.replace(";", ",").split(",")
-        if part.strip()
-    }
-
-
-def _status_name(value: Any) -> str:
-    return _normalise_env(value)
 
 
 class _TradeOrderPushHandler(_TradeOrderBase):

@@ -10,6 +10,8 @@ import pytest
 
 from src.trading_core import (
     Account,
+    ExecutionPolicy,
+    ExecutionSession,
     IntentAction,
     OrderIntent,
     OrderLeg,
@@ -126,6 +128,15 @@ def test_order_leg_rejects_non_positive_quantity(quantity: Decimal) -> None:
 def test_order_intent_rejects_empty_legs() -> None:
     with pytest.raises(ValueError, match="at least one leg"):
         _intent(())
+
+
+def test_execution_session_is_distinct_from_legacy_extended_hours_toggle() -> None:
+    assert ExecutionPolicy().execution_session is ExecutionSession.REGULAR
+    assert ExecutionPolicy(allow_extended_hours=True).execution_session is ExecutionSession.EXTENDED
+    assert ExecutionPolicy(execution_session=ExecutionSession.OVERNIGHT).allow_extended_hours is False
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ExecutionPolicy(allow_extended_hours=True, execution_session=ExecutionSession.OVERNIGHT)
 
 
 def test_order_intent_rejects_duplicate_leg_ids() -> None:

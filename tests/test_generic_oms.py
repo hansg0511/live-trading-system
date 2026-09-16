@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -12,6 +13,7 @@ from src.trading_core.domain import (
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     ExecutionPolicy,
+    ExecutionSession,
     Fill,
     Instrument,
     IntentAction,
@@ -215,6 +217,27 @@ def test_duplicate_intent_returns_existing_state_without_resubmission(tmp_path):
     assert len(adapter.submit_calls) == 1
 
 
+def test_oms_propagates_the_explicit_extended_hours_toggle_to_the_adapter(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    order_intent = replace(make_intent(1), execution_policy=ExecutionPolicy(allow_extended_hours=True))
+
+    GenericOMS(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+
+    assert adapter.submit_calls[0].allow_extended_hours is True
+
+
+def test_oms_propagates_the_explicit_overnight_session_to_the_adapter(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    order_intent = replace(make_intent(1), execution_policy=ExecutionPolicy(execution_session=ExecutionSession.OVERNIGHT))
+
+    GenericOMS(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+
+    assert adapter.submit_calls[0].execution_session is ExecutionSession.OVERNIGHT
+    assert adapter.submit_calls[0].allow_extended_hours is False
+
+
 def test_mixed_leg_states_remain_visible_after_later_rejection(tmp_path):
     repository = ready_repository(tmp_path, 3)
     adapter = FakeAdapter(repository, reject_call=2)
@@ -232,6 +255,30 @@ def test_mixed_leg_states_remain_visible_after_later_rejection(tmp_path):
     assert len(adapter.submit_calls) == 2
 
 
+def test_definite_no_submit_rejection_stops_before_later_leg_and_stays_terminal(tmp_path):
+    repository = ready_repository(tmp_path, 3)
+    adapter = FakeAdapter(repository, reject_call=1)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(3)
+
+    result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+
+    assert result["status"] == IntentStatus.REJECTED.value
+    assert [leg["status"] for leg in result["legs"]] == [
+        LegStatus.REJECTED.value,
+        LegStatus.PLANNED.value,
+        LegStatus.PLANNED.value,
+    ]
+    assert len(adapter.submit_calls) == 1
+    assert repository.open_reconciliation_issues("acct") == []
+    attempt = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
+    assert attempt["status"] == BrokerOrderStatus.REJECTED.value
+    assert attempt["external_order_id"] is None
+    metadata = json.loads(attempt["metadata_json"])
+    assert metadata["definite_no_submit"] is True
+    assert metadata["error"] == "rejected"
+
+
 def test_ambiguous_submit_is_not_retried_and_requires_reconciliation(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository, ambiguous_call=1)
@@ -243,6 +290,69 @@ def test_ambiguous_submit_is_not_retried_and_requires_reconciliation(tmp_path):
     assert result["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
     assert repository.broker_orders_for_leg(order_intent.legs[0].id)[0]["status"] == BrokerOrderStatus.UNKNOWN.value
     assert len(adapter.submit_calls) == 1
+
+
+def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_path):
+    repository = ready_repository(tmp_path, 2)
+    order_intent = make_intent(2)
+    repository.create_intent(order_intent)
+    repository.transition_intent(order_intent.id, IntentStatus.RISK_APPROVED)
+    repository.transition_intent(order_intent.id, IntentStatus.SUBMITTING)
+    repository.transition_leg(order_intent.legs[0].id, LegStatus.SUBMITTING)
+    repository.create_broker_order(
+        broker_order_id="rejected-attempt",
+        order_leg_id=order_intent.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=1,
+        client_order_id="rejected-client",
+        submitted_quantity=Decimal("10"),
+    )
+    repository.transition_broker_order("rejected-attempt", BrokerOrderStatus.SUBMITTING)
+    repository.record_submission(
+        "rejected-attempt",
+        status=BrokerOrderStatus.REJECTED,
+        external_order_id=None,
+        metadata={"provider_status": "REJECTED", "error": "Paper trading does not support overnight trading sessions"},
+    )
+    repository.transition_leg(order_intent.legs[0].id, LegStatus.REJECTED)
+    repository.transition_intent(order_intent.id, IntentStatus.RECONCILIATION_REQUIRED)
+
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    oms._require_reconciliation(
+        order_intent.id,
+        account(),
+        category="BROKER_QUERY_FAILED",
+        entity_type="ACCOUNT",
+        entity_key="acct:fills",
+        details={"message": "Paper trading does not support deal data."},
+    )
+    oms._require_reconciliation(
+        order_intent.id,
+        account(),
+        category="UNRELATED",
+        entity_type="ACCOUNT",
+        entity_key="acct:unrelated",
+        details={"message": "must remain open"},
+    )
+
+    class NoFillHistoryAdapter(FakeAdapter):
+        def get_fills(self, _account, since=None):
+            raise AssertionError("clean no-submit rejection must not query deal history")
+
+    recovered = GenericOMS(repository, NoFillHistoryAdapter(repository)).recover_intent(
+        order_intent.id,
+        account=account(),
+    )
+
+    assert recovered["status"] == IntentStatus.REJECTED.value
+    assert [leg["status"] for leg in recovered["legs"]] == [
+        LegStatus.REJECTED.value,
+        LegStatus.PLANNED.value,
+    ]
+    remaining = repository.open_reconciliation_issues("acct")
+    assert [issue["issue_key"] for issue in remaining] == ["UNRELATED:ACCOUNT:acct:unrelated"]
 
 
 def test_restart_recovers_exact_client_order_match_without_submit(tmp_path):
@@ -310,6 +420,15 @@ def test_restart_applies_broker_fill_facts_and_broker_truth_wins(tmp_path):
     ]
     adapter.fills = [
         BrokerFill(
+            external_order_id="older-unrelated-order",
+            external_fill_id="older-unrelated-fill",
+            dedupe_key="older-unrelated-fill",
+            quantity=Decimal("1"),
+            price=Decimal("50"),
+            filled_at=NOW,
+            received_at=NOW,
+        ),
+        BrokerFill(
             external_order_id=attempt["external_order_id"],
             external_fill_id="deal-recovered",
             dedupe_key="deal-recovered",
@@ -326,6 +445,150 @@ def test_restart_applies_broker_fill_facts_and_broker_truth_wins(tmp_path):
     assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
     assert len(repository.fills_for_leg(order_intent.legs[0].id)) == 1
     assert repository.position_allocations("acct")[0]["signed_quantity"] == "10"
+    assert repository.open_reconciliation_issues("acct") == []
+
+
+def test_recovery_keeps_reconciliation_when_one_leg_is_only_partial(tmp_path):
+    repository = ready_repository(tmp_path, 2)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(2)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    attempts = [repository.broker_orders_for_leg(leg.id)[0] for leg in order_intent.legs]
+    adapter.open_orders = [
+        BrokerOrderSnapshot(
+            id="filled-snapshot",
+            broker_snapshot_id="snapshot",
+            account_id="acct",
+            instrument_id="instrument-0",
+            external_order_id=attempts[0]["external_order_id"],
+            client_order_id=attempts[0]["client_order_id"],
+            side=Side.BUY,
+            quantity=Decimal("10"),
+            filled_quantity=Decimal("10"),
+            status=BrokerOrderStatus.FILLED,
+            captured_at=NOW,
+        ),
+        BrokerOrderSnapshot(
+            id="partial-snapshot",
+            broker_snapshot_id="snapshot",
+            account_id="acct",
+            instrument_id="instrument-1",
+            external_order_id=attempts[1]["external_order_id"],
+            client_order_id=attempts[1]["client_order_id"],
+            side=Side.SELL,
+            quantity=Decimal("10"),
+            filled_quantity=Decimal("5"),
+            status=BrokerOrderStatus.PARTIALLY_FILLED,
+            captured_at=NOW,
+        ),
+    ]
+    adapter.fills = [
+        BrokerFill(
+            external_order_id=attempts[0]["external_order_id"],
+            external_fill_id=None,
+            dedupe_key="synthetic-filled-leg-0",
+            quantity=Decimal("10"),
+            price=Decimal("101"),
+            filled_at=NOW,
+            received_at=NOW,
+        )
+    ]
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert [leg["status"] for leg in recovered["legs"]] == [
+        LegStatus.FILLED.value,
+        LegStatus.RECONCILIATION_REQUIRED.value,
+    ]
+    assert any(issue["category"] == "FILL_EVIDENCE_REQUIRED" for issue in repository.open_reconciliation_issues("acct"))
+
+
+def test_recovery_resolves_exact_unsupported_fill_issue_after_all_legs_are_evidenced(tmp_path):
+    repository = ready_repository(tmp_path, 2)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(2)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    attempts = [repository.broker_orders_for_leg(leg.id)[0] for leg in order_intent.legs]
+    adapter.open_orders = [
+        BrokerOrderSnapshot(
+            id=f"filled-snapshot-{index}",
+            broker_snapshot_id="snapshot",
+            account_id="acct",
+            instrument_id=f"instrument-{index}",
+            external_order_id=attempt["external_order_id"],
+            client_order_id=attempt["client_order_id"],
+            side=Side.BUY if index == 0 else Side.SELL,
+            quantity=Decimal("10"),
+            filled_quantity=Decimal("10"),
+            status=BrokerOrderStatus.FILLED,
+            captured_at=NOW,
+        )
+        for index, attempt in enumerate(attempts)
+    ]
+    adapter.fills = [
+        BrokerFill(
+            external_order_id=attempt["external_order_id"],
+            external_fill_id=None,
+            dedupe_key=f"synthetic-filled-leg-{index}",
+            quantity=Decimal("10"),
+            price=Decimal("101") if index == 0 else Decimal("201"),
+            filled_at=NOW,
+            received_at=NOW,
+        )
+        for index, attempt in enumerate(attempts)
+    ]
+    oms._require_reconciliation(
+        order_intent.id,
+        account(),
+        category="BROKER_QUERY_FAILED",
+        entity_type="ACCOUNT",
+        entity_key="acct:fills",
+        details={"intent_id": order_intent.id, "message": "Paper trading does not support deal data."},
+    )
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.FILLED.value
+    assert [leg["status"] for leg in recovered["legs"]] == [LegStatus.FILLED.value, LegStatus.FILLED.value]
+    assert repository.open_reconciliation_issues("acct") == []
+
+
+def test_recovery_keeps_unsupported_or_ambiguous_fill_query_reconciliation(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    order_intent = make_intent(1)
+
+    class BrokenHistoryAdapter(FakeAdapter):
+        def get_fills(self, _account, since=None):
+            raise RuntimeError("deal history transport failure")
+
+    adapter = BrokenHistoryAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    attempt = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
+    adapter.open_orders = [
+        BrokerOrderSnapshot(
+            id="filled-snapshot",
+            broker_snapshot_id="snapshot",
+            account_id="acct",
+            instrument_id="instrument-0",
+            external_order_id=attempt["external_order_id"],
+            client_order_id=attempt["client_order_id"],
+            side=Side.BUY,
+            quantity=Decimal("10"),
+            filled_quantity=Decimal("10"),
+            status=BrokerOrderStatus.FILLED,
+            captured_at=NOW,
+        )
+    ]
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
+    assert any(issue["category"] == "BROKER_QUERY_FAILED" for issue in repository.open_reconciliation_issues("acct"))
 
 
 def test_open_reconciliation_issue_blocks_new_submission(tmp_path):

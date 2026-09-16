@@ -937,6 +937,23 @@ class SQLiteTradingRepository:
                 (_timestamp(resolved_at or utc_now()), issue_id),
             )
 
+    def resolve_reconciliation_issue_by_key(
+        self,
+        account_id: str,
+        issue_key: str,
+        *,
+        resolved_at: datetime | None = None,
+    ) -> bool:
+        """Resolve one known evidence-gap issue after its evidence is durable."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE core_reconciliation_issues
+                   SET status = 'RESOLVED', resolved_at = ?
+                   WHERE account_id = ? AND issue_key = ? AND status = 'OPEN'""",
+                (_timestamp(resolved_at or utc_now()), account_id, issue_key),
+            )
+            return cursor.rowcount > 0
+
     def open_reconciliation_issues(self, account_id: str) -> list[dict[str, Any]]:
         with self.transaction() as conn:
             return [

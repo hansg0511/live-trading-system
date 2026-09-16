@@ -27,6 +27,14 @@ class TradingEnvironment(_ValueEnum):
     LIVE = "LIVE"
 
 
+class ExecutionSession(_ValueEnum):
+    """Provider-neutral session selection for an execution request."""
+
+    REGULAR = "REGULAR"
+    EXTENDED = "EXTENDED"
+    OVERNIGHT = "OVERNIGHT"
+
+
 class AssetClass(_ValueEnum):
     EQUITY = "EQUITY"
     OPTION = "OPTION"
@@ -210,6 +218,27 @@ def _enum(value: object, enum_type: type[_ValueEnum], field_name: str):
         return value if isinstance(value, enum_type) else enum_type(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid {field_name}: {value!r}") from exc
+
+
+def _normalise_execution_session(
+    value: object,
+    allow_extended_hours: bool,
+) -> tuple[ExecutionSession, bool]:
+    """Resolve the session while retaining the legacy extended-hours alias."""
+
+    session = _enum(value, ExecutionSession, "execution_session")
+    if not isinstance(allow_extended_hours, bool):
+        raise ValueError("allow_extended_hours must be a bool")
+    if allow_extended_hours:
+        if session is ExecutionSession.REGULAR:
+            session = ExecutionSession.EXTENDED
+        elif session is not ExecutionSession.EXTENDED:
+            raise ValueError("allow_extended_hours cannot be combined with a non-extended execution_session")
+    elif session is ExecutionSession.EXTENDED:
+        # An explicit generic session remains compatible with adapters that
+        # still inspect the legacy boolean field.
+        allow_extended_hours = True
+    return session, allow_extended_hours
 
 
 def _nonnegative_int(value: object, field_name: str) -> int:
@@ -436,8 +465,10 @@ class ExecutionPolicy:
     max_attempts: int = 1
     timeout_seconds: int = 300
     require_native_atomicity: bool = False
+    allow_extended_hours: bool = False
     required_capabilities: frozenset[str] = frozenset()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_session: ExecutionSession = ExecutionSession.REGULAR
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "legging_policy", _enum(self.legging_policy, LeggingPolicy, "legging_policy"))
@@ -447,6 +478,12 @@ class ExecutionPolicy:
         object.__setattr__(self, "timeout_seconds", _positive_int(self.timeout_seconds, "timeout_seconds"))
         if not isinstance(self.require_native_atomicity, bool):
             raise ValueError("require_native_atomicity must be a bool")
+        session, allow_extended_hours = _normalise_execution_session(
+            self.execution_session,
+            self.allow_extended_hours,
+        )
+        object.__setattr__(self, "execution_session", session)
+        object.__setattr__(self, "allow_extended_hours", allow_extended_hours)
         object.__setattr__(self, "required_capabilities", frozenset(str(value).strip() for value in self.required_capabilities if str(value).strip()))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
 
@@ -903,6 +940,7 @@ __all__ = [
     "BrokerOrderStatus",
     "BrokerSnapshot",
     "ExecutionPolicy",
+    "ExecutionSession",
     "FailurePolicy",
     "Fill",
     "Instrument",

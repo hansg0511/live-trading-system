@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+import json
 import uuid
 
 from .domain import (
@@ -183,6 +186,8 @@ class GenericOMS:
             order_leg=leg,
             client_order_id=client_order_id,
             attempt_number=attempt_number,
+            allow_extended_hours=intent.execution_policy.allow_extended_hours,
+            execution_session=intent.execution_policy.execution_session,
         )
         try:
             result = self.adapter.submit_order(account, request)
@@ -196,25 +201,40 @@ class GenericOMS:
             self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED)
             return "ambiguous"
 
-        if result.broker_order_id != broker_order_id or self._is_ambiguous(result):
+        if result.broker_order_id != broker_order_id:
             self.repository.record_submission(
                 broker_order_id,
                 status=BrokerOrderStatus.UNKNOWN,
                 external_order_id=result.external_order_id,
-                metadata={"provider_status": result.status.value, "error": result.error_message},
+                metadata=self._submission_metadata(result),
             )
             self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED)
             return "ambiguous"
 
-        if result.accepted is False or result.status is BrokerOrderStatus.REJECTED:
+        # A provider can reject a request before creating any broker-side
+        # order.  Only this narrow, positively identified outcome is safe to
+        # finish as a rejection; all other rejection-shaped responses remain
+        # reconciliation-required because they may hide a submitted order or
+        # fill.
+        if self._is_definite_no_submit_rejection(result):
             self.repository.record_submission(
                 broker_order_id,
                 status=BrokerOrderStatus.REJECTED,
                 external_order_id=result.external_order_id,
-                metadata={"provider_status": result.status.value, "error": result.error_message},
+                metadata=self._submission_metadata(result, definite_no_submit=True),
             )
             self.repository.transition_leg(leg.id, LegStatus.REJECTED)
             return "rejected"
+
+        if self._is_ambiguous(result) or result.accepted is False or result.status is BrokerOrderStatus.REJECTED:
+            self.repository.record_submission(
+                broker_order_id,
+                status=BrokerOrderStatus.UNKNOWN,
+                external_order_id=result.external_order_id,
+                metadata=self._submission_metadata(result),
+            )
+            self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED)
+            return "ambiguous"
 
         accepted_status = result.status
         if accepted_status not in {
@@ -245,6 +265,62 @@ class GenericOMS:
     @staticmethod
     def _is_ambiguous(result: BrokerSubmissionResult) -> bool:
         return bool(result.ambiguous or result.accepted is None or (result.accepted and not result.external_order_id))
+
+    @classmethod
+    def _is_definite_no_submit_rejection(cls, result: BrokerSubmissionResult) -> bool:
+        return bool(
+            result.accepted is False
+            and result.status is BrokerOrderStatus.REJECTED
+            and not result.ambiguous
+            and result.external_order_id is None
+            and result.cumulative_filled_quantity == 0
+            and not cls._payload_has_submission_evidence(result.raw_payload)
+        )
+
+    @staticmethod
+    def _payload_has_submission_evidence(payload: object) -> bool:
+        """Return true when optional provider payload contains order/fill facts."""
+        if isinstance(payload, Mapping):
+            for key, value in payload.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                if normalized in {"order_id", "orderid", "external_order_id", "broker_order_id"}:
+                    if value not in (None, "", 0, "0"):
+                        return True
+                if normalized in {
+                    "filled_qty",
+                    "dealt_qty",
+                    "filled_quantity",
+                    "cumulative_filled_quantity",
+                }:
+                    try:
+                        if Decimal(str(value)) > 0:
+                            return True
+                    except (InvalidOperation, TypeError, ValueError):
+                        return True
+                if normalized in {"fills", "deals", "fill_list", "deal_list"} and value:
+                    return True
+                if GenericOMS._payload_has_submission_evidence(value):
+                    return True
+        elif isinstance(payload, (list, tuple)):
+            return any(GenericOMS._payload_has_submission_evidence(item) for item in payload)
+        return False
+
+    @staticmethod
+    def _submission_metadata(
+        result: BrokerSubmissionResult,
+        *,
+        definite_no_submit: bool = False,
+    ) -> dict:
+        return {
+            "accepted": result.accepted,
+            "ambiguous": result.ambiguous,
+            "provider_status": result.status.value,
+            "error_code": result.error_code,
+            "error": result.error_message,
+            "reported_cumulative_fill": str(result.cumulative_filled_quantity),
+            "raw_payload": dict(result.raw_payload),
+            "definite_no_submit": definite_no_submit,
+        }
 
     def _require_reconciliation(
         self,
@@ -402,7 +478,14 @@ class GenericOMS:
                         details={"broker_status": target.value},
                     )
 
-        self._recover_fills(intent_id, account)
+        # A clean provider rejection is already complete broker evidence: no
+        # external order ID, no fill quantity, and no matching open order.  Do
+        # not ask a broker for account-wide deal history in that case.  Some
+        # SIM APIs reject deal-history queries, and that query failure must not
+        # turn a known no-submit rejection into a false reconciliation issue.
+        clean_rejection = self._restore_definite_rejection(intent_id, account, open_orders)
+        if self._intent_needs_fill_recovery(intent_id, open_orders) and not clean_rejection:
+            self._recover_fills(intent_id, account)
 
         recovered = self._required_intent(intent_id)
         leg_statuses = {leg["status"] for leg in recovered["legs"]}
@@ -411,6 +494,138 @@ class GenericOMS:
             if recovered["status"] != target.value:
                 self.repository.transition_intent(intent_id, target)
         return self._required_intent(intent_id)
+
+    def _restore_definite_rejection(
+        self,
+        intent_id: str,
+        account: Account,
+        open_orders: tuple[BrokerOrderSnapshot, ...],
+    ) -> bool:
+        """Restore a persisted clean no-submit rejection without broad cleanup."""
+        intent = self._required_intent(intent_id)
+        if intent["status"] not in {
+            IntentStatus.REJECTED.value,
+            IntentStatus.RECONCILIATION_REQUIRED.value,
+        }:
+            return False
+        rejected_legs: list[dict] = []
+        for leg in intent["legs"]:
+            attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
+            if not attempts:
+                if leg["status"] == LegStatus.PLANNED.value:
+                    continue
+                return False
+            if leg["status"] not in {
+                LegStatus.REJECTED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                return False
+            if not all(self._is_durable_no_submit_rejection(attempt, leg, open_orders) for attempt in attempts):
+                return False
+            if leg["status"] == LegStatus.RECONCILIATION_REQUIRED.value:
+                self.repository.transition_leg(str(leg["id"]), LegStatus.REJECTED)
+            rejected_legs.append(leg)
+
+        if not rejected_legs:
+            return False
+
+        recovered = self._required_intent(intent_id)
+        if any(
+            leg["status"] not in {LegStatus.REJECTED.value, LegStatus.PLANNED.value}
+            for leg in recovered["legs"]
+        ):
+            return False
+        if any(
+            leg["status"] == LegStatus.PLANNED.value
+            and self.repository.broker_orders_for_leg(str(leg["id"]))
+            for leg in recovered["legs"]
+        ):
+            return False
+
+        for leg in rejected_legs:
+            # Resolve only the exact leg issue that named this rejected leg;
+            # unrelated account or order issues remain sticky.
+            self.repository.resolve_reconciliation_issue_by_key(
+                account.id,
+                f"INCOMPLETE_INTENT:ORDER_LEG:{leg['id']}",
+            )
+
+        # Older generic smoke runs created this account/fills issue while
+        # polling a known no-submit rejection.  The key is intentionally
+        # narrow: no other reconciliation category is cleared here.
+        self.repository.resolve_reconciliation_issue_by_key(
+            account.id,
+            f"BROKER_QUERY_FAILED:ACCOUNT:{account.id}:fills",
+        )
+        if recovered["status"] != IntentStatus.REJECTED.value:
+            self.repository.transition_intent(intent_id, IntentStatus.REJECTED)
+        return True
+
+    @classmethod
+    def _is_durable_no_submit_rejection(
+        cls,
+        attempt: dict,
+        leg: dict,
+        open_orders: tuple[BrokerOrderSnapshot, ...],
+    ) -> bool:
+        if attempt["status"] != BrokerOrderStatus.REJECTED.value:
+            return False
+        if attempt["external_order_id"]:
+            return False
+        try:
+            if Decimal(str(leg["cumulative_filled_quantity"])) != 0:
+                return False
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        metadata = cls._attempt_metadata(attempt)
+        if str(metadata.get("provider_status", "")).upper() != BrokerOrderStatus.REJECTED.value:
+            return False
+        if metadata.get("accepted") not in (None, False):
+            return False
+        if metadata.get("ambiguous") is True:
+            return False
+        if cls._payload_has_submission_evidence(metadata.get("raw_payload", {})):
+            return False
+        if any(
+            attempt["client_order_id"]
+            and item.client_order_id == attempt["client_order_id"]
+            for item in open_orders
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _attempt_metadata(attempt: dict) -> dict:
+        value = attempt.get("metadata_json", {})
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _intent_needs_fill_recovery(
+        self,
+        intent_id: str,
+        open_orders: tuple[BrokerOrderSnapshot, ...],
+    ) -> bool:
+        intent = self._required_intent(intent_id)
+        for leg in intent["legs"]:
+            status = leg["status"]
+            if status not in {LegStatus.PLANNED.value, LegStatus.REJECTED.value}:
+                return True
+            if self.repository.fills_for_leg(str(leg["id"])):
+                return True
+            attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
+            for attempt in attempts:
+                if attempt["external_order_id"] or attempt["status"] != BrokerOrderStatus.REJECTED.value:
+                    return True
+                if not self._is_durable_no_submit_rejection(attempt, leg, open_orders):
+                    return True
+        return False
 
     def _recover_fills(self, intent_id: str, account: Account) -> None:
         """Apply broker deal facts to known attempts; never infer fills from status."""
@@ -423,7 +638,7 @@ class GenericOMS:
                 category="BROKER_QUERY_FAILED",
                 entity_type="ACCOUNT",
                 entity_key=f"{account.id}:fills",
-                details={"message": str(exc)},
+                details={"intent_id": intent_id, "message": str(exc)},
             )
             return
 
@@ -441,6 +656,11 @@ class GenericOMS:
                 for attempt in attempts
                 if attempt["external_order_id"] == broker_fill.external_order_id
             ]
+            # ``get_fills`` is account-scoped. Historical fills belonging to
+            # another strategy or an earlier completed intent carry no
+            # evidence about this intent and must not manufacture a blocker.
+            if not matches:
+                continue
             if len(matches) != 1:
                 self._require_reconciliation(
                     intent_id,
@@ -476,6 +696,67 @@ class GenericOMS:
                     metadata=broker_fill.metadata,
                 )
             )
+
+        # A broker status can arrive before its deal record. Once durable fill
+        # evidence has made a leg fully filled, close only that exact evidence
+        # gap; never resolve unrelated reconciliation findings.
+        recovered = self._required_intent(intent_id)
+        for leg in recovered["legs"]:
+            if leg["status"] != LegStatus.FILLED.value:
+                continue
+            for attempt in self.repository.broker_orders_for_leg(str(leg["id"])):
+                self.repository.resolve_reconciliation_issue_by_key(
+                    account.id,
+                    f"FILL_EVIDENCE_REQUIRED:BROKER_ORDER:{attempt['id']}",
+                )
+
+        # Moomoo SIM can leave a durable account-wide deal-query error from a
+        # prior recovery even though its order list now supplies complete,
+        # terminal fill facts.  Resolve that one issue only when every leg of
+        # this exact intent has durable positive fill evidence; partial,
+        # ambiguous, or unfilled intents remain reconciliation-required.
+        if self._all_legs_have_fill_evidence(intent_id):
+            self._resolve_exact_fill_query_issue(account, intent_id)
+
+    def _all_legs_have_fill_evidence(self, intent_id: str) -> bool:
+        intent = self._required_intent(intent_id)
+        if not intent["legs"]:
+            return False
+        for leg in intent["legs"]:
+            if leg["status"] != LegStatus.FILLED.value:
+                return False
+            try:
+                requested = Decimal(str(leg["quantity"]))
+                cumulative = Decimal(str(leg["cumulative_filled_quantity"]))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if requested <= 0 or cumulative != requested:
+                return False
+            if not self.repository.fills_for_leg(str(leg["id"])):
+                return False
+            attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
+            if not any(
+                attempt["status"] == BrokerOrderStatus.FILLED.value
+                and bool(attempt["external_order_id"])
+                for attempt in attempts
+            ):
+                return False
+        return True
+
+    def _resolve_exact_fill_query_issue(self, account: Account, intent_id: str) -> None:
+        issue_key = f"BROKER_QUERY_FAILED:ACCOUNT:{account.id}:fills"
+        for issue in self.repository.open_reconciliation_issues(account.id):
+            if issue.get("issue_key") != issue_key:
+                continue
+            details = issue.get("details_json", {})
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except (TypeError, ValueError):
+                    details = {}
+            if isinstance(details, dict) and details.get("intent_id") == intent_id:
+                self.repository.resolve_reconciliation_issue_by_key(account.id, issue_key)
+                return
 
     def apply_fill(self, fill) -> bool:
         return self.repository.record_fill(fill)

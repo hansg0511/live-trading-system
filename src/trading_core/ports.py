@@ -14,6 +14,7 @@ from .domain import (
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     BrokerSnapshot,
+    ExecutionSession,
     Instrument,
     InstrumentMapping,
     MappingPurpose,
@@ -21,6 +22,7 @@ from .domain import (
     PositionSnapshot,
     _enum,
     _mapping,
+    _normalise_execution_session,
     _nonnegative_decimal,
     _optional_id,
     _positive_int,
@@ -39,7 +41,9 @@ class BrokerSubmitRequest:
     order_leg: OrderLeg
     attempt_number: int = 1
     client_order_id: str | None = None
+    allow_extended_hours: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_session: ExecutionSession = ExecutionSession.REGULAR
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "broker_order_id", _required_id(self.broker_order_id, "broker_order_id"))
@@ -49,7 +53,15 @@ class BrokerSubmitRequest:
             raise ValueError("order_leg must be an OrderLeg")
         object.__setattr__(self, "attempt_number", _positive_int(self.attempt_number, "attempt_number"))
         object.__setattr__(self, "client_order_id", _optional_id(self.client_order_id, "client_order_id"))
+        if not isinstance(self.allow_extended_hours, bool):
+            raise ValueError("allow_extended_hours must be a bool")
         object.__setattr__(self, "metadata", _mapping(self.metadata))
+        session, allow_extended_hours = _normalise_execution_session(
+            self.execution_session,
+            self.allow_extended_hours,
+        )
+        object.__setattr__(self, "execution_session", session)
+        object.__setattr__(self, "allow_extended_hours", allow_extended_hours)
 
 @dataclass(frozen=True, slots=True)
 class BrokerSubmissionResult:
