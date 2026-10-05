@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "mode": "SIM_SUBMIT",
+  "state_db": "data/stage6-pilot-sim-20261001.db",
+  "market": "US",
+  "security_firm": "FUTUINC",
+  "account": {
+    "id": "moomoo:sim:5077333",
+    "broker": "moomoo",
+    "environment": "SIM",
+    "external_account_id": "5077333",
+    "base_currency": "USD",
+    "enabled": true,
+    "created_at": "2026-10-01T13:25:00+00:00",
+    "updated_at": "2026-10-01T13:25:00+00:00",
+    "metadata": {
+      "purpose": "operator-approved Stage 6 controlled SIM pilot",
+      "market": "US",
+      "security_firm": "FUTUINC",
+      "allocation_capacity": "20",
+      "account_capacity": "20",
+      "capacity_unit": "FRACTION"
+    }
+  },
+  "strategy": {
+    "id": "stage6-controlled-sim-20261001",
+    "name": "Stage 6 controlled combined-book SIM pilot",
+    "strategy_type": "generic_stat_arb_pilot",
+    "version": "1",
+    "enabled": true,
+    "created_at": "2026-10-01T13:25:00+00:00",
+    "updated_at": "2026-10-01T13:25:00+00:00",
+    "config": {
+      "pilot_mode": "operator-approved-two-sleeve-smoke",
+      "signal_source": "operator-approved",
+      "strategy_parameters": "not used by controlled smoke"
+    },
+    "metadata": {
+      "stage": 6,
+      "sim_only": true,
+      "rth_only": true
+    }
+  },
+  "books": [
+    {
+      "id": "stage6-book-a-20261001",
+      "name": "Stage 6 Book A",
+      "enabled": true,
+      "created_at": "2026-10-01T13:25:00+00:00",
+      "updated_at": "2026-10-01T13:25:00+00:00",
+      "metadata": {
+        "pilot_role": "sleeve-a",
+        "capacity_unit": "FRACTION"
+      }
+    },
+    {
+      "id": "stage6-book-b-20261001",
+      "name": "Stage 6 Book B",
+      "enabled": true,
+      "created_at": "2026-10-01T13:25:00+00:00",
+      "updated_at": "2026-10-01T13:25:00+00:00",
+      "metadata": {
+        "pilot_role": "sleeve-b",
+        "capacity_unit": "FRACTION"
+      }
+    }
+  ],
+  "sleeves": [
+    {
+      "sleeve_id": "stage6-sleeve-a-20261001",
+      "strategy_id": "stage6-controlled-sim-20261001",
+      "account_id": "moomoo:sim:5077333",
+      "book_id": "stage6-book-a-20261001",
+      "name": "Stage 6 Sleeve A",
+      "version": "1",
+      "enabled": true,
+      "configuration": {
+        "pilot_pair": "AAPL-MSFT",
+        "signal_source": "operator-approved-entry-exit"
+      },
+      "pair": [
+        {
+          "instrument_id": "stage6:us-aapl",
+          "symbol": "AAPL",
+          "moomoo_symbol": "US.AAPL",
+          "venue": "US",
+          "currency": "USD"
+        },
+        {
+          "instrument_id": "stage6:us-msft",
+          "symbol": "MSFT",
+          "moomoo_symbol": "US.MSFT",
+          "venue": "US",
+          "currency": "USD"
+        }
+      ]
+    },
+    {
+      "sleeve_id": "stage6-sleeve-b-20261001",
+      "strategy_id": "stage6-controlled-sim-20261001",
+      "account_id": "moomoo:sim:5077333",
+      "book_id": "stage6-book-b-20261001",
+      "name": "Stage 6 Sleeve B",
+      "version": "1",
+      "enabled": true,
+      "configuration": {
+        "pilot_pair": "SPY-QQQ",
+        "signal_source": "operator-approved-entry-exit"
+      },
+      "pair": [
+        {
+          "instrument_id": "stage6:us-spy",
+          "symbol": "SPY",
+          "moomoo_symbol": "US.SPY",
+          "venue": "US",
+          "currency": "USD"
+        },
+        {
+          "instrument_id": "stage6:us-qqq",
+          "symbol": "QQQ",
+          "moomoo_symbol": "US.QQQ",
+          "venue": "US",
+          "currency": "USD"
+        }
+      ]
+    }
+  ],
+  "allocation_update": {
+    "account_id": "moomoo:sim:5077333",
+    "version": 1,
+    "effective_at": "2026-10-01T13:25:00+00:00",
+    "provenance": "operator-approved-50-50-stage6-sim-20261001",
+    "targets": [
+      {
+        "sleeve_id": "stage6-sleeve-a-20261001",
+        "book_id": "stage6-book-a-20261001",
+        "target_weight": 0.5,
+        "capacity_unit": "FRACTION"
+      },
+      {
+        "sleeve_id": "stage6-sleeve-b-20261001",
+        "book_id": "stage6-book-b-20261001",
+        "target_weight": 0.5,
+        "capacity_unit": "FRACTION"
+      }
+    ]
+  },
+  "targets": [
+    {
+      "sleeve_id": "stage6-sleeve-a-20261001",
+      "cycle_id": "stage6-20261002-rth-flat-cycle-a-185530",
+      "signal_id": "stage6-20261002-rth-flat-signal-a-185530",
+      "instrument_ids": ["stage6:us-aapl", "stage6:us-msft"],
+      "signed_quantities": [2, -2],
+      "action": "EXIT",
+      "evaluated_at": "2026-10-02T18:55:30.000Z",
+      "provenance": {
+        "source": "operator-approved",
+        "approval_scope": "SIM account 5077333 only",
+        "session": "REGULAR"
+      }
+    },
+    {
+      "sleeve_id": "stage6-sleeve-b-20261001",
+      "cycle_id": "stage6-20261002-rth-flat-cycle-b-185530",
+      "signal_id": "stage6-20261002-rth-flat-signal-b-185530",
+      "instrument_ids": ["stage6:us-spy", "stage6:us-qqq"],
+      "signed_quantities": [2, -2],
+      "action": "EXIT",
+      "evaluated_at": "2026-10-02T18:55:30.000Z",
+      "provenance": {
+        "source": "operator-approved",
+        "approval_scope": "SIM account 5077333 only",
+        "session": "REGULAR"
+      }
+    }
+  ],
+  "require_flat_entry": true,
+  "execution_policy": {
+    "rth_handoff_policy": "RTH_ONLY",
+    "execution_session": "REGULAR",
+    "allow_extended_hours": false,
+    "legging_policy": "SEQUENTIAL",
+    "partial_fill_policy": "WAIT",
+    "failure_policy": "HOLD_AND_RECONCILE",
+    "max_attempts": 1,
+    "timeout_seconds": 300,
+    "stale_order_seconds": 300
+  }
+}

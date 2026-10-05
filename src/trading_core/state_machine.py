@@ -13,8 +13,8 @@ StatusT = TypeVar("StatusT", bound=Enum)
 
 
 INTENT_TRANSITIONS: Mapping[IntentStatus, frozenset[IntentStatus]] = {
-    IntentStatus.CREATED: frozenset({IntentStatus.RISK_APPROVED, IntentStatus.REJECTED, IntentStatus.FAILED}),
-    IntentStatus.RISK_APPROVED: frozenset({IntentStatus.SUBMITTING, IntentStatus.REJECTED, IntentStatus.FAILED}),
+    IntentStatus.CREATED: frozenset({IntentStatus.RISK_APPROVED, IntentStatus.REJECTED, IntentStatus.FAILED, IntentStatus.RECONCILIATION_REQUIRED}),
+    IntentStatus.RISK_APPROVED: frozenset({IntentStatus.SUBMITTING, IntentStatus.REJECTED, IntentStatus.FAILED, IntentStatus.RECONCILIATION_REQUIRED}),
     IntentStatus.SUBMITTING: frozenset(
         {
             IntentStatus.WORKING,
@@ -29,6 +29,7 @@ INTENT_TRANSITIONS: Mapping[IntentStatus, frozenset[IntentStatus]] = {
         {
             IntentStatus.PARTIALLY_FILLED,
             IntentStatus.FILLED,
+            IntentStatus.REJECTED,
             IntentStatus.CANCELLED,
             IntentStatus.FAILED,
             IntentStatus.RECONCILIATION_REQUIRED,
@@ -37,6 +38,7 @@ INTENT_TRANSITIONS: Mapping[IntentStatus, frozenset[IntentStatus]] = {
     IntentStatus.PARTIALLY_FILLED: frozenset(
         {
             IntentStatus.FILLED,
+            IntentStatus.REJECTED,
             IntentStatus.CANCELLED,
             IntentStatus.FAILED,
             IntentStatus.RECONCILIATION_REQUIRED,
@@ -81,6 +83,7 @@ LEG_TRANSITIONS: Mapping[LegStatus, frozenset[LegStatus]] = {
         {
             LegStatus.PARTIALLY_FILLED,
             LegStatus.FILLED,
+            LegStatus.REJECTED,
             LegStatus.CANCELLED,
             LegStatus.FAILED,
             LegStatus.RECONCILIATION_REQUIRED,
@@ -89,6 +92,7 @@ LEG_TRANSITIONS: Mapping[LegStatus, frozenset[LegStatus]] = {
     LegStatus.PARTIALLY_FILLED: frozenset(
         {
             LegStatus.FILLED,
+            LegStatus.REJECTED,
             LegStatus.CANCELLED,
             LegStatus.FAILED,
             LegStatus.RECONCILIATION_REQUIRED,
@@ -132,6 +136,7 @@ BROKER_ORDER_TRANSITIONS: Mapping[BrokerOrderStatus, frozenset[BrokerOrderStatus
         {
             BrokerOrderStatus.PARTIALLY_FILLED,
             BrokerOrderStatus.FILLED,
+            BrokerOrderStatus.REJECTED,
             BrokerOrderStatus.CANCELLED,
             BrokerOrderStatus.FAILED,
             BrokerOrderStatus.UNKNOWN,
@@ -140,6 +145,7 @@ BROKER_ORDER_TRANSITIONS: Mapping[BrokerOrderStatus, frozenset[BrokerOrderStatus
     BrokerOrderStatus.PARTIALLY_FILLED: frozenset(
         {
             BrokerOrderStatus.FILLED,
+            BrokerOrderStatus.REJECTED,
             BrokerOrderStatus.CANCELLED,
             BrokerOrderStatus.FAILED,
             BrokerOrderStatus.UNKNOWN,

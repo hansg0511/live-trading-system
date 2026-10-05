@@ -20,11 +20,11 @@ from src.trading_core.domain import (
     PositionSnapshot,
     Side,
 )
-from src.trading_core.ports import BrokerFill, BrokerSubmissionResult
+from src.trading_core.ports import BrokerFactSnapshot, BrokerFill, BrokerSubmissionResult
 from src.trading_core.repository import SQLiteTradingRepository
 
 
-NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 class FakeGenericMoomooAdapter:
@@ -49,11 +49,19 @@ class FakeGenericMoomooAdapter:
         self.connected = False
         return True
 
+    @staticmethod
+    def _now():
+        # Keep provider facts close to the injected-at-construction wall clock
+        # used by the real smoke flow; the generic OMS must reject stale
+        # broker evidence, so a module-level timestamp would become invalid
+        # while this test module is running.
+        return datetime.now(timezone.utc)
+
     def get_capabilities(self, _account):
         return BrokerCapabilities(broker="moomoo", supports_fill_read=True, supports_submit=True, supports_cancel=True)
 
     def get_snapshot(self, account):
-        return BrokerSnapshot(id="snapshot", account_id=account.id, captured_at=NOW, status="COMPLETE")
+        return BrokerSnapshot(id="snapshot", account_id=account.id, captured_at=self._now(), status="COMPLETE")
 
     def get_balances(self, _account):
         return AccountBalanceSnapshot(id="balance", broker_snapshot_id="snapshot", currency="USD", cash=Decimal("10000"), buying_power=Decimal("10000"), equity=Decimal("10000"))
@@ -67,7 +75,7 @@ class FakeGenericMoomooAdapter:
         return tuple(
             PositionSnapshot(
                 id=f"position:{instrument_id}", broker_snapshot_id="snapshot", account_id=account.id,
-                instrument_id=instrument_id, signed_quantity=quantity, average_price=Decimal("100"), captured_at=NOW,
+                instrument_id=instrument_id, signed_quantity=quantity, average_price=Decimal("100"), captured_at=self._now(),
             )
             for instrument_id, quantity in totals.items()
             if quantity != 0
@@ -87,8 +95,8 @@ class FakeGenericMoomooAdapter:
                 dedupe_key=f"fill-{external_id}",
                 quantity=request.order_leg.quantity,
                 price=request.order_leg.limit_price or Decimal("100"),
-                filled_at=NOW,
-                received_at=NOW,
+                filled_at=self._now(),
+                received_at=self._now(),
             )
         )
         return BrokerSubmissionResult(
@@ -106,14 +114,34 @@ class FakeGenericMoomooAdapter:
             id=f"snapshot:{external_order_id}", broker_snapshot_id="snapshot", account_id=account.id,
             instrument_id=leg.instrument_id, external_order_id=external_order_id, client_order_id=request.client_order_id,
             side=leg.side, quantity=leg.quantity, filled_quantity=leg.quantity,
-            status=BrokerOrderStatus.FILLED, captured_at=NOW,
+            status=BrokerOrderStatus.FILLED, captured_at=self._now(),
         )
 
     def get_fills(self, _account, since=None):
         return tuple(self._fills)
 
+    def get_account_facts(self, account):
+        return BrokerFactSnapshot(
+            account_id=account.id,
+            captured_at=self._now(),
+            complete=True,
+            positions=tuple(self.get_positions(account)),
+            open_orders=tuple(self.get_open_orders(account)),
+            fills=tuple(self._fills),
+        )
+
+    def get_authoritative_account_facts(self, account):
+        return self.get_account_facts(account)
+
     def cancel_order(self, _account, external_order_id):
-        return BrokerSubmissionResult(broker_order_id=f"cancel:{external_order_id}", accepted=True, status=BrokerOrderStatus.CANCELLED, external_order_id=external_order_id)
+        return BrokerSubmissionResult(
+            broker_order_id=f"cancel:{external_order_id}",
+            accepted=True,
+            status=BrokerOrderStatus.CANCELLED,
+            external_order_id=external_order_id,
+            cumulative_filled_quantity=Decimal("0"),
+            no_fill_asserted=True,
+        )
 
     def replace_order(self, _account, external_order_id, _changes):
         return BrokerSubmissionResult(broker_order_id=f"replace:{external_order_id}", accepted=True, status=BrokerOrderStatus.WORKING, external_order_id=external_order_id)
@@ -129,10 +157,19 @@ class RejectingGenericMoomooAdapter(FakeGenericMoomooAdapter):
             client_order_id=request.client_order_id,
             error_code="SIM_OVERNIGHT_UNSUPPORTED",
             error_message="Paper trading does not support overnight trading sessions",
+            cumulative_filled_quantity=Decimal("0"),
+            no_submit_asserted=True,
+            no_fill_asserted=True,
         )
 
     def get_fills(self, _account, since=None):
-        raise AssertionError("known no-submit rejection must not poll unsupported SIM deal history")
+        # The account-wide pre-submit safety gate may perform a read before
+        # the rejection is known.  Once the provider has returned its
+        # definite no-submit result, recovery must not poll unsupported deal
+        # history for that clean rejection.
+        if self.requests:
+            raise AssertionError("known no-submit rejection must not poll unsupported SIM deal history")
+        return ()
 
 
 def args(tmp_path, stage="preflight", **overrides):

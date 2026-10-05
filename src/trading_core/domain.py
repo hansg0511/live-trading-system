@@ -99,6 +99,33 @@ class BrokerOrderStatus(_ValueEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ExecutionEvidenceMode(_ValueEnum):
+    """Provider-neutral description of execution evidence available.
+
+    ``INDIVIDUAL_DEALS`` identifies immutable provider deal rows.  Some SIM
+    providers cannot expose deal rows but do expose an authenticated order
+    snapshot with cumulative dealt quantity; that is deliberately a separate
+    mode and must never be represented as a fabricated deal ID.
+    """
+
+    INDIVIDUAL_DEALS = "INDIVIDUAL_DEALS"
+    CUMULATIVE_ORDER_SNAPSHOTS = "CUMULATIVE_ORDER_SNAPSHOTS"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+# Set by an adapter when a normalized order snapshot came from its
+# authenticated order-query path.  This provenance is kept separate from
+# provider metadata so expected order identity fields in a raw row do not
+# look like untrusted submission evidence.
+ADAPTER_ORDER_SNAPSHOT_AUTHORITY = "ADAPTER_ORDER_SNAPSHOT"
+# Set by an adapter only after it has positively validated a non-terminal
+# submission acknowledgement: the bound order exists, cumulative/dealt
+# quantity is exactly zero, and the raw response contains no contradictory
+# fill/deal evidence.  This is intentionally distinct from a terminal order
+# snapshot authority.
+ADAPTER_SUBMISSION_ACK_AUTHORITY = "ADAPTER_SUBMISSION_ACK"
+
+
 class LeggingPolicy(_ValueEnum):
     SEQUENTIAL = "SEQUENTIAL"
     PARALLEL = "PARALLEL"
@@ -135,6 +162,11 @@ class ReconciliationStatus(_ValueEnum):
 
 
 class IssueStatus(_ValueEnum):
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+
+
+class RecoveryActionStatus(_ValueEnum):
     OPEN = "OPEN"
     RESOLVED = "RESOLVED"
 
@@ -449,12 +481,42 @@ class BookAllocation:
         object.__setattr__(self, "effective_at", _utc_datetime(self.effective_at, "effective_at"))
         if self.expires_at is not None:
             object.__setattr__(self, "expires_at", _utc_datetime(self.expires_at, "expires_at"))
+            if self.expires_at <= self.effective_at:
+                raise ValueError("expires_at must be after effective_at")
+        configured_limits = tuple(
+            value is not None
+            for value in (self.capital_fraction, self.capital_amount, self.risk_budget)
+        )
+        if not any(configured_limits):
+            raise ValueError(
+                "book allocation requires capital_fraction, capital_amount, or risk_budget"
+            )
+        if sum(configured_limits) != 1:
+            raise ValueError(
+                "book allocation must configure exactly one limit basis"
+            )
         object.__setattr__(self, "metadata", _mapping(self.metadata))
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "created_at"))
         if self.updated_at is None:
             object.__setattr__(self, "updated_at", self.created_at)
         else:
             object.__setattr__(self, "updated_at", _utc_datetime(self.updated_at, "updated_at"))
+
+    @property
+    def limit_basis(self) -> str:
+        """Return the single generic capacity basis configured for this book."""
+        configured = tuple(
+            name
+            for name, value in (
+                ("capital_fraction", self.capital_fraction),
+                ("capital_amount", self.capital_amount),
+                ("risk_budget", self.risk_budget),
+            )
+            if value is not None
+        )
+        if len(configured) != 1:
+            raise ValueError("book allocation must configure exactly one limit basis")
+        return configured[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,15 +531,27 @@ class ExecutionPolicy:
     required_capabilities: frozenset[str] = frozenset()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     execution_session: ExecutionSession = ExecutionSession.REGULAR
+    stale_order_seconds: int = 300
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "legging_policy", _enum(self.legging_policy, LeggingPolicy, "legging_policy"))
         object.__setattr__(self, "partial_fill_policy", _enum(self.partial_fill_policy, PartialFillPolicy, "partial_fill_policy"))
+        if self.partial_fill_policy is not PartialFillPolicy.WAIT:
+            raise ValueError("partial_fill_policy values other than WAIT are not implemented")
         object.__setattr__(self, "failure_policy", _enum(self.failure_policy, FailurePolicy, "failure_policy"))
         object.__setattr__(self, "max_attempts", _positive_int(self.max_attempts, "max_attempts"))
         object.__setattr__(self, "timeout_seconds", _positive_int(self.timeout_seconds, "timeout_seconds"))
+        object.__setattr__(self, "stale_order_seconds", _positive_int(self.stale_order_seconds, "stale_order_seconds"))
+        if self.legging_policy is not LeggingPolicy.SEQUENTIAL:
+            raise ValueError("legging_policy values other than SEQUENTIAL are not implemented")
+        if self.failure_policy is FailurePolicy.UNWIND_FILLED_LEGS:
+            raise ValueError("failure_policy UNWIND_FILLED_LEGS is not implemented")
+        if self.max_attempts != 1:
+            raise ValueError("max_attempts values other than 1 are not implemented")
         if not isinstance(self.require_native_atomicity, bool):
             raise ValueError("require_native_atomicity must be a bool")
+        if self.require_native_atomicity:
+            raise ValueError("require_native_atomicity is not implemented for separate generic legs")
         session, allow_extended_hours = _normalise_execution_session(
             self.execution_session,
             self.allow_extended_hours,
@@ -485,6 +559,8 @@ class ExecutionPolicy:
         object.__setattr__(self, "execution_session", session)
         object.__setattr__(self, "allow_extended_hours", allow_extended_hours)
         object.__setattr__(self, "required_capabilities", frozenset(str(value).strip() for value in self.required_capabilities if str(value).strip()))
+        if self.required_capabilities:
+            raise ValueError("required_capabilities are not implemented by the generic Stage 3 executor")
         object.__setattr__(self, "metadata", _mapping(self.metadata))
 
 
@@ -628,6 +704,20 @@ class BrokerOrderEvent:
     broker_status: BrokerOrderStatus | None = None
     external_event_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    external_order_id: str | None = None
+    client_order_id: str | None = None
+    cumulative_filled_quantity: Decimal | None = None
+    # Explicit account aliases are optional for backwards-compatible event
+    # producers, but when supplied they must agree with the persisted order
+    # account before an event can affect lifecycle state.
+    account_id: str | None = None
+    external_account_id: str | None = None
+    # A provider may explicitly certify that this terminal event carried no
+    # fills. False/omitted is intentionally not proof of zero.
+    no_fill_asserted: bool = False
+    # Set when the event status/cumulative values were projected from an
+    # adapter-authenticated order snapshot.
+    authority: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _required_id(self.id, "id"))
@@ -639,6 +729,19 @@ class BrokerOrderEvent:
         object.__setattr__(self, "event_at", _utc_datetime(self.event_at, "event_at"))
         object.__setattr__(self, "received_at", _utc_datetime(self.received_at, "received_at"))
         object.__setattr__(self, "external_event_id", _optional_id(self.external_event_id, "external_event_id"))
+        object.__setattr__(self, "external_order_id", _optional_id(self.external_order_id, "external_order_id"))
+        object.__setattr__(self, "client_order_id", _optional_id(self.client_order_id, "client_order_id"))
+        object.__setattr__(self, "account_id", _optional_id(self.account_id, "account_id"))
+        object.__setattr__(self, "external_account_id", _optional_id(self.external_account_id, "external_account_id"))
+        if not isinstance(self.no_fill_asserted, bool):
+            raise ValueError("no_fill_asserted must be a bool")
+        object.__setattr__(self, "authority", _optional_id(self.authority, "authority"))
+        if self.cumulative_filled_quantity is not None:
+            object.__setattr__(
+                self,
+                "cumulative_filled_quantity",
+                _nonnegative_decimal(self.cumulative_filled_quantity, "cumulative_filled_quantity"),
+            )
         object.__setattr__(self, "metadata", _mapping(self.metadata))
 
 @dataclass(frozen=True, slots=True)
@@ -655,6 +758,18 @@ class Fill:
     fee: Decimal | None = None
     fee_currency: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Optional normalized account identity for repository-level validation.
+    account_id: str | None = None
+    # How the provider established this execution.  Order-level SIM fallback
+    # evidence is explicitly distinct from individual deal evidence.
+    evidence_mode: ExecutionEvidenceMode = ExecutionEvidenceMode.INDIVIDUAL_DEALS
+    # Exact provider-side identity used to bind this evidence to the one
+    # persisted broker-order attempt.  Older callers may omit it; the
+    # repository derives the deterministic legacy reference from the
+    # persisted external order ID and dedupe key, but an explicit value is
+    # always checked when supplied.
+    external_order_id: str | None = None
+    evidence_reference: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _required_id(self.id, "id"))
@@ -670,6 +785,63 @@ class Fill:
         if self.fee_currency is not None:
             object.__setattr__(self, "fee_currency", _required_id(self.fee_currency, "fee_currency"))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
+        object.__setattr__(self, "account_id", _optional_id(self.account_id, "account_id"))
+        object.__setattr__(self, "evidence_mode", _enum(self.evidence_mode, ExecutionEvidenceMode, "evidence_mode"))
+        object.__setattr__(self, "external_order_id", _optional_id(self.external_order_id, "external_order_id"))
+        object.__setattr__(self, "evidence_reference", _optional_id(self.evidence_reference, "evidence_reference"))
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryAction:
+    """Durable operator-facing guidance for an unresolved order observation."""
+
+    id: str
+    intent_id: str
+    account_id: str
+    action_key: str
+    state: str
+    summary: str
+    observed_positions: Mapping[str, Any] = field(default_factory=dict)
+    remaining_quantities: Mapping[str, Any] = field(default_factory=dict)
+    stale: bool = False
+    timed_out: bool = False
+    allowed_next_steps: tuple[str, ...] = ()
+    status: RecoveryActionStatus = RecoveryActionStatus.OPEN
+    detected_at: datetime = field(default_factory=_utc_now)
+    last_seen_at: datetime | None = None
+    occurrence_count: int = 1
+    resolved_at: datetime | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _required_id(self.id, "id"))
+        object.__setattr__(self, "intent_id", _required_id(self.intent_id, "intent_id"))
+        object.__setattr__(self, "account_id", _required_id(self.account_id, "account_id"))
+        object.__setattr__(self, "action_key", _required_id(self.action_key, "action_key"))
+        object.__setattr__(self, "state", _required_id(self.state, "state").upper())
+        object.__setattr__(self, "summary", str(self.summary))
+        object.__setattr__(self, "observed_positions", _mapping(self.observed_positions, "observed_positions"))
+        object.__setattr__(self, "remaining_quantities", _mapping(self.remaining_quantities, "remaining_quantities"))
+        if not isinstance(self.stale, bool):
+            raise ValueError("stale must be a bool")
+        if not isinstance(self.timed_out, bool):
+            raise ValueError("timed_out must be a bool")
+        object.__setattr__(
+            self,
+            "allowed_next_steps",
+            tuple(_required_id(step, "allowed_next_step") for step in self.allowed_next_steps),
+        )
+        object.__setattr__(self, "status", _enum(self.status, RecoveryActionStatus, "status"))
+        detected_at = _utc_datetime(self.detected_at, "detected_at")
+        object.__setattr__(self, "detected_at", detected_at)
+        if self.last_seen_at is None:
+            object.__setattr__(self, "last_seen_at", detected_at)
+        else:
+            object.__setattr__(self, "last_seen_at", _utc_datetime(self.last_seen_at, "last_seen_at"))
+        object.__setattr__(self, "occurrence_count", _positive_int(self.occurrence_count, "occurrence_count"))
+        if self.resolved_at is not None:
+            object.__setattr__(self, "resolved_at", _utc_datetime(self.resolved_at, "resolved_at"))
+        object.__setattr__(self, "metadata", _mapping(self.metadata))
 
 @dataclass(frozen=True, slots=True)
 class BrokerCapabilities:
@@ -679,6 +851,8 @@ class BrokerCapabilities:
     supports_position_read: bool = True
     supports_order_read: bool = True
     supports_fill_read: bool = False
+    execution_evidence_mode: ExecutionEvidenceMode = ExecutionEvidenceMode.UNAVAILABLE
+    execution_evidence_scope: frozenset[str] = frozenset()
     supports_order_events: bool = False
     supports_submit: bool = True
     supports_cancel: bool = False
@@ -709,6 +883,16 @@ class BrokerCapabilities:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a bool")
+        object.__setattr__(
+            self,
+            "execution_evidence_mode",
+            _enum(self.execution_evidence_mode, ExecutionEvidenceMode, "execution_evidence_mode"),
+        )
+        object.__setattr__(
+            self,
+            "execution_evidence_scope",
+            frozenset(str(value).strip() for value in self.execution_evidence_scope if str(value).strip()),
+        )
         object.__setattr__(self, "metadata", _mapping(self.metadata))
 
     def supports(self, capability: str) -> bool:
@@ -794,6 +978,15 @@ class BrokerOrderSnapshot:
     captured_at: datetime
     client_order_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Broker-provided order creation/update time.  This is distinct from the
+    # local query capture time and is used for stale-order policy when present.
+    order_time: datetime | None = None
+    external_account_id: str | None = None
+    no_fill_asserted: bool = False
+    # Set by an adapter-authenticated order-query path.  This is deliberately
+    # separate from provider metadata so generic evidence validation can
+    # distinguish expected row identity from an untrusted order claim.
+    authority: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _required_id(self.id, "id"))
@@ -812,6 +1005,12 @@ class BrokerOrderSnapshot:
         object.__setattr__(self, "status", _enum(self.status, BrokerOrderStatus, "status"))
         object.__setattr__(self, "captured_at", _utc_datetime(self.captured_at, "captured_at"))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
+        if self.order_time is not None:
+            object.__setattr__(self, "order_time", _utc_datetime(self.order_time, "order_time"))
+        object.__setattr__(self, "external_account_id", _optional_id(self.external_account_id, "external_account_id"))
+        if not isinstance(self.no_fill_asserted, bool):
+            raise ValueError("no_fill_asserted must be a bool")
+        object.__setattr__(self, "authority", _optional_id(self.authority, "authority"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,6 +1082,44 @@ class ReconciliationRun:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionEvidenceBaseline:
+    """An explicitly verified, bounded account-facts checkpoint.
+
+    This records what was freshly observed and reconciled; it does not claim
+    that a provider with cumulative order snapshots exposes historical deal
+    records that it cannot return.
+    """
+
+    id: str
+    account_id: str
+    captured_at: datetime
+    evidence_mode: ExecutionEvidenceMode
+    coverage: tuple[str, ...]
+    source_ledger_fingerprint: str
+    source_order_ids: tuple[str, ...]
+    position_fingerprint: str
+    open_order_fingerprint: str
+    verified_flat: bool = True
+    status: str = "VERIFIED"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _required_id(self.id, "id"))
+        object.__setattr__(self, "account_id", _required_id(self.account_id, "account_id"))
+        object.__setattr__(self, "captured_at", _utc_datetime(self.captured_at, "captured_at"))
+        object.__setattr__(self, "evidence_mode", _enum(self.evidence_mode, ExecutionEvidenceMode, "evidence_mode"))
+        object.__setattr__(self, "coverage", tuple(_required_id(value, "coverage") for value in self.coverage))
+        object.__setattr__(self, "source_ledger_fingerprint", _required_id(self.source_ledger_fingerprint, "source_ledger_fingerprint"))
+        object.__setattr__(self, "source_order_ids", tuple(_required_id(value, "source_order_id") for value in self.source_order_ids))
+        object.__setattr__(self, "position_fingerprint", _required_id(self.position_fingerprint, "position_fingerprint"))
+        object.__setattr__(self, "open_order_fingerprint", _required_id(self.open_order_fingerprint, "open_order_fingerprint"))
+        if not isinstance(self.verified_flat, bool):
+            raise ValueError("verified_flat must be a bool")
+        object.__setattr__(self, "status", _required_id(self.status, "status").upper())
+        object.__setattr__(self, "metadata", _mapping(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationIssue:
     id: str
     run_id: str
@@ -940,6 +1177,8 @@ __all__ = [
     "BrokerOrderStatus",
     "BrokerSnapshot",
     "ExecutionPolicy",
+    "ExecutionEvidenceMode",
+    "ExecutionEvidenceBaseline",
     "ExecutionSession",
     "FailurePolicy",
     "Fill",
@@ -963,6 +1202,8 @@ __all__ = [
     "ReconciliationRun",
     "ReconciliationStatus",
     "RiskDecisionRecord",
+    "RecoveryAction",
+    "RecoveryActionStatus",
     "Side",
     "Strategy",
     "TradingEnvironment",

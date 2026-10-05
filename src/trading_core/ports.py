@@ -14,6 +14,7 @@ from .domain import (
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     BrokerSnapshot,
+    ExecutionEvidenceMode,
     ExecutionSession,
     Instrument,
     InstrumentMapping,
@@ -65,7 +66,15 @@ class BrokerSubmitRequest:
 
 @dataclass(frozen=True, slots=True)
 class BrokerSubmissionResult:
-    """Normalized outcome of a submit, cancel, or replace operation."""
+    """Normalized outcome of a submit, cancel, or replace operation.
+
+    ``cumulative_filled_quantity`` is deliberately optional.  ``None`` means
+    that the provider did not give an authoritative cumulative-fill value;
+    it is not equivalent to zero.  A caller may claim a clean no-submit or
+    no-fill result only with the corresponding explicit assertion flag.  This
+    keeps provider response parsing fail-closed instead of treating an
+    unrecognized response shape as proof of no broker exposure.
+    """
 
     broker_order_id: str
     accepted: bool | None
@@ -77,8 +86,20 @@ class BrokerSubmissionResult:
     error_message: str | None = None
     retryable: bool = False
     ambiguous: bool = False
-    cumulative_filled_quantity: Decimal = Decimal("0")
+    cumulative_filled_quantity: Decimal | None = None
     raw_payload: Mapping[str, Any] = field(default_factory=dict)
+    no_submit_asserted: bool = False
+    no_fill_asserted: bool = False
+    # Provenance for an adapter-authoritative terminal order response.  The
+    # generic OMS uses this only to distinguish expected row identity from
+    # untrusted nested lifecycle evidence.
+    authority: str | None = None
+    # Optional normalized identity facts reported by a command response.
+    # These are intentionally separate from ``raw_payload`` so the generic
+    # OMS can bind a terminal zero-fill claim to the persisted attempt rather
+    # than accepting an unscoped provider assertion.
+    submitted_quantity: Decimal | None = None
+    instrument_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "broker_order_id", _required_id(self.broker_order_id, "broker_order_id"))
@@ -97,11 +118,34 @@ class BrokerSubmissionResult:
             raise ValueError("retryable must be a bool")
         if not isinstance(self.ambiguous, bool):
             raise ValueError("ambiguous must be a bool")
-        object.__setattr__(
-            self,
-            "cumulative_filled_quantity",
-            _nonnegative_decimal(self.cumulative_filled_quantity, "cumulative_filled_quantity"),
-        )
+        if self.cumulative_filled_quantity is not None:
+            object.__setattr__(
+                self,
+                "cumulative_filled_quantity",
+                _nonnegative_decimal(self.cumulative_filled_quantity, "cumulative_filled_quantity"),
+            )
+        if self.submitted_quantity is not None:
+            object.__setattr__(
+                self,
+                "submitted_quantity",
+                _nonnegative_decimal(self.submitted_quantity, "submitted_quantity"),
+            )
+            if self.submitted_quantity == 0:
+                raise ValueError("submitted_quantity must be positive when provided")
+        object.__setattr__(self, "instrument_id", _optional_id(self.instrument_id, "instrument_id"))
+        if not isinstance(self.no_submit_asserted, bool):
+            raise ValueError("no_submit_asserted must be a bool")
+        if not isinstance(self.no_fill_asserted, bool):
+            raise ValueError("no_fill_asserted must be a bool")
+        object.__setattr__(self, "authority", _optional_id(self.authority, "authority"))
+        if self.no_submit_asserted:
+            if self.accepted is not False or self.external_order_id is not None or self.ambiguous:
+                raise ValueError("no_submit_asserted requires a definite rejected result without an order ID")
+        if self.no_fill_asserted:
+            if self.cumulative_filled_quantity is None or self.cumulative_filled_quantity != 0:
+                raise ValueError("no_fill_asserted requires an authoritative zero cumulative fill")
+            if self.ambiguous:
+                raise ValueError("no_fill_asserted cannot be asserted on an ambiguous result")
         object.__setattr__(self, "raw_payload", _mapping(self.raw_payload, "raw_payload"))
 
 
@@ -119,6 +163,14 @@ class BrokerFill:
     fee: Decimal | None = None
     fee_currency: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    account_id: str | None = None
+    evidence_reference: str | None = None
+    evidence_mode: ExecutionEvidenceMode = ExecutionEvidenceMode.INDIVIDUAL_DEALS
+    # Canonical generic instrument identity supplied by the adapter.  Legacy
+    # broker-neutral test/fake feeds may omit it, but a provider row carrying
+    # symbol provenance must be represented here so OMS matching can reject
+    # a foreign or contradictory instrument before persistence.
+    instrument_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "external_order_id", _required_id(self.external_order_id, "external_order_id"))
@@ -137,6 +189,133 @@ class BrokerFill:
             object.__setattr__(self, "fee", _nonnegative_decimal(self.fee, "fee"))
         object.__setattr__(self, "fee_currency", _optional_id(self.fee_currency, "fee_currency"))
         object.__setattr__(self, "metadata", _mapping(self.metadata, "metadata"))
+        object.__setattr__(self, "account_id", _optional_id(self.account_id, "account_id"))
+        object.__setattr__(self, "evidence_reference", _optional_id(self.evidence_reference, "evidence_reference"))
+        object.__setattr__(self, "evidence_mode", _enum(self.evidence_mode, ExecutionEvidenceMode, "evidence_mode"))
+        object.__setattr__(self, "instrument_id", _optional_id(self.instrument_id, "instrument_id"))
+        if self.evidence_reference is None:
+            # A provider deal ID is ideal, but the normalized dedupe key is
+            # still an exact immutable evidence reference for legacy feeds.
+            object.__setattr__(self, "evidence_reference", self.dedupe_key)
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerFactSnapshot:
+    """One complete, account-scoped broker-fact observation.
+
+    Empty child collections are meaningful only when ``complete`` is true.
+    Adapters must set ``complete=False`` (and preferably ``error``) when any
+    required account-wide query is unsupported, partial, or ambiguous.  This
+    prevents a safety gate from interpreting an unavailable account as flat.
+    ``metadata`` is diagnostic context only; the OMS recursively validates it
+    as primitive, non-execution-shaped, and account-consistent before treating
+    empty child collections as safe.
+    """
+
+    account_id: str
+    captured_at: datetime
+    complete: bool
+    positions: tuple[PositionSnapshot, ...] = ()
+    open_orders: tuple[BrokerOrderSnapshot, ...] = ()
+    fills: tuple[BrokerFill, ...] = ()
+    error: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Legacy fake/adapters that predate typed execution evidence retain the
+    # historical individual-deal contract when they omit this field.  A
+    # provider that truly cannot establish execution evidence must set
+    # ``UNAVAILABLE`` explicitly; the OMS safety gate blocks that mode.
+    execution_evidence_mode: ExecutionEvidenceMode = ExecutionEvidenceMode.INDIVIDUAL_DEALS
+    execution_evidence_scope: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "account_id", _required_id(self.account_id, "account_id"))
+        object.__setattr__(self, "captured_at", _utc_datetime(self.captured_at, "captured_at"))
+        if not isinstance(self.complete, bool):
+            raise ValueError("complete must be a bool")
+        positions = tuple(self.positions)
+        open_orders = tuple(self.open_orders)
+        fills = tuple(self.fills)
+        if any(not isinstance(item, PositionSnapshot) for item in positions):
+            raise ValueError("positions must contain PositionSnapshot values")
+        if any(not isinstance(item, BrokerOrderSnapshot) for item in open_orders):
+            raise ValueError("open_orders must contain BrokerOrderSnapshot values")
+        if any(not isinstance(item, BrokerFill) for item in fills):
+            raise ValueError("fills must contain BrokerFill values")
+        object.__setattr__(self, "positions", positions)
+        object.__setattr__(self, "open_orders", open_orders)
+        object.__setattr__(self, "fills", fills)
+        if self.error is not None:
+            object.__setattr__(self, "error", str(self.error))
+        object.__setattr__(self, "metadata", _mapping(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "execution_evidence_mode",
+            _enum(self.execution_evidence_mode, ExecutionEvidenceMode, "execution_evidence_mode"),
+        )
+        object.__setattr__(
+            self,
+            "execution_evidence_scope",
+            frozenset(str(value).strip() for value in self.execution_evidence_scope if str(value).strip()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerHistoricalOrderFacts:
+    """One explicitly bounded, provider-authoritative order-history window.
+
+    Historical order coverage is deliberately separate from the fresh
+    account-facts snapshot used by the submission gate.  An adapter must
+    return ``complete=False`` on an unsupported, malformed, or failed history
+    query; an empty successful window is represented by ``complete=True``
+    with empty ``orders``/``fills``.  This prevents a history transport error
+    from being mistaken for proof that no historical executions exist.
+    """
+
+    account_id: str
+    requested_start: datetime
+    requested_end: datetime
+    captured_at: datetime
+    complete: bool
+    orders: tuple[BrokerOrderSnapshot, ...] = ()
+    fills: tuple[BrokerFill, ...] = ()
+    error: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_evidence_mode: ExecutionEvidenceMode = ExecutionEvidenceMode.UNAVAILABLE
+    execution_evidence_scope: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "account_id", _required_id(self.account_id, "account_id"))
+        start = _utc_datetime(self.requested_start, "requested_start")
+        end = _utc_datetime(self.requested_end, "requested_end")
+        captured = _utc_datetime(self.captured_at, "captured_at")
+        if end <= start:
+            raise ValueError("requested_end must be after requested_start")
+        object.__setattr__(self, "requested_start", start)
+        object.__setattr__(self, "requested_end", end)
+        object.__setattr__(self, "captured_at", captured)
+        if not isinstance(self.complete, bool):
+            raise ValueError("complete must be a bool")
+        orders = tuple(self.orders)
+        fills = tuple(self.fills)
+        if any(not isinstance(item, BrokerOrderSnapshot) for item in orders):
+            raise ValueError("orders must contain BrokerOrderSnapshot values")
+        if any(not isinstance(item, BrokerFill) for item in fills):
+            raise ValueError("fills must contain BrokerFill values")
+        object.__setattr__(self, "orders", orders)
+        object.__setattr__(self, "fills", fills)
+        if self.error is not None:
+            object.__setattr__(self, "error", str(self.error))
+        object.__setattr__(self, "metadata", _mapping(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "execution_evidence_mode",
+            _enum(self.execution_evidence_mode, ExecutionEvidenceMode, "execution_evidence_mode"),
+        )
+        object.__setattr__(
+            self,
+            "execution_evidence_scope",
+            frozenset(str(value).strip() for value in self.execution_evidence_scope if str(value).strip()),
+        )
 
 @runtime_checkable
 class BrokerAdapter(Protocol):
@@ -166,6 +345,26 @@ class BrokerAdapter(Protocol):
     def get_fills(self, account: Account, since: datetime | None = None) -> Sequence[BrokerFill]:
         ...
 
+    def get_account_facts(self, account: Account) -> BrokerFactSnapshot:
+        """Return account facts for ordinary reads/display paths.
+
+        Order submission safety gates must call
+        :meth:`get_authoritative_account_facts` instead.  This reader may be
+        backed by a bounded display cache when an adapter supports one.
+        """
+        ...
+
+    def get_authoritative_account_facts(self, account: Account) -> BrokerFactSnapshot:
+        """Return a freshly queried account fact set for safety-critical gates.
+
+        Implementations must bypass any bounded display/query cache for every
+        required account-fact endpoint.  An adapter that cannot obtain a
+        complete fresh set must return an incomplete snapshot or raise so the
+        generic OMS can persist a blocker rather than treating cached or
+        missing facts as a flat account.
+        """
+        ...
+
     def submit_order(self, account: Account, request: BrokerSubmitRequest) -> BrokerSubmissionResult:
         ...
 
@@ -175,6 +374,19 @@ class BrokerAdapter(Protocol):
     def replace_order(
         self, account: Account, external_order_id: str, changes: Mapping[str, Any]
     ) -> BrokerSubmissionResult:
+        ...
+
+
+@runtime_checkable
+class HistoricalOrderEvidenceProvider(Protocol):
+    """Optional provider capability for a bounded authoritative order window."""
+
+    def get_historical_order_facts(
+        self,
+        account: Account,
+        start: datetime,
+        end: datetime,
+    ) -> BrokerHistoricalOrderFacts:
         ...
 
 
@@ -237,9 +449,12 @@ class MarketDataProvider(Protocol):
 
 __all__ = [
     "BrokerAdapter",
+    "BrokerFactSnapshot",
     "BrokerFill",
+    "BrokerHistoricalOrderFacts",
     "BrokerSubmitRequest",
     "BrokerSubmissionResult",
+    "HistoricalOrderEvidenceProvider",
     "MarketBar",
     "MarketDataProvider",
     "MarketQuote",

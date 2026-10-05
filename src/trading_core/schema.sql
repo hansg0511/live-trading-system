@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS core_broker_order_events (
     event_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    oms_fill_fingerprint TEXT,
+    oms_event_fingerprint TEXT,
     UNIQUE (broker_order_id, dedupe_key)
 );
 
@@ -169,6 +171,7 @@ CREATE TABLE IF NOT EXISTS core_fills (
     fee_currency TEXT,
     filled_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    evidence_mode TEXT NOT NULL DEFAULT 'INDIVIDUAL_DEALS',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE (broker_order_id, dedupe_key),
     FOREIGN KEY (broker_order_id, order_leg_id)
@@ -274,6 +277,62 @@ CREATE TABLE IF NOT EXISTS core_reconciliation_issues (
     UNIQUE (account_id, issue_key)
 );
 
+CREATE TABLE IF NOT EXISTS core_recovery_actions (
+    id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL REFERENCES core_order_intents(id) ON DELETE RESTRICT,
+    account_id TEXT NOT NULL REFERENCES core_accounts(id) ON DELETE RESTRICT,
+    action_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    observed_positions_json TEXT NOT NULL DEFAULT '{}',
+    remaining_quantities_json TEXT NOT NULL DEFAULT '{}',
+    stale INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1)),
+    timed_out INTEGER NOT NULL DEFAULT 0 CHECK (timed_out IN (0, 1)),
+    allowed_next_steps_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    resolved_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (account_id, intent_id, action_key)
+);
+
+-- Stage 7 local operational audit trail.  This is deliberately separate from
+-- the trading ledger: it records operator/service decisions and never stores
+-- credentials or provider secrets.  Existing databases receive this table
+-- through the normal idempotent schema initialization path.
+CREATE TABLE IF NOT EXISTS core_operational_events (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES core_accounts(id) ON DELETE RESTRICT,
+    event_type TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
+-- A verified, bounded account-facts checkpoint.  This is not a claim that
+-- the provider exposes complete historical deal data; it records the exact
+-- fresh position/order observation and the order-evidence coverage that an
+-- operator explicitly reconciled before a SIM submission.
+CREATE TABLE IF NOT EXISTS core_execution_evidence_baselines (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES core_accounts(id) ON DELETE RESTRICT,
+    captured_at TEXT NOT NULL,
+    evidence_mode TEXT NOT NULL,
+    coverage_json TEXT NOT NULL DEFAULT '[]',
+    source_ledger_fingerprint TEXT NOT NULL,
+    source_order_ids_json TEXT NOT NULL DEFAULT '[]',
+    position_fingerprint TEXT NOT NULL,
+    open_order_fingerprint TEXT NOT NULL,
+    verified_flat INTEGER NOT NULL CHECK (verified_flat IN (0, 1)),
+    status TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (account_id, source_ledger_fingerprint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_core_intents_status
     ON core_order_intents(account_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_core_legs_status
@@ -286,6 +345,11 @@ CREATE INDEX IF NOT EXISTS idx_core_events_received
     ON core_broker_order_events(broker_order_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_core_fills_leg
     ON core_fills(order_leg_id, filled_at);
+-- Additive lookup for the second fill identity.  Enforcement remains in the
+-- repository so pre-Stage-3 databases containing historical duplicates can
+-- initialize safely without a destructive migration.
+CREATE INDEX IF NOT EXISTS idx_core_fills_broker_external_fill
+    ON core_fills(broker_order_id, external_fill_id);
 CREATE INDEX IF NOT EXISTS idx_core_snapshots_account
     ON core_broker_snapshots(account_id, captured_at);
 CREATE INDEX IF NOT EXISTS idx_core_positions_snapshot
@@ -294,6 +358,18 @@ CREATE INDEX IF NOT EXISTS idx_core_allocations_position
     ON core_position_allocations(account_id, instrument_id, ownership_class);
 CREATE INDEX IF NOT EXISTS idx_core_reconciliation_open
     ON core_reconciliation_issues(account_id, status, severity, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_core_recovery_actions_open
+    ON core_recovery_actions(account_id, status, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_core_operational_events_account
+    ON core_operational_events(account_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_core_execution_baselines_account
+    ON core_execution_evidence_baselines(account_id, captured_at);
 
 INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Initial broker-neutral trading core schema');
+
+INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Durable generic recovery actions');
+
+INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Dedicated broker-event evidence fingerprints');

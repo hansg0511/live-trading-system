@@ -4,6 +4,7 @@
 from .generic_adapter import (
     MooMooGenericAdapter,
     MoomooAdapterError,
+    MoomooRateLimitError,
     MoomooInstrumentResolver,
     MoomooMappingError,
     StaticMoomooInstrumentResolver,
@@ -12,6 +13,7 @@ from .generic_adapter import (
 __all__ = [
     "MooMooGenericAdapter",
     "MoomooAdapterError",
+    "MoomooRateLimitError",
     "MoomooInstrumentResolver",
     "MoomooMappingError",
     "StaticMoomooInstrumentResolver",

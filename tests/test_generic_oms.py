@@ -10,6 +10,7 @@ import pytest
 from src.trading_core.domain import (
     Account,
     AssetClass,
+    BrokerOrderEvent,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     ExecutionPolicy,
@@ -28,7 +29,7 @@ from src.trading_core.domain import (
     TradingEnvironment,
 )
 from src.trading_core.oms import GenericOMS, OMSExecutionError
-from src.trading_core.ports import BrokerFill, BrokerSubmissionResult
+from src.trading_core.ports import BrokerFactSnapshot, BrokerFill, BrokerSubmissionResult
 from src.trading_core.repository import SQLiteTradingRepository
 
 
@@ -131,6 +132,7 @@ class FakeAdapter:
         self.submit_calls = []
         self.open_orders = []
         self.fills = []
+        self.positions = []
 
     def submit_order(self, account_value, request):
         self.submit_calls.append(request)
@@ -160,6 +162,9 @@ class FakeAdapter:
                 status=BrokerOrderStatus.REJECTED,
                 client_order_id=request.client_order_id,
                 error_message="rejected",
+                cumulative_filled_quantity=Decimal("0"),
+                no_submit_asserted=True,
+                no_fill_asserted=True,
             )
         external = f"external-{call}"
         return BrokerSubmissionResult(
@@ -173,8 +178,24 @@ class FakeAdapter:
     def get_open_orders(self, account_value):
         return tuple(self.open_orders)
 
+    def get_positions(self, account_value):
+        return tuple(self.positions)
+
     def get_fills(self, account_value, since=None):
         return tuple(self.fills)
+
+    def get_account_facts(self, account_value):
+        return BrokerFactSnapshot(
+            account_id=account_value.id,
+            captured_at=NOW,
+            complete=True,
+            positions=tuple(self.positions),
+            open_orders=tuple(self.open_orders),
+            fills=tuple(self.fills),
+        )
+
+    def get_authoritative_account_facts(self, account_value):
+        return self.get_account_facts(account_value)
 
     def get_order(self, account_value, external_order_id):
         return next(
@@ -188,6 +209,23 @@ class FakeAdapter:
             accepted=True,
             status=BrokerOrderStatus.CANCELLED,
             external_order_id=external_order_id,
+            cumulative_filled_quantity=Decimal("0"),
+            no_fill_asserted=True,
+        )
+
+
+class UncertainRejectAdapter(FakeAdapter):
+    def submit_order(self, account_value, request):
+        self.submit_calls.append(request)
+        return BrokerSubmissionResult(
+            broker_order_id=request.broker_order_id,
+            accepted=False,
+            status=BrokerOrderStatus.REJECTED,
+            external_order_id=None,
+            client_order_id=request.client_order_id,
+            cumulative_filled_quantity=None,
+            no_submit_asserted=False,
+            no_fill_asserted=False,
         )
 
 
@@ -279,6 +317,49 @@ def test_definite_no_submit_rejection_stops_before_later_leg_and_stays_terminal(
     assert metadata["error"] == "rejected"
 
 
+def test_rejection_without_explicit_no_submit_contract_stays_blocked(tmp_path):
+    repository = ready_repository(tmp_path, 2)
+    adapter = UncertainRejectAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(2)
+
+    result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+
+    assert result["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert len(adapter.submit_calls) == 1
+    assert result["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
+    assert result["legs"][1]["status"] == LegStatus.PLANNED.value
+    assert repository.open_reconciliation_issues("acct")
+
+
+@pytest.mark.parametrize("raw_payload", ({"fill_blob": {"provider_field": "unknown"}}, {"execution_detail": "opaque"}))
+def test_unrecognized_fill_shaped_rejection_payload_is_not_clean(tmp_path, raw_payload):
+    class OpaqueRejectAdapter(FakeAdapter):
+        def submit_order(self, account_value, request):
+            self.submit_calls.append(request)
+            return BrokerSubmissionResult(
+                broker_order_id=request.broker_order_id,
+                accepted=False,
+                status=BrokerOrderStatus.REJECTED,
+                external_order_id=None,
+                cumulative_filled_quantity=Decimal("0"),
+                no_submit_asserted=True,
+                no_fill_asserted=True,
+                raw_payload=raw_payload,
+            )
+
+    repository = ready_repository(tmp_path, 1)
+    adapter = OpaqueRejectAdapter(repository)
+    result = GenericOMS(repository, adapter).submit_intent(
+        make_intent(1),
+        account=account(),
+        risk_decision=decision("intent-1"),
+    )
+
+    assert result["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert result["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
+
+
 def test_ambiguous_submit_is_not_retried_and_requires_reconciliation(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository, ambiguous_call=1)
@@ -313,7 +394,18 @@ def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_pat
         "rejected-attempt",
         status=BrokerOrderStatus.REJECTED,
         external_order_id=None,
-        metadata={"provider_status": "REJECTED", "error": "Paper trading does not support overnight trading sessions"},
+        metadata={
+            "accepted": False,
+            "ambiguous": False,
+            "provider_status": "REJECTED",
+            "error": "Paper trading does not support overnight trading sessions",
+            "reported_cumulative_fill": "0",
+            "cumulative_fill_known": True,
+            "no_submit_asserted": True,
+            "no_fill_asserted": True,
+            "definite_no_submit": True,
+            "raw_payload": {},
+        },
     )
     repository.transition_leg(order_intent.legs[0].id, LegStatus.REJECTED)
     repository.transition_intent(order_intent.id, IntentStatus.RECONCILIATION_REQUIRED)
@@ -326,7 +418,10 @@ def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_pat
         category="BROKER_QUERY_FAILED",
         entity_type="ACCOUNT",
         entity_key="acct:fills",
-        details={"message": "Paper trading does not support deal data."},
+        details={
+            "intent_id": order_intent.id,
+            "message": "Paper trading does not support deal data.",
+        },
     )
     oms._require_reconciliation(
         order_intent.id,
@@ -370,8 +465,9 @@ def test_restart_recovers_exact_client_order_match_without_submit(tmp_path):
         attempt_number=1,
         client_order_id="durable-client",
         submitted_quantity=Decimal("10"),
+        now=NOW,
     )
-    repository.transition_broker_order("attempt", BrokerOrderStatus.SUBMITTING)
+    repository.transition_broker_order("attempt", BrokerOrderStatus.SUBMITTING, now=NOW)
     adapter = FakeAdapter(repository)
     adapter.open_orders = [
         BrokerOrderSnapshot(
@@ -389,7 +485,7 @@ def test_restart_recovers_exact_client_order_match_without_submit(tmp_path):
         )
     ]
 
-    recovered = GenericOMS(repository, adapter).recover_intent(order_intent.id, account=account())
+    recovered = GenericOMS(repository, adapter, clock=lambda: NOW).recover_intent(order_intent.id, account=account())
     assert recovered["status"] == IntentStatus.WORKING.value
     assert recovered["legs"][0]["status"] == LegStatus.WORKING.value
     assert repository.broker_orders_for_leg(order_intent.legs[0].id)[0]["external_order_id"] == "external-recovered"
@@ -399,7 +495,7 @@ def test_restart_recovers_exact_client_order_match_without_submit(tmp_path):
 def test_restart_applies_broker_fill_facts_and_broker_truth_wins(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     attempt = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
@@ -441,17 +537,20 @@ def test_restart_applies_broker_fill_facts_and_broker_truth_wins(tmp_path):
 
     recovered = oms.recover_intent(order_intent.id, account=account())
 
-    assert recovered["status"] == IntentStatus.FILLED.value
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
     assert len(repository.fills_for_leg(order_intent.legs[0].id)) == 1
     assert repository.position_allocations("acct")[0]["signed_quantity"] == "10"
-    assert repository.open_reconciliation_issues("acct") == []
+    assert any(
+        issue["category"] == "UNKNOWN_BROKER_FILL"
+        for issue in repository.open_reconciliation_issues("acct")
+    )
 
 
 def test_recovery_keeps_reconciliation_when_one_leg_is_only_partial(tmp_path):
     repository = ready_repository(tmp_path, 2)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     order_intent = make_intent(2)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     attempts = [repository.broker_orders_for_leg(leg.id)[0] for leg in order_intent.legs]
@@ -502,13 +601,16 @@ def test_recovery_keeps_reconciliation_when_one_leg_is_only_partial(tmp_path):
         LegStatus.FILLED.value,
         LegStatus.RECONCILIATION_REQUIRED.value,
     ]
-    assert any(issue["category"] == "FILL_EVIDENCE_REQUIRED" for issue in repository.open_reconciliation_issues("acct"))
+    assert any(
+        issue["category"] in {"BROKER_SNAPSHOT_MISMATCH", "FILL_EVIDENCE_REQUIRED"}
+        for issue in repository.open_reconciliation_issues("acct")
+    )
 
 
 def test_recovery_resolves_exact_unsupported_fill_issue_after_all_legs_are_evidenced(tmp_path):
     repository = ready_repository(tmp_path, 2)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     order_intent = make_intent(2)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     attempts = [repository.broker_orders_for_leg(leg.id)[0] for leg in order_intent.legs]
@@ -561,12 +663,19 @@ def test_recovery_keeps_unsupported_or_ambiguous_fill_query_reconciliation(tmp_p
     order_intent = make_intent(1)
 
     class BrokenHistoryAdapter(FakeAdapter):
+        def __init__(self, repository):
+            super().__init__(repository)
+            self.fail_history = False
+
         def get_fills(self, _account, since=None):
-            raise RuntimeError("deal history transport failure")
+            if self.fail_history:
+                raise RuntimeError("deal history transport failure")
+            return super().get_fills(_account, since=since)
 
     adapter = BrokenHistoryAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    adapter.fail_history = True
     attempt = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
     adapter.open_orders = [
         BrokerOrderSnapshot(
@@ -591,6 +700,53 @@ def test_recovery_keeps_unsupported_or_ambiguous_fill_query_reconciliation(tmp_p
     assert any(issue["category"] == "BROKER_QUERY_FAILED" for issue in repository.open_reconciliation_issues("acct"))
 
 
+def test_retryable_position_poll_stops_one_recovery_cycle_without_duplicate_poll_blockers(tmp_path):
+    class RetryableReadError(RuntimeError):
+        retryable = True
+
+    class RateLimitedAdapter(FakeAdapter):
+        def __init__(self, repository):
+            super().__init__(repository)
+            self.rate_limited = False
+            self.position_calls = 0
+            self.order_calls = 0
+            self.fill_calls = 0
+
+        def get_positions(self, account_value):
+            self.position_calls += 1
+            if self.rate_limited:
+                raise RetryableReadError("provider rate limit")
+            return super().get_positions(account_value)
+
+        def get_open_orders(self, account_value):
+            self.order_calls += 1
+            return super().get_open_orders(account_value)
+
+        def get_fills(self, account_value, since=None):
+            self.fill_calls += 1
+            return super().get_fills(account_value, since=since)
+
+    repository = ready_repository(tmp_path, 1)
+    adapter = RateLimitedAdapter(repository)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
+    intent = make_intent(1)
+    oms.submit_intent(intent, account=account(), risk_decision=decision(intent.id))
+    adapter.rate_limited = True
+
+    first = oms.recover_intent(intent.id, account=account())
+    second = oms.recover_intent(intent.id, account=account())
+
+    assert first["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert second["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert adapter.position_calls == 2
+    assert adapter.order_calls == 0
+    assert adapter.fill_calls == 0
+    actions = repository.open_recovery_actions("acct")
+    assert [item["action_key"] for item in actions] == ["POLL_ERROR:acct:positions"]
+    issues = repository.open_reconciliation_issues("acct")
+    assert [item["category"] for item in issues] == ["BROKER_QUERY_FAILED"]
+
+
 def test_open_reconciliation_issue_blocks_new_submission(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository, ambiguous_call=1)
@@ -613,23 +769,39 @@ def test_open_reconciliation_issue_blocks_new_submission(tmp_path):
 def test_fill_evidence_drives_completion(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     attempt = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
 
-    oms.apply_fill(
-        Fill(
-            id="fill",
+    oms._ingest_validated_broker_order_event(
+        BrokerOrderEvent(
+            id="event-fill",
             broker_order_id=attempt["id"],
-            order_leg_id=order_intent.legs[0].id,
-            external_fill_id="deal",
-            dedupe_key="deal",
-            quantity=Decimal("10"),
-            price=Decimal("100"),
-            filled_at=NOW,
+            dedupe_key="event-fill",
+            event_type="ORDER_STATUS",
+            event_at=NOW,
             received_at=NOW,
-        )
+            broker_status=BrokerOrderStatus.FILLED,
+            external_order_id=attempt["external_order_id"],
+            cumulative_filled_quantity=Decimal("10"),
+            account_id=account().id,
+            external_account_id=account().external_account_id,
+        ),
+        account=account(),
+        fills=(
+            BrokerFill(
+                external_order_id=attempt["external_order_id"],
+                external_fill_id="deal",
+                dedupe_key="deal",
+                quantity=Decimal("10"),
+                price=Decimal("100"),
+                filled_at=NOW,
+                received_at=NOW,
+                account_id=account().id,
+                evidence_reference="deal",
+            ),
+        ),
     )
     assert repository.get_intent(order_intent.id)["status"] == IntentStatus.FILLED.value
     assert oms.complete_intent(order_intent.id)["status"] == IntentStatus.COMPLETED.value
@@ -654,3 +826,174 @@ def test_only_filled_intent_can_be_completed(tmp_path):
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     with pytest.raises(OMSExecutionError):
         oms.complete_intent(order_intent.id)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        {"external_account_id": "different-external"},
+        {"broker": "other-broker"},
+        {"environment": TradingEnvironment.LIVE},
+        {"enabled": False},
+    ),
+)
+def test_recovery_status_rejects_every_noncanonical_account_component(tmp_path, variant):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(1)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+
+    status = oms.recovery_status(order_intent.id, account=replace(account(), **variant))
+
+    assert status["safe_to_submit"] is False
+    assert any(
+        issue["category"] == "ACCOUNT_CANONICAL_IDENTITY_MISMATCH"
+        for issue in repository.open_reconciliation_issues("acct")
+    )
+    assert any(
+        action["action_key"] == "ACCOUNT_CANONICAL_IDENTITY_MISMATCH:recovery_status"
+        for action in repository.recovery_actions_for_intent(order_intent.id)
+    )
+    assert adapter.submit_calls
+
+
+def test_new_submit_rejects_noncanonical_account_before_persisting_or_calling_adapter(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(1)
+
+    with pytest.raises(OMSExecutionError, match="canonical account"):
+        oms.submit_intent(
+            order_intent,
+            account=replace(account(), external_account_id="wrong-external"),
+            risk_decision=decision(order_intent.id),
+        )
+
+    assert repository.get_intent(order_intent.id) is None
+    assert adapter.submit_calls == []
+
+
+def test_persisted_disabled_account_blocks_accountless_status(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(1)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    with repository.transaction() as conn:
+        conn.execute("UPDATE core_accounts SET enabled = 0 WHERE id = ?", (account().id,))
+
+    status = oms.recovery_status(order_intent.id)
+
+    assert status["safe_to_submit"] is False
+    assert any(
+        issue["category"] == "ACCOUNT_CANONICAL_IDENTITY_MISMATCH"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )
+
+
+def test_accountless_recovery_status_loads_canonical_account_and_quarantines_multiple_attempts(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    order_intent = make_intent(1)
+    oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    first = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
+    repository.create_broker_order(
+        broker_order_id="second-attempt",
+        order_leg_id=order_intent.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=None,
+        client_order_id=None,
+        submitted_quantity=Decimal("10"),
+    )
+
+    status = oms.recovery_status(order_intent.id)
+
+    assert status["safe_to_submit"] is False
+    assert any(
+        issue["category"] == "MULTIPLE_ATTEMPTS_UNSUPPORTED"
+        for issue in repository.open_reconciliation_issues("acct")
+    )
+    assert first["id"]
+
+
+def test_open_action_on_other_intent_blocks_completion_account_wide(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    first = make_intent(1, key="first-key")
+    oms.submit_intent(first, account=account(), risk_decision=decision(first.id))
+
+    second_id = "second-intent"
+    second_leg = replace(first.legs[0], id="second-leg", intent_id=second_id)
+    second = replace(first, id=second_id, idempotency_key="second-key", legs=(second_leg,))
+    oms.submit_intent(second, account=account(), risk_decision=decision(second.id))
+    attempt = repository.broker_orders_for_leg(second_leg.id)[0]
+    repository.record_fill(
+        Fill(
+            id="second-fill",
+            broker_order_id=attempt["id"],
+            order_leg_id=second_leg.id,
+            external_fill_id="second-deal",
+            dedupe_key="second-deal",
+            quantity=Decimal("10"),
+            price=Decimal("100"),
+            filled_at=NOW,
+            received_at=NOW,
+            account_id=account().id,
+            external_order_id=attempt["external_order_id"],
+            evidence_reference="second-deal",
+        ),
+        _validation_token=repository._fill_validation_capability(),
+    )
+    first_record = repository.get_intent(first.id)
+    assert first_record is not None
+    oms._record_recovery_action(
+        intent=first_record,
+        account=account(),
+        action_key="ACCOUNT_WIDE_OPERATOR_BLOCK",
+        state="RECONCILIATION_REQUIRED",
+        summary="account-wide blocker",
+        observed_positions={"_status": "RECONCILIATION_REQUIRED"},
+        remaining_quantities={"first": "10"},
+    )
+
+    with pytest.raises(OMSExecutionError, match="reconciliation issues or recovery actions"):
+        oms.complete_intent(second.id)
+
+
+def test_sibling_multi_attempt_leg_blocks_new_account_submit(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = GenericOMS(repository, adapter)
+    first = make_intent(1, key="multi-sibling-source")
+    oms.submit_intent(first, account=account(), risk_decision=decision(first.id))
+    repository.create_broker_order(
+        broker_order_id="sibling-second-attempt",
+        order_leg_id=first.legs[0].id,
+        account_id=account().id,
+        broker=account().broker,
+        attempt_number=None,
+        client_order_id=None,
+        submitted_quantity=Decimal("10"),
+    )
+
+    new_id = "multi-sibling-new"
+    new_leg = replace(first.legs[0], id="multi-sibling-new-leg", intent_id=new_id)
+    new_intent = replace(
+        first,
+        id=new_id,
+        idempotency_key="multi-sibling-new-key",
+        legs=(new_leg,),
+    )
+    result = oms.submit_intent(new_intent, account=account(), risk_decision=decision(new_id))
+
+    assert result["status"] == IntentStatus.REJECTED.value
+    assert len(adapter.submit_calls) == 1
+    assert any(
+        issue["category"] == "MULTIPLE_ATTEMPTS_UNSUPPORTED"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )

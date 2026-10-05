@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "state_db": "data/stage6-pilot.db",
+  "market": "US",
+  "security_firm": "REPLACE_WITH_FUTUINC",
+  "account": {
+    "id": "REPLACE_WITH_INTERNAL_ACCOUNT_ID",
+    "broker": "moomoo",
+    "environment": "SIM",
+    "external_account_id": "REPLACE_WITH_SIM_ACCOUNT_ID",
+    "base_currency": "USD",
+    "enabled": true,
+    "created_at": "REPLACE_WITH_ISO_TIMESTAMP",
+    "updated_at": "REPLACE_WITH_ISO_TIMESTAMP",
+    "metadata": {
+      "account_capacity": "REPLACE_WITH_APPROVED_CAPACITY",
+      "allocation_capacity": "REPLACE_WITH_APPROVED_CAPACITY",
+      "capacity_unit": "FRACTION"
+    }
+  },
+  "strategy": {
+    "id": "REPLACE_WITH_STRATEGY_ID",
+    "name": "REPLACE_WITH_STRATEGY_NAME",
+    "strategy_type": "generic_stat_arb",
+    "version": "1",
+    "enabled": true,
+    "created_at": "REPLACE_WITH_ISO_TIMESTAMP",
+    "updated_at": "REPLACE_WITH_ISO_TIMESTAMP",
+    "config": {
+      "lookback": "REPLACE_WITH_LOOKBACK",
+      "z_entry": "REPLACE_WITH_ENTRY_THRESHOLD",
+      "z_exit": "REPLACE_WITH_EXIT_THRESHOLD"
+    }
+  },
+  "books": [
+    {
+      "id": "REPLACE_WITH_BOOK_A_ID",
+      "name": "REPLACE_WITH_BOOK_A_NAME",
+      "enabled": true,
+      "created_at": "REPLACE_WITH_ISO_TIMESTAMP",
+      "updated_at": "REPLACE_WITH_ISO_TIMESTAMP"
+    },
+    {
+      "id": "REPLACE_WITH_BOOK_B_ID",
+      "name": "REPLACE_WITH_BOOK_B_NAME",
+      "enabled": true,
+      "created_at": "REPLACE_WITH_ISO_TIMESTAMP",
+      "updated_at": "REPLACE_WITH_ISO_TIMESTAMP"
+    }
+  ],
+  "sleeves": [
+    {
+      "sleeve_id": "REPLACE_WITH_SLEEVE_A_ID",
+      "strategy_id": "REPLACE_WITH_STRATEGY_ID",
+      "account_id": "REPLACE_WITH_INTERNAL_ACCOUNT_ID",
+      "book_id": "REPLACE_WITH_BOOK_A_ID",
+      "name": "REPLACE_WITH_SLEEVE_A_NAME",
+      "version": "1",
+      "enabled": true,
+      "configuration": {
+        "pair_parameters": "REPLACE_WITH_PAIR_A_PARAMETERS"
+      },
+      "pair": [
+        {
+          "instrument_id": "REPLACE_WITH_A_LEG_1_ID",
+          "symbol": "REPLACE_WITH_A_LEG_1_SYMBOL",
+          "moomoo_symbol": "US.REPLACE_WITH_A_LEG_1_TICKER",
+          "venue": "US",
+          "currency": "USD"
+        },
+        {
+          "instrument_id": "REPLACE_WITH_A_LEG_2_ID",
+          "symbol": "REPLACE_WITH_A_LEG_2_SYMBOL",
+          "moomoo_symbol": "US.REPLACE_WITH_A_LEG_2_TICKER",
+          "venue": "US",
+          "currency": "USD"
+        }
+      ]
+    },
+    {
+      "sleeve_id": "REPLACE_WITH_SLEEVE_B_ID",
+      "strategy_id": "REPLACE_WITH_STRATEGY_ID",
+      "account_id": "REPLACE_WITH_INTERNAL_ACCOUNT_ID",
+      "book_id": "REPLACE_WITH_BOOK_B_ID",
+      "name": "REPLACE_WITH_SLEEVE_B_NAME",
+      "version": "1",
+      "enabled": true,
+      "configuration": {
+        "pair_parameters": "REPLACE_WITH_PAIR_B_PARAMETERS"
+      },
+      "pair": [
+        {
+          "instrument_id": "REPLACE_WITH_B_LEG_1_ID",
+          "symbol": "REPLACE_WITH_B_LEG_1_SYMBOL",
+          "moomoo_symbol": "US.REPLACE_WITH_B_LEG_1_TICKER",
+          "venue": "US",
+          "currency": "USD"
+        },
+        {
+          "instrument_id": "REPLACE_WITH_B_LEG_2_ID",
+          "symbol": "REPLACE_WITH_B_LEG_2_SYMBOL",
+          "moomoo_symbol": "US.REPLACE_WITH_B_LEG_2_TICKER",
+          "venue": "US",
+          "currency": "USD"
+        }
+      ]
+    }
+  ],
+  "allocation_update": {
+    "account_id": "REPLACE_WITH_INTERNAL_ACCOUNT_ID",
+    "version": 1,
+    "effective_at": "REPLACE_WITH_ISO_TIMESTAMP",
+    "provenance": "REPLACE_WITH_APPROVED_ALLOCATION_SOURCE",
+    "targets": [
+      {
+        "sleeve_id": "REPLACE_WITH_SLEEVE_A_ID",
+        "book_id": "REPLACE_WITH_BOOK_A_ID",
+        "target_weight": 0.5,
+        "capacity_unit": "FRACTION"
+      },
+      {
+        "sleeve_id": "REPLACE_WITH_SLEEVE_B_ID",
+        "book_id": "REPLACE_WITH_BOOK_B_ID",
+        "target_weight": 0.5,
+        "capacity_unit": "FRACTION"
+      }
+    ]
+  },
+  "targets": [
+    {
+      "sleeve_id": "REPLACE_WITH_SLEEVE_A_ID",
+      "cycle_id": "REPLACE_WITH_ENTRY_CYCLE_A",
+      "signal_id": "REPLACE_WITH_SIGNAL_A",
+      "instrument_ids": ["REPLACE_WITH_A_LEG_1_ID", "REPLACE_WITH_A_LEG_2_ID"],
+      "signed_quantities": [0, 0],
+      "action": "ENTER",
+      "evaluated_at": "REPLACE_WITH_ISO_TIMESTAMP",
+      "provenance": {
+        "source": "REPLACE_WITH_SIGNAL_SOURCE"
+      }
+    },
+    {
+      "sleeve_id": "REPLACE_WITH_SLEEVE_B_ID",
+      "cycle_id": "REPLACE_WITH_ENTRY_CYCLE_B",
+      "signal_id": "REPLACE_WITH_SIGNAL_B",
+      "instrument_ids": ["REPLACE_WITH_B_LEG_1_ID", "REPLACE_WITH_B_LEG_2_ID"],
+      "signed_quantities": [0, 0],
+      "action": "ENTER",
+      "evaluated_at": "REPLACE_WITH_ISO_TIMESTAMP",
+      "provenance": {
+        "source": "REPLACE_WITH_SIGNAL_SOURCE"
+      }
+    }
+  ],
+  "require_flat_entry": true,
+  "execution_policy": {
+    "rth_handoff_policy": "RTH_ONLY",
+    "execution_session": "REGULAR",
+    "allow_extended_hours": false,
+    "legging_policy": "SEQUENTIAL",
+    "partial_fill_policy": "WAIT",
+    "failure_policy": "HOLD_AND_RECONCILE",
+    "max_attempts": 1,
+    "timeout_seconds": 300,
+    "stale_order_seconds": 300
+  }
+}

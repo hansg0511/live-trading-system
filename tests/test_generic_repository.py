@@ -27,11 +27,13 @@ from src.trading_core.domain import (
     ReconciliationIssue,
     ReconciliationRun,
     ReconciliationStatus,
+    RecoveryAction,
+    RecoveryActionStatus,
     Side,
     Strategy,
     TradingEnvironment,
 )
-from src.trading_core.repository import IdempotencyConflict, SQLiteTradingRepository
+from src.trading_core.repository import IdempotencyConflict, SQLiteTradingRepository, _payload_hash
 
 
 NOW = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc)
@@ -166,6 +168,27 @@ def test_intent_and_all_legs_are_inserted_atomically_and_idempotently(tmp_path):
         repository.create_intent(replace(original, legs=changed_legs))
 
 
+def test_legacy_stage2_hash_retries_after_stale_policy_addition(tmp_path):
+    repository = ready_repository(tmp_path)
+    original = intent(2)
+    repository.create_intent(original)
+    legacy_hash = _payload_hash(original, include_stale_order_seconds=False)
+    with repository.transaction() as conn:
+        conn.execute(
+            "UPDATE core_order_intents SET payload_hash = ? WHERE id = ?",
+            (legacy_hash, original.id),
+        )
+
+    assert repository.create_intent(original) == (original.id, False)
+    with pytest.raises(IdempotencyConflict):
+        repository.create_intent(
+            replace(original, execution_policy=ExecutionPolicy(stale_order_seconds=301))
+        )
+    changed_legs = (replace(original.legs[0], quantity=Decimal("11")), *original.legs[1:])
+    with pytest.raises(IdempotencyConflict):
+        repository.create_intent(replace(original, legs=changed_legs))
+
+
 def test_one_logical_leg_can_have_multiple_broker_order_attempts(tmp_path):
     repository = ready_repository(tmp_path)
     original = intent()
@@ -184,6 +207,114 @@ def test_one_logical_leg_can_have_multiple_broker_order_attempts(tmp_path):
             replaces_broker_order_id="attempt-1" if attempt == 2 else None,
         )
     assert [row["attempt_number"] for row in repository.broker_orders_for_leg(leg_id)] == [1, 2]
+
+
+def test_repository_record_fill_requires_canonical_account_and_one_attempt(tmp_path):
+    repository = ready_repository(tmp_path)
+    original = intent()
+    repository.create_intent(original)
+    repository.create_broker_order(
+        broker_order_id="attempt-account-check",
+        order_leg_id=original.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=1,
+        client_order_id="account-check",
+        submitted_quantity=Decimal("10"),
+    )
+    with pytest.raises(ValueError, match="account identity"):
+        repository.record_fill(
+            Fill(
+                id="wrong-account-fill",
+                broker_order_id="attempt-account-check",
+                order_leg_id=original.legs[0].id,
+                dedupe_key="wrong-account-fill",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=NOW,
+                received_at=NOW,
+                account_id="other-account",
+            )
+        )
+
+    repository.create_broker_order(
+        broker_order_id="attempt-account-check-2",
+        order_leg_id=original.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=2,
+        client_order_id="account-check-2",
+        submitted_quantity=Decimal("10"),
+    )
+    with pytest.raises(ValueError, match="exactly one broker attempt"):
+        repository.record_fill(
+            Fill(
+                id="multi-attempt-fill",
+                broker_order_id="attempt-account-check",
+                order_leg_id=original.legs[0].id,
+                dedupe_key="multi-attempt-fill",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=NOW,
+                received_at=NOW,
+            )
+        )
+
+
+def test_repository_record_fill_cannot_bypass_open_account_blocker(tmp_path):
+    repository = ready_repository(tmp_path)
+    original = intent()
+    repository.create_intent(original)
+    repository.create_broker_order(
+        broker_order_id="blocked-fill-attempt",
+        order_leg_id=original.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=1,
+        client_order_id="blocked-fill",
+        submitted_quantity=Decimal("10"),
+    )
+    repository.save_reconciliation_run(
+        ReconciliationRun(
+            id="blocked-fill-run",
+            account_id="acct",
+            broker_snapshot_id=None,
+            started_at=NOW,
+            completed_at=NOW,
+            status=ReconciliationStatus.COMPLETED,
+            metadata={},
+        )
+    )
+    repository.upsert_reconciliation_issue(
+        ReconciliationIssue(
+            id="blocked-fill-issue",
+            run_id="blocked-fill-run",
+            account_id="acct",
+            issue_key="blocked-fill",
+            entity_type="ACCOUNT",
+            entity_key="acct",
+            category="TEST_BLOCKER",
+            severity=IssueSeverity.CRITICAL,
+            status=IssueStatus.OPEN,
+            sticky=True,
+            details={},
+            detected_at=NOW,
+        )
+    )
+
+    with pytest.raises(ValueError, match="blockers are open"):
+        repository.record_fill(
+            Fill(
+                id="blocked-fill",
+                broker_order_id="blocked-fill-attempt",
+                order_leg_id=original.legs[0].id,
+                dedupe_key="blocked-fill",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=NOW,
+                received_at=NOW,
+            )
+        )
 
 
 def test_partial_fills_accumulate_and_duplicates_do_not_double_count(tmp_path):
@@ -222,9 +353,23 @@ def test_partial_fills_accumulate_and_duplicates_do_not_double_count(tmp_path):
         filled_at=NOW,
         received_at=NOW,
         metadata={},
+        account_id="acct",
+        external_order_id="external",
+        evidence_reference="deal-1",
     )
-    assert repository.record_fill(first) is True
-    assert repository.record_fill(replace(first, id="duplicate")) is False
+    capability = repository._fill_validation_capability()
+    with pytest.raises(PermissionError, match="validated broker fill capability"):
+        repository.record_fill(
+            replace(
+                first,
+                id="forged-without-capability",
+                external_fill_id="forged-without-capability",
+                dedupe_key="forged-without-capability",
+                evidence_reference="forged-without-capability",
+            )
+        )
+    assert repository.record_fill(first, _validation_token=capability) is True
+    assert repository.record_fill(replace(first, id="duplicate"), _validation_token=capability) is False
     second = replace(
         first,
         id="fill-2",
@@ -232,8 +377,9 @@ def test_partial_fills_accumulate_and_duplicates_do_not_double_count(tmp_path):
         dedupe_key="deal-2",
         quantity=Decimal("6"),
         price=Decimal("110"),
+        evidence_reference="deal-2",
     )
-    assert repository.record_fill(second) is True
+    assert repository.record_fill(second, _validation_token=capability) is True
 
     stored = repository.get_intent(original.id)
     assert stored is not None
@@ -244,7 +390,75 @@ def test_partial_fills_accumulate_and_duplicates_do_not_double_count(tmp_path):
     assert repository.position_allocations("acct")[0]["signed_quantity"] == "10"
 
     with pytest.raises(ValueError, match="different evidence"):
-        repository.record_fill(replace(first, id="conflict", price=Decimal("999")))
+        repository.record_fill(
+            replace(first, id="conflict", price=Decimal("999")),
+            _validation_token=capability,
+        )
+
+
+def test_pre_stage3_fill_replay_is_idempotent_but_changed_evidence_conflicts(tmp_path):
+    repository = ready_repository(tmp_path)
+    original = intent(quantity=Decimal("10"))
+    repository.create_intent(original)
+    repository.transition_intent(original.id, IntentStatus.RISK_APPROVED)
+    repository.transition_intent(original.id, IntentStatus.SUBMITTING)
+    repository.transition_leg(original.legs[0].id, LegStatus.SUBMITTING)
+    repository.create_broker_order(
+        broker_order_id="legacy-attempt",
+        order_leg_id=original.legs[0].id,
+        account_id="acct",
+        broker="fake",
+        attempt_number=1,
+        client_order_id="legacy-client",
+        submitted_quantity=Decimal("10"),
+    )
+    repository.transition_broker_order("legacy-attempt", BrokerOrderStatus.SUBMITTING)
+    repository.record_submission(
+        "legacy-attempt",
+        status=BrokerOrderStatus.WORKING,
+        external_order_id="legacy-external",
+    )
+    repository.transition_leg(original.legs[0].id, LegStatus.WORKING)
+    repository.transition_intent(original.id, IntentStatus.WORKING)
+    with repository.transaction() as conn:
+        conn.execute(
+            """INSERT INTO core_fills
+               (id, broker_order_id, order_leg_id, external_fill_id, dedupe_key,
+                quantity, price, fee, fee_currency, filled_at, received_at, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "legacy-fill-row",
+                "legacy-attempt",
+                original.legs[0].id,
+                "legacy-deal",
+                "legacy-deal",
+                "4",
+                "100",
+                None,
+                None,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                "{}",
+            ),
+        )
+    replay = Fill(
+        id="legacy-fill-replay",
+        broker_order_id="legacy-attempt",
+        order_leg_id=original.legs[0].id,
+        external_fill_id="legacy-deal",
+        dedupe_key="legacy-deal",
+        quantity=Decimal("4"),
+        price=Decimal("100"),
+        filled_at=NOW,
+        received_at=NOW,
+    )
+    capability = repository._fill_validation_capability()
+    assert repository.record_fill(replay, _validation_token=capability) is False
+    with pytest.raises(ValueError, match="different evidence"):
+        repository.record_fill(
+            replace(replay, id="legacy-fill-changed", price=Decimal("101")),
+            _validation_token=capability,
+        )
 
 
 def test_fill_cannot_cross_logical_legs(tmp_path):
@@ -317,5 +531,29 @@ def test_reconciliation_issue_is_sticky_and_requires_explicit_resolution(tmp_pat
     opened = repository.open_reconciliation_issues("acct")
     assert opened[0]["occurrence_count"] == 2
 
-    repository.resolve_reconciliation_issue("issue", resolved_at=NOW)
+    with pytest.raises(PermissionError, match="resolution capability"):
+        repository.resolve_reconciliation_issue("issue", resolved_at=NOW)
+    assert repository.open_reconciliation_issues("acct")
+
+    original = intent()
+    repository.create_intent(original)
+    action = RecoveryAction(
+        id="action",
+        intent_id=original.id,
+        account_id="acct",
+        action_key="operator-review",
+        state="RECONCILIATION_REQUIRED",
+        summary="review",
+        detected_at=NOW,
+        status=RecoveryActionStatus.OPEN,
+    )
+    repository.upsert_recovery_action(action)
+    with pytest.raises(PermissionError, match="recovery-action resolution capability"):
+        repository.upsert_recovery_action(replace(action, status=RecoveryActionStatus.RESOLVED))
+
+    repository.resolve_reconciliation_issue(
+        "issue",
+        resolved_at=NOW,
+        _resolution_capability=repository._resolution_capability(),
+    )
     assert repository.open_reconciliation_issues("acct") == []
