@@ -333,6 +333,61 @@ CREATE TABLE IF NOT EXISTS core_execution_evidence_baselines (
     UNIQUE (account_id, source_ledger_fingerprint)
 );
 
+-- Stage 6 validation evidence is separate from the execution ledger.  The
+-- phase rows retain the operator's preflight/recovery/final observations;
+-- the session row is an immutable deterministic result derived from those
+-- observations.  Neither table creates an execution or broker-order path.
+CREATE TABLE IF NOT EXISTS core_stage6_validation_observations (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES core_accounts(id) ON DELETE RESTRICT,
+    phase TEXT NOT NULL CHECK (phase IN ('PREFLIGHT', 'RECOVERY', 'FINAL')),
+    captured_at TEXT NOT NULL,
+    process_id TEXT,
+    fresh_process INTEGER NOT NULL DEFAULT 0 CHECK (fresh_process IN (0, 1)),
+    evidence_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (id, evidence_hash)
+);
+
+CREATE TABLE IF NOT EXISTS core_stage6_validation_sessions (
+    session_id TEXT PRIMARY KEY,
+    us_trading_date TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    execution_compatibility TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES core_accounts(id) ON DELETE RESTRICT,
+    environment TEXT NOT NULL CHECK (environment = 'SIM'),
+    result TEXT NOT NULL CHECK (result IN ('CLEAN_PASS', 'FAILED', 'INVALID')),
+    qualified INTEGER NOT NULL CHECK (qualified IN (0, 1)),
+    counted_for_completion INTEGER NOT NULL CHECK (counted_for_completion IN (0, 1)),
+    evidence_class TEXT NOT NULL CHECK (evidence_class IN ('DURABLE', 'LEGACY_VERIFIED_EVIDENCE')),
+    expected_entry_order_count INTEGER NOT NULL CHECK (expected_entry_order_count >= 0),
+    actual_entry_order_count INTEGER NOT NULL CHECK (actual_entry_order_count >= 0),
+    expected_exit_order_count INTEGER NOT NULL CHECK (expected_exit_order_count >= 0),
+    actual_exit_order_count INTEGER NOT NULL CHECK (actual_exit_order_count >= 0),
+    duplicate_attempt_count INTEGER NOT NULL CHECK (duplicate_attempt_count >= 0),
+    run_ids_json TEXT NOT NULL DEFAULT '[]',
+    entry_intent_ids_json TEXT NOT NULL DEFAULT '[]',
+    exit_intent_ids_json TEXT NOT NULL DEFAULT '[]',
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    audit_refs_json TEXT NOT NULL DEFAULT '[]',
+    preflight_json TEXT NOT NULL DEFAULT '{}',
+    recovery_json TEXT NOT NULL DEFAULT '{}',
+    final_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- A US trading date can contribute at most one clean session to the Stage 6
+-- completion series.  Failed/invalid/legacy rows remain fully retained.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_core_stage6_clean_date
+    ON core_stage6_validation_sessions(us_trading_date)
+    WHERE result = 'CLEAN_PASS' AND qualified = 1;
+
 CREATE INDEX IF NOT EXISTS idx_core_intents_status
     ON core_order_intents(account_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_core_legs_status
@@ -364,6 +419,10 @@ CREATE INDEX IF NOT EXISTS idx_core_operational_events_account
     ON core_operational_events(account_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_core_execution_baselines_account
     ON core_execution_evidence_baselines(account_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_core_stage6_validation_observations_session
+    ON core_stage6_validation_observations(session_id, captured_at, id);
+CREATE INDEX IF NOT EXISTS idx_core_stage6_validation_sessions_account
+    ON core_stage6_validation_sessions(account_id, us_trading_date, completed_at);
 
 INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Initial broker-neutral trading core schema');
@@ -373,3 +432,6 @@ VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Durable generic recovery acti
 
 INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
 VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Dedicated broker-event evidence fingerprints');
+
+INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+VALUES (9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Durable Stage 6 supervised SIM validation evidence');

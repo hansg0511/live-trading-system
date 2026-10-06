@@ -900,6 +900,75 @@ The overall Stage 6 roadmap gate remains **in progress** until the documented
 multiple-session clean-reconciliation criterion is satisfied; that status is
 not a rejection of this distinct Oct 5 cycle.
 
+**Durable supervised-session validation (2026-10-06 UTC; additive offline
+implementation):** Stage 6 validation is now represented by the broker-neutral
+`src/trading_core/stage6_validation.py` model and the additive SQLite tables
+`core_stage6_validation_observations` and
+`core_stage6_validation_sessions`.  Phase observations are append-only;
+final results retain the canonical evidence document and its hash.  Reusing a
+session ID with changed evidence is rejected, and the partial unique index
+allows at most one qualified `CLEAN_PASS` for a US trading date.  `FAILED` and
+`INVALID` rows are never deleted or overwritten.  Completion requires at
+least three qualified clean sessions on three distinct US trading dates, all
+with the exact same declared execution-compatibility identity.  A commit SHA
+is retained separately as provenance; reporting-only changes may share a
+compatibility identity, while uncertain/material execution changes must use a
+new identity and cannot silently join the series.
+
+The validator requires explicit evidence for the SIM account identity,
+complete fresh account facts, regular US RTH, flat preflight, two books with
+valid allocations/mappings/quantities and no blockers, the two expected entry
+intents and attributable complete fills, a deliberate fresh-process recovery
+checkpoint with preserved intent/order IDs and no duplicate attempts, correct
+current-exposure exits (including documented delayed/partial recovery), and a
+fresh complete final flat/no-orders/no-exposure/no-issues/no-actions/
+no-unfinished-intents terminal state.  Manual database repair, direct SDK
+rescue, fabricated or silently dismissed evidence, and operator overrides are
+not countable.  Missing, contradictory, or legacy-only evidence is retained
+as `INVALID`/`LEGACY_VERIFIED_EVIDENCE` and does not advance the three-date
+gate.
+
+The existing Stage 6 CLI now has validation/reporting commands.  They never
+create a second submission path:
+
+```powershell
+# Record an explicit no-submit preflight observation.
+python scripts/generic_stage6_pilot.py session-preflight `
+  --config configs/stage6-pilot-sim-next-entry-20261005.json `
+  --session-id <session-id> --evidence <preflight.json> --json
+
+# Record evidence from the existing fresh-process Stage6PilotRunner.recover path.
+python scripts/generic_stage6_pilot.py session-recover `
+  --config configs/stage6-pilot-sim-next-entry-20261005.json `
+  --session-id <session-id> --evidence <recovery.json> `
+  --fresh-process --process-id <new-process-id> --json
+
+# Derive and persist one immutable result; this performs no broker action.
+python scripts/generic_stage6_pilot.py session-finalize `
+  --config configs/stage6-pilot-sim-next-entry-20261005.json `
+  --evidence <complete-session-evidence.json> --json
+
+python scripts/generic_stage6_pilot.py session-status `
+  --config configs/stage6-pilot-sim-next-entry-20261005.json `
+  --session-id <session-id> --json
+python scripts/generic_stage6_pilot.py stage-status `
+  --config configs/stage6-pilot-sim-next-entry-20261005.json --json
+```
+
+These commands do not connect to OpenD or submit orders.  When preflight
+evidence is omitted, `session-preflight` invokes the existing runner's
+`DRY_RUN` mode to capture its no-submit report, including any normal
+allocation bookkeeping that mode already performs; it then persists only the
+validation observation.  `sim-submit` remains the only broker-capable Stage 6
+command and still dispatches exclusively through `Stage6PilotRunner` →
+`GenericOMS`.
+The Oct 5 narrative evidence predates this durable validation ledger and does
+not contain a persisted validator recovery observation, so it is retained as
+`LEGACY_VERIFIED_EVIDENCE` and is not counted automatically.  It may only be
+backfilled if the durable records directly satisfy every required field; no
+date/result is hard-coded or manually invented.  The earlier wrong-direction
+EXIT incident remains immutable incident evidence.
+
 Run live signals in SIM at deliberately small size only after that preparation.
 Exercise normal entries/exits, simultaneous sleeve signals, restart recovery,
 delayed fills, and unrelated broker positions.

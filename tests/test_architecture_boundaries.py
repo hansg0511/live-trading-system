@@ -40,7 +40,10 @@ FORBIDDEN_GENERIC_IMPORT_PREFIXES = (
 
 # These are strategy/pair terms, not generic trading vocabulary.  The scan is
 # intentionally narrow so generic concepts such as position, allocation,
-# order, leg, and instrument remain available.
+# order, leg, and instrument remain available.  ``oms.py`` is an existing
+# execution boundary whose committed source already contains the word
+# ``pair`` in explanatory text; its source immutability is guarded separately
+# below rather than treating that pre-existing word as a new coupling.
 PAIR_SPECIFIC_TOKENS = (
     "pair",
     "ticker1",
@@ -50,6 +53,12 @@ PAIR_SPECIFIC_TOKENS = (
     "zscore",
     "cointegration",
 )
+
+PAIR_TOKEN_BASELINE_EXEMPTIONS = {
+    "src/trading_core/oms.py",
+}
+
+CURRENT_GENERIC_OMS_BLOB = "c7d2730c05a4b15bbb6ccc9b56330d698f2e35d0"
 
 CURRENT_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",
@@ -155,11 +164,29 @@ def test_generic_core_has_no_pair_specific_domain_tokens():
     assert GENERIC_ROOT.is_dir(), f"missing generic core directory: {GENERIC_ROOT}"
     violations: list[str] = []
     for path in _source_files(GENERIC_ROOT):
+        if path.relative_to(ROOT).as_posix() in PAIR_TOKEN_BASELINE_EXEMPTIONS:
+            continue
         text = path.read_text(encoding="utf-8").lower()
         for token in PAIR_SPECIFIC_TOKENS:
             if token in text:
                 violations.append(f"{path.relative_to(ROOT)} contains {token!r}")
     assert not violations, "pair-specific vocabulary crossed into trading_core:\n" + "\n".join(violations)
+
+
+def test_generic_oms_execution_source_remains_the_committed_baseline():
+    """Stage 6 validation must not alter the existing GenericOMS boundary."""
+    git_root = _git_root()
+    if git_root is None:
+        pytest.skip("Git repository is not available; cannot verify OMS baseline")
+    target = git_root / "src" / "trading_core" / "oms.py"
+    assert target.is_file(), "GenericOMS source is missing"
+    try:
+        actual_blob = _git_blob(git_root, "src/trading_core/oms.py")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"Git blob lookup unavailable: {exc}")
+    assert actual_blob == CURRENT_GENERIC_OMS_BLOB, (
+        "GenericOMS execution source changed; Stage 6 validation must remain additive"
+    )
 
 
 def test_translators_depend_on_core_when_present():

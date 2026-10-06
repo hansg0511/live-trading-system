@@ -51,6 +51,15 @@ from .state_machine import (
     validate_transition,
 )
 from .provider_payload import ProviderPayloadError, coerce_provider_payload, normalize_provider_key
+from .stage6_validation import (
+    Stage6EvidenceClass,
+    Stage6SessionOutcome,
+    Stage6SessionResult,
+    Stage6ValidationError,
+    canonical_evidence_json,
+    evaluate_stage6_session,
+    stage6_completion_status,
+)
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -252,6 +261,11 @@ class SQLiteTradingRepository:
                 """INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
                    VALUES (8, ?, ?)""",
                 (_timestamp(utc_now()), "Typed execution-evidence mode and bounded SIM baselines"),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+                   VALUES (9, ?, ?)""",
+                (_timestamp(utc_now()), "Durable Stage 6 supervised SIM validation evidence"),
             )
             self._audit_legacy_duplicate_fills_conn(conn)
             self._audit_legacy_duplicate_broker_orders_conn(conn)
@@ -2696,6 +2710,306 @@ class SQLiteTradingRepository:
             status=str(row["status"]),
             metadata=_decode(row["metadata_json"]),
         )
+
+    # ------------------------------------------------------------------
+    # Stage 6 validation evidence
+    # ------------------------------------------------------------------
+    def record_stage6_validation_observation(
+        self,
+        *,
+        observation_id: str,
+        session_id: str,
+        account_id: str,
+        phase: str,
+        captured_at: datetime,
+        evidence: Mapping[str, Any],
+        process_id: str | None = None,
+        fresh_process: bool = False,
+    ) -> str:
+        """Append one immutable validation-phase observation.
+
+        This is intentionally not an execution-ledger write.  A repeated
+        observation ID is accepted only when every persisted field is byte
+        equivalent after canonicalization; changed evidence is rejected.
+        """
+
+        observation_id = str(observation_id).strip()
+        session_id = str(session_id).strip()
+        account_id = str(account_id).strip()
+        phase = str(phase).strip().upper()
+        if not observation_id or not session_id or not account_id:
+            raise ValueError("observation_id, session_id, and account_id are required")
+        if phase not in {"PREFLIGHT", "RECOVERY", "FINAL"}:
+            raise ValueError("Stage 6 validation phase must be PREFLIGHT, RECOVERY, or FINAL")
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            raise ValueError("captured_at must be timezone-aware")
+        if type(fresh_process) is not bool:
+            raise ValueError("fresh_process must be a bool")
+        try:
+            evidence_json = canonical_evidence_json(evidence)
+        except Stage6ValidationError as exc:
+            raise ValueError(str(exc)) from exc
+        evidence_session_id = evidence.get("session_id")
+        if evidence_session_id is not None and str(evidence_session_id).strip() != session_id:
+            raise ValueError("Stage 6 observation evidence session_id does not match the row")
+        evidence_account_id = evidence.get("account_id")
+        if evidence_account_id is not None and str(evidence_account_id).strip() != account_id:
+            raise ValueError("Stage 6 observation evidence account_id does not match the row")
+        evidence_hash = _fingerprint(json.loads(evidence_json))
+        values = (
+            observation_id,
+            session_id,
+            account_id,
+            phase,
+            _timestamp(captured_at),
+            str(process_id).strip() if process_id is not None else None,
+            int(fresh_process),
+            evidence_json,
+            evidence_hash,
+        )
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM core_accounts WHERE id = ?", (account_id,)).fetchone() is None:
+                raise ValueError(f"unknown account for Stage 6 validation observation: {account_id}")
+            existing = conn.execute(
+                "SELECT * FROM core_stage6_validation_observations WHERE id = ?",
+                (observation_id,),
+            ).fetchone()
+            if existing is not None:
+                current = (
+                    str(existing["id"]),
+                    str(existing["session_id"]),
+                    str(existing["account_id"]),
+                    str(existing["phase"]),
+                    str(existing["captured_at"]),
+                    existing["process_id"],
+                    int(existing["fresh_process"]),
+                    str(existing["evidence_json"]),
+                    str(existing["evidence_hash"]),
+                )
+                expected = tuple(None if value is None else str(value) for value in values)
+                normalized_current = tuple(None if value is None else str(value) for value in current)
+                if normalized_current != expected:
+                    raise ValueError("Stage 6 validation observation ID was reused with different evidence")
+                return observation_id
+            conn.execute(
+                """INSERT INTO core_stage6_validation_observations
+                   (id, session_id, account_id, phase, captured_at, process_id,
+                    fresh_process, evidence_json, evidence_hash, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*values, _timestamp(utc_now())),
+            )
+        return observation_id
+
+    def stage6_validation_observations(
+        self,
+        session_id: str,
+        *,
+        phase: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return retained validation observations in capture order."""
+
+        clauses = ["session_id = ?"]
+        params: list[Any] = [str(session_id)]
+        if phase is not None:
+            normalized_phase = str(phase).strip().upper()
+            if normalized_phase not in {"PREFLIGHT", "RECOVERY", "FINAL"}:
+                raise ValueError("invalid Stage 6 validation phase")
+            clauses.append("phase = ?")
+            params.append(normalized_phase)
+        with self.transaction() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM core_stage6_validation_observations
+                     WHERE {' AND '.join(clauses)}
+                     ORDER BY captured_at, id""",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = _decode(item.pop("evidence_json"))
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _stage6_result_values(result: Stage6SessionResult) -> tuple[Any, ...]:
+        evidence_json = canonical_evidence_json(result.evidence)
+        return (
+            result.session_id,
+            result.us_trading_date,
+            _timestamp(result.started_at),
+            _timestamp(result.completed_at),
+            result.commit_sha,
+            result.execution_compatibility,
+            result.account_id,
+            "SIM",
+            result.outcome.value,
+            int(result.qualified),
+            int(result.counted_for_completion),
+            result.evidence_class,
+            int(result.expected_entry_order_count),
+            int(result.actual_entry_order_count),
+            int(result.expected_exit_order_count),
+            int(result.actual_exit_order_count),
+            int(result.duplicate_attempt_count),
+            _json(list(result.run_ids)),
+            _json(list(result.entry_intent_ids)),
+            _json(list(result.exit_intent_ids)),
+            _json(list(result.failure_reasons)),
+            _json(list(result.audit_refs)),
+            _json(result.preflight),
+            _json(result.restart_recovery),
+            _json(result.final),
+            evidence_json,
+            _fingerprint(json.loads(evidence_json)),
+        )
+
+    def save_stage6_validation_session(
+        self,
+        result: Stage6SessionResult | Mapping[str, Any],
+    ) -> Stage6SessionResult:
+        """Persist one immutable derived Stage 6 validation result.
+
+        Mapping inputs are evaluated through the same strict validator as the
+        CLI.  Callers cannot set ``qualified`` or completion counts to bypass
+        missing evidence.  A clean date collision is rejected while all
+        failed/invalid rows remain retained.
+        """
+
+        if isinstance(result, Stage6SessionResult):
+            try:
+                derived = evaluate_stage6_session(result.evidence)
+            except Stage6ValidationError as exc:
+                raise ValueError(str(exc)) from exc
+            if (
+                derived.session_id != result.session_id
+                or derived.outcome is not result.outcome
+                or derived.qualified != result.qualified
+                or derived.evidence_class != result.evidence_class
+                or derived.failure_reasons != result.failure_reasons
+            ):
+                raise ValueError("Stage 6 validation result fields do not match derived evidence")
+            normalized = derived
+        elif isinstance(result, Mapping):
+            try:
+                normalized = evaluate_stage6_session(result)
+            except Stage6ValidationError as exc:
+                raise ValueError(str(exc)) from exc
+        else:
+            raise TypeError("Stage 6 validation result must be Stage6SessionResult or a mapping")
+        if normalized.outcome is Stage6SessionOutcome.CLEAN_PASS:
+            if not normalized.qualified or not normalized.counted_for_completion:
+                raise ValueError("CLEAN_PASS must be qualified and initially countable")
+            if normalized.evidence_class != Stage6EvidenceClass.DURABLE.value:
+                raise ValueError("legacy evidence cannot be persisted as CLEAN_PASS")
+            if normalized.manual_intervention:
+                raise ValueError("manual intervention cannot be persisted as CLEAN_PASS")
+        elif normalized.qualified or normalized.counted_for_completion:
+            raise ValueError("FAILED/INVALID Stage 6 validation rows cannot be qualified")
+        values = self._stage6_result_values(normalized)
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM core_accounts WHERE id = ?", (normalized.account_id,)).fetchone() is None:
+                raise ValueError(f"unknown account for Stage 6 validation session: {normalized.account_id}")
+            existing = conn.execute(
+                "SELECT * FROM core_stage6_validation_sessions WHERE session_id = ?",
+                (normalized.session_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_hash = str(existing["evidence_hash"])
+                if existing_hash != str(values[-1]):
+                    raise ValueError("Stage 6 validation session is immutable; evidence changed")
+                return normalized
+            try:
+                placeholders = ", ".join("?" for _ in range(28))
+                conn.execute(
+                    f"""INSERT INTO core_stage6_validation_sessions
+                       (session_id, us_trading_date, started_at, completed_at,
+                        commit_sha, execution_compatibility, account_id, environment,
+                        result, qualified, counted_for_completion, evidence_class,
+                        expected_entry_order_count, actual_entry_order_count,
+                        expected_exit_order_count, actual_exit_order_count,
+                        duplicate_attempt_count, run_ids_json, entry_intent_ids_json,
+                        exit_intent_ids_json, failure_reasons_json, audit_refs_json,
+                        preflight_json, recovery_json, final_json, evidence_json,
+                        evidence_hash, created_at)
+                       VALUES ({placeholders})""",
+                    (*values, _timestamp(utc_now())),
+                )
+            except sqlite3.IntegrityError as exc:
+                if normalized.outcome is Stage6SessionOutcome.CLEAN_PASS:
+                    raise ValueError(
+                        f"a CLEAN_PASS already exists for US trading date {normalized.us_trading_date}"
+                    ) from exc
+                raise
+        return normalized
+
+    def get_stage6_validation_session(self, session_id: str) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM core_stage6_validation_sessions WHERE session_id = ?",
+                (str(session_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        for column, target in (
+            ("run_ids_json", "run_ids"),
+            ("entry_intent_ids_json", "entry_intent_ids"),
+            ("exit_intent_ids_json", "exit_intent_ids"),
+            ("failure_reasons_json", "failure_reasons"),
+            ("audit_refs_json", "audit_refs"),
+            ("preflight_json", "preflight"),
+            ("recovery_json", "restart_recovery"),
+            ("final_json", "final"),
+            ("evidence_json", "evidence"),
+        ):
+            item[target] = _decode(item.pop(column))
+        item["qualified"] = bool(item["qualified"])
+        item["counted_for_completion"] = bool(item["counted_for_completion"])
+        return item
+
+    def list_stage6_validation_sessions(
+        self,
+        account_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(str(account_id))
+        query = "SELECT session_id FROM core_stage6_validation_sessions"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY us_trading_date, completed_at, session_id"
+        with self.transaction() as conn:
+            ids = [str(row["session_id"]) for row in conn.execute(query, params).fetchall()]
+        rows: list[dict[str, Any]] = []
+        for session_id in ids:
+            row = self.get_stage6_validation_session(session_id)
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    def stage6_validation_status(
+        self,
+        account_id: str | None = None,
+        *,
+        execution_compatibility: str | None = None,
+        required_sessions: int = 3,
+    ) -> dict[str, Any]:
+        rows = self.list_stage6_validation_sessions(account_id)
+        status = stage6_completion_status(
+            rows,
+            required_sessions=required_sessions,
+            execution_compatibility=execution_compatibility,
+        )
+        status["account_id"] = account_id
+        status["sessions"] = rows
+        return status
+
+    # Short aliases keep the public repository surface discoverable for CLI
+    # callers while retaining the explicit validation name in documentation.
+    record_stage6_observation = record_stage6_validation_observation
+    stage6_validation_session = get_stage6_validation_session
 
     def import_legacy_order_evidence(
         self,
