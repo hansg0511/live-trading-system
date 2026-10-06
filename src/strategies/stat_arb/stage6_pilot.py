@@ -40,7 +40,7 @@ from src.trading_core.domain import (
     TradingEnvironment,
 )
 from src.trading_core.oms import GenericOMS
-from src.trading_core.ports import BrokerFactSnapshot, BrokerHistoricalOrderFacts
+from src.trading_core.ports import BrokerFactSnapshot, BrokerFill, BrokerHistoricalOrderFacts
 from src.trading_core.repository import SQLiteTradingRepository
 
 from .stage5_sleeves import (
@@ -564,29 +564,25 @@ class Stage6PilotRunner:
                         )
         return reasons
 
-    def _fresh_broker_facts(self, spec: Stage6PilotSpec) -> tuple[dict[str, Any], list[str]]:
-        """Run the pilot's read-only account gate before any submit call."""
+    def _fresh_broker_snapshot(
+        self,
+        spec: Stage6PilotSpec,
+    ) -> tuple[BrokerFactSnapshot | None, list[str]]:
+        """Read and validate one fresh account-scoped fact set.
 
+        This helper deliberately has no repository writes and no broker command
+        capability.  ``run(..., SIM_SUBMIT)`` continues to use the same gate;
+        the broker-preflight command uses it before constructing any intents.
+        """
         getter = getattr(self.oms.adapter, "get_authoritative_account_facts", None)
         if not callable(getter):
-            return {}, ["adapter lacks authoritative fresh account-facts capability"]
+            return None, ["adapter lacks authoritative fresh account-facts capability"]
         try:
             facts = getter(spec.account)
         except Exception as exc:
-            return {}, [f"authoritative broker facts unavailable: {exc}"]
+            return None, [f"authoritative broker facts unavailable: {exc}"]
         if not isinstance(facts, BrokerFactSnapshot):
-            return {}, ["authoritative broker facts returned an invalid snapshot"]
-        summary = {
-            "account_id": facts.account_id,
-            "captured_at": facts.captured_at.isoformat(),
-            "complete": facts.complete,
-            "execution_evidence_mode": facts.execution_evidence_mode.value,
-            "execution_evidence_scope": sorted(facts.execution_evidence_scope),
-            "position_count": len(facts.positions),
-            "open_order_count": len(facts.open_orders),
-            "fill_count": len(facts.fills),
-            "error": facts.error,
-        }
+            return None, ["authoritative broker facts returned an invalid snapshot"]
         reasons: list[str] = []
         if facts.account_id != spec.account.id:
             reasons.append("authoritative broker facts belong to a different account")
@@ -653,7 +649,320 @@ class Stage6PilotRunner:
                 reasons.append(
                     f"unattributed broker fill evidence is present for {fill.external_order_id}"
                 )
-        return summary, reasons
+        return facts, reasons
+
+    def _fresh_broker_facts(self, spec: Stage6PilotSpec) -> tuple[dict[str, Any], list[str]]:
+        """Run the pilot's read-only account gate before any submit call."""
+
+        facts, reasons = self._fresh_broker_snapshot(spec)
+        if facts is None:
+            return {}, reasons
+        return {
+            "account_id": facts.account_id,
+            "captured_at": facts.captured_at.isoformat(),
+            "complete": facts.complete,
+            "execution_evidence_mode": facts.execution_evidence_mode.value,
+            "execution_evidence_scope": sorted(facts.execution_evidence_scope),
+            "position_count": len(facts.positions),
+            "open_order_count": len(facts.open_orders),
+            "fill_count": len(facts.fills),
+            "error": facts.error,
+        }, reasons
+
+    @staticmethod
+    def _broker_position_payload(position: PositionSnapshot) -> dict[str, Any]:
+        return {
+            "id": position.id,
+            "broker_snapshot_id": position.broker_snapshot_id,
+            "account_id": position.account_id,
+            "instrument_id": position.instrument_id,
+            "signed_quantity": str(position.signed_quantity),
+            "average_price": str(position.average_price) if position.average_price is not None else None,
+            "captured_at": position.captured_at.isoformat(),
+            "metadata": _stable_value(position.metadata),
+        }
+
+    @staticmethod
+    def _broker_order_payload(order: Any) -> dict[str, Any]:
+        return {
+            "id": order.id,
+            "broker_snapshot_id": order.broker_snapshot_id,
+            "account_id": order.account_id,
+            "external_account_id": order.external_account_id,
+            "instrument_id": order.instrument_id,
+            "external_order_id": order.external_order_id,
+            "client_order_id": order.client_order_id,
+            "side": order.side.value,
+            "quantity": str(order.quantity),
+            "filled_quantity": str(order.filled_quantity),
+            "status": order.status.value,
+            "captured_at": order.captured_at.isoformat(),
+            "order_time": order.order_time.isoformat() if order.order_time is not None else None,
+            "no_fill_asserted": order.no_fill_asserted,
+            "authority": order.authority,
+            "metadata": _stable_value(order.metadata),
+        }
+
+    @staticmethod
+    def _broker_fill_payload(fill: BrokerFill) -> dict[str, Any]:
+        return {
+            "external_order_id": fill.external_order_id,
+            "external_fill_id": fill.external_fill_id,
+            "dedupe_key": fill.dedupe_key,
+            "quantity": str(fill.quantity),
+            "price": str(fill.price),
+            "filled_at": fill.filled_at.isoformat(),
+            "received_at": fill.received_at.isoformat(),
+            "account_id": fill.account_id,
+            "instrument_id": fill.instrument_id,
+            "evidence_reference": fill.evidence_reference,
+            "evidence_mode": fill.evidence_mode.value,
+            "metadata": _stable_value(fill.metadata),
+        }
+
+    def _fresh_market_state(
+        self,
+        spec: Stage6PilotSpec,
+        symbols: Sequence[str],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Read authoritative provider market/session state without commands."""
+
+        getter = getattr(self.oms.adapter, "get_authoritative_market_state", None)
+        if not callable(getter):
+            return {}, ["adapter lacks authoritative market/RTH state capability"]
+        requested = tuple(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip())
+        if not requested:
+            return {}, ["configured broker symbols are unavailable for market/RTH preflight"]
+        try:
+            value = getter(requested)
+        except Exception as exc:
+            return {}, [f"authoritative market/RTH state unavailable: {exc}"]
+        if not isinstance(value, Mapping):
+            return {}, ["authoritative market/RTH state returned an invalid report"]
+        report = dict(value)
+        reasons: list[str] = []
+        if str(report.get("market", "")).strip().upper() != "US":
+            reasons.append("authoritative market/RTH state is not for US")
+        if report.get("complete") is not True:
+            reasons.append("authoritative market/RTH state is incomplete")
+        captured_at = report.get("captured_at")
+        if not isinstance(captured_at, str) or not captured_at.strip():
+            reasons.append("authoritative market/RTH state has no capture timestamp")
+        raw_rows = report.get("rows")
+        if type(raw_rows) is not list or not raw_rows:
+            reasons.append("authoritative market/RTH state has no symbol rows")
+            raw_rows = []
+        rows: list[dict[str, Any]] = []
+        observed_symbols: set[str] = set()
+        rth_states = {"RTH", "REGULAR", "MORNING", "AFTERNOON"}
+        for index, raw_row in enumerate(raw_rows):
+            if not isinstance(raw_row, Mapping):
+                reasons.append(f"authoritative market/RTH row {index} is malformed")
+                continue
+            row = dict(raw_row)
+            symbol = str(row.get("symbol", row.get("code", ""))).strip().upper()
+            state = str(row.get("market_state", row.get("session", row.get("state", "")))).strip().upper()
+            if not symbol:
+                reasons.append(f"authoritative market/RTH row {index} has no symbol")
+            else:
+                observed_symbols.add(symbol)
+            if not state:
+                reasons.append(f"authoritative market/RTH row {index} has no market state")
+            elif state not in rth_states:
+                reasons.append(f"authoritative market state for {symbol or index} is not RTH: {state}")
+            rows.append({**row, "symbol": symbol, "market_state": state})
+        if observed_symbols != set(requested):
+            reasons.append(
+                "authoritative market/RTH symbols do not match configuration: "
+                f"expected {sorted(set(requested))}, observed {sorted(observed_symbols)}"
+            )
+        report["market"] = str(report.get("market", "")).strip().upper()
+        report["symbols"] = list(requested)
+        report["rows"] = rows
+        report["rth"] = {
+            "observed": not reasons,
+            "market_state": (
+                rows[0].get("market_state")
+                if rows and len({row.get("market_state") for row in rows}) == 1
+                else "MIXED"
+            ),
+        }
+        return report, reasons
+
+    def broker_preflight(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        market_symbols: Sequence[str] = (),
+        mapping_details: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Perform a connected, read-only broker/account preflight.
+
+        This method intentionally does not call ``run``, ``recover``, or any
+        GenericOMS submission/recovery method.  It creates no intents, legs,
+        broker-order attempts, or fills.
+        """
+
+        started = self._now()
+        stop_reasons: list[str] = []
+        try:
+            spec.validate_repository(self.repository)
+        except Exception as exc:
+            stop_reasons.append(f"configuration/repository validation failed: {exc}")
+
+        local_blockers: list[str] = []
+        book_risk_status: Mapping[str, Any] = {}
+        try:
+            book_risk_status = self.oms.book_risk_status(account=spec.account)
+            blocked_books = [
+                book_id
+                for book_id, value in book_risk_status.get("books", {}).items()
+                if isinstance(value, Mapping) and value.get("status") == "BLOCKED"
+            ]
+            if blocked_books:
+                local_blockers.append("book risk status is blocked for: " + ", ".join(sorted(blocked_books)))
+        except Exception as exc:
+            local_blockers.append(f"book risk status unavailable: {exc}")
+        try:
+            local_blockers.extend(self._local_blockers(spec))
+        except Exception as exc:
+            local_blockers.append(f"local safety blockers unavailable: {exc}")
+
+        unfinished_statuses = {
+            IntentStatus.CREATED.value,
+            IntentStatus.RISK_APPROVED.value,
+            IntentStatus.SUBMITTING.value,
+            IntentStatus.WORKING.value,
+            IntentStatus.PARTIALLY_FILLED.value,
+            IntentStatus.RECONCILIATION_REQUIRED.value,
+        }
+        try:
+            closed_historical = self.oms._closed_historical_intent_ids(spec.account)
+        except Exception as exc:
+            closed_historical = set()
+            local_blockers.append(f"historical intent closure state unavailable: {exc}")
+        unfinished_intents = [
+            {
+                "intent_id": str(row.get("id")),
+                "status": str(row.get("status")),
+                "book_id": row.get("book_id"),
+            }
+            for row in self.repository.book_intents(spec.account.id)
+            if str(row.get("status")) in unfinished_statuses
+            and str(row.get("id")) not in closed_historical
+        ]
+        if unfinished_intents:
+            local_blockers.append(
+                f"{len(unfinished_intents)} unfinished account intent(s) block preflight"
+            )
+        stop_reasons.extend(local_blockers)
+
+        facts, fact_reasons = self._fresh_broker_snapshot(spec)
+        stop_reasons.extend(fact_reasons)
+        market_report, market_reasons = self._fresh_market_state(spec, market_symbols)
+        stop_reasons.extend(market_reasons)
+
+        broker_facts: dict[str, Any] = {
+            "account_id": facts.account_id if facts is not None else spec.account.id,
+            "captured_at": facts.captured_at.isoformat() if facts is not None else None,
+            "complete": facts.complete if facts is not None else False,
+            "error": facts.error if facts is not None else "authoritative broker facts unavailable",
+            "execution_evidence_mode": (
+                facts.execution_evidence_mode.value if facts is not None else "UNAVAILABLE"
+            ),
+            "execution_evidence_scope": sorted(facts.execution_evidence_scope) if facts is not None else [],
+            "flat": not facts.positions if facts is not None else False,
+            "position_count": len(facts.positions) if facts is not None else 0,
+            "open_order_count": len(facts.open_orders) if facts is not None else 0,
+            "fill_count": len(facts.fills) if facts is not None else 0,
+            "positions": [self._broker_position_payload(item) for item in facts.positions] if facts else [],
+            "open_orders": [self._broker_order_payload(item) for item in facts.open_orders] if facts else [],
+            "fills": [self._broker_fill_payload(item) for item in facts.fills] if facts else [],
+            "metadata": _stable_value(facts.metadata) if facts is not None else {},
+        }
+
+        books: list[dict[str, Any]] = []
+        targets_by_sleeve = {target.sleeve_id: target for target in spec.targets}
+        allocation_by_sleeve = {target.sleeve_id: target for target in spec.allocation_update.targets}
+        for sleeve in spec.sleeves:
+            target = targets_by_sleeve[sleeve.sleeve_id]
+            allocation = allocation_by_sleeve[sleeve.sleeve_id]
+            books.append(
+                {
+                    "book_id": sleeve.book_id,
+                    "sleeve_id": sleeve.sleeve_id,
+                    "allocation_valid": True,
+                    "mapping_valid": True,
+                    "allocation": {
+                        "version": spec.allocation_update.version,
+                        "target_weight": str(allocation.target_weight) if allocation.target_weight is not None else None,
+                        "capacity": str(allocation.capacity) if allocation.capacity is not None else None,
+                        "capacity_unit": allocation.capacity_unit,
+                    },
+                    "expected_quantities": {
+                        instrument_id: str(quantity)
+                        for instrument_id, quantity in zip(
+                            target.instrument_ids,
+                            target.signed_quantities,
+                            strict=True,
+                        )
+                    },
+                }
+            )
+
+        open_issues = self.repository.open_reconciliation_issues(spec.account.id)
+        open_actions = self.repository.open_recovery_actions(spec.account.id)
+        preflight = {
+            "account_identity": {
+                "account_id": spec.account.id,
+                "external_account_id": spec.account.external_account_id,
+                "broker": spec.account.broker,
+                "environment": spec.account.environment.value,
+            },
+            "fresh_facts": broker_facts,
+            "rth": market_report.get("rth", {"observed": False}) if market_report else {"observed": False},
+            "books": books,
+            "mappings": [dict(item) for item in mapping_details],
+            "mappings_valid": True,
+            "quantities_valid": True,
+            "safety_gates_passed": not stop_reasons,
+            "blockers": {
+                "issues": len(open_issues),
+                "actions": len(open_actions),
+                "unfinished_intents": len(unfinished_intents),
+            },
+            "reconciliation_issues": _stable_value(open_issues),
+            "recovery_actions": _stable_value(open_actions),
+            "unfinished_intents": unfinished_intents,
+            "local_book_risk_status": _stable_value(book_risk_status),
+            "local_blockers": list(local_blockers),
+        }
+        return {
+            "run_id": spec.run_id,
+            "mode": "BROKER_PREFLIGHT",
+            "started_at": started.isoformat(),
+            "completed_at": self._now().isoformat(),
+            "account": preflight["account_identity"],
+            "broker_contacted": True,
+            "orders_submitted": 0,
+            "preflight_passed": not stop_reasons,
+            "broker_preflight_passed": not stop_reasons,
+            "stop_reasons": list(stop_reasons),
+            "broker_facts": broker_facts,
+            "market_state": market_report,
+            "preflight": preflight,
+            "config": {"books": books, "mappings": [dict(item) for item in mapping_details]},
+            "mutations": {
+                "order_intents": 0,
+                "order_legs": 0,
+                "broker_orders": 0,
+                "fills": 0,
+                "submission_calls": 0,
+                "cancel_calls": 0,
+                "replace_calls": 0,
+                "recovery_calls": 0,
+            },
+        }
 
     @staticmethod
     def _parse_history_timestamp(value: object, *, field: str) -> datetime:

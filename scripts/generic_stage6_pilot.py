@@ -5,7 +5,10 @@ Commands are intentionally asymmetric:
 * ``validate`` only parses and validates the JSON configuration.
 * ``dry-run`` prepares the local generic repository and prints the full
   two-intent report without contacting a broker.
-* ``sim-submit`` is the only broker-capable command and requires both
+* ``broker-preflight`` performs fresh account and provider market-state reads
+  through the configured generic adapter, but never creates or submits an
+  order.
+* ``sim-submit`` is the only broker-order command and requires both
   ``--arm-sim`` and the exact confirmation phrase containing the deterministic
   run correlation.  It still submits only through ``Stage6PilotRunner`` and
   ``GenericOMS``; there is no direct order path here.
@@ -47,12 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser("validate", help="validate config only; no DB or broker access")
     dry_run = subparsers.add_parser("dry-run", help="prepare repository and print a no-submit report")
+    broker_preflight = subparsers.add_parser(
+        "broker-preflight",
+        help="query fresh SIM account/RTH facts without creating or submitting orders",
+    )
     baseline = subparsers.add_parser(
         "baseline",
         help="explicitly verify fresh flat SIM facts and import bounded legacy order evidence (no submit)",
     )
     sim_submit = subparsers.add_parser("sim-submit", help="explicitly arm one SIM pilot through GenericOMS")
-    for command in (validate, dry_run, baseline, sim_submit):
+    for command in (validate, dry_run, broker_preflight, baseline, sim_submit):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--json", action="store_true", dest="as_json")
     baseline.add_argument("--legacy-db", type=Path, required=True)
@@ -390,6 +397,42 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         )
 
     repository = SQLiteTradingRepository(config.state_db)
+    if args.command == "broker-preflight":
+        # This command is structurally read-only: unlike dry-run and the
+        # execution command, it must not bootstrap or persist config rows.
+        # ``Stage6PilotRunner.broker_preflight`` validates the already-existing
+        # canonical repository objects before querying the adapter.
+        spec = config.spec()
+        try:
+            config.validate_repository(repository)
+        except Exception as exc:
+            raise Stage6ConfigError(f"existing repository validation failed: {exc}") from exc
+        adapter = config.build_moomoo_adapter()
+        connected = True
+        try:
+            adapter.connect()
+            mapping_details = [
+                {
+                    "mapping_id": mapping.id,
+                    "instrument_id": mapping.instrument_id,
+                    "provider": mapping.provider,
+                    "purpose": mapping.purpose.value,
+                    "external_symbol": mapping.external_symbol,
+                    "external_id": mapping.external_id,
+                }
+                for mapping in config.mappings
+            ]
+            result = config.build_runner(repository, adapter=adapter).broker_preflight(
+                spec,
+                market_symbols=tuple(mapping.external_symbol for mapping in config.mappings),
+                mapping_details=mapping_details,
+            )
+            result["config"] = _summary(config)
+            return (0 if result.get("preflight_passed") else 2), result
+        finally:
+            if connected:
+                adapter.disconnect()
+
     config.ensure_repository(repository)
     if args.command == "dry-run":
         report = config.build_runner(repository).run(config.spec(), mode=Stage6RunMode.DRY_RUN)

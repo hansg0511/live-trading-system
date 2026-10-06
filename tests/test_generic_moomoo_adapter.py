@@ -175,6 +175,39 @@ def adapter(context: FakeTradeContext | None = None) -> MooMooGenericAdapter:
     return result
 
 
+def test_generic_adapter_market_state_is_read_only_and_closed_with_adapter():
+    quote_contexts = []
+
+    class FakeQuoteContext:
+        def __init__(self, **_kwargs):
+            self.closed = False
+            quote_contexts.append(self)
+
+        def get_market_state(self, symbols):
+            return 0, [{"code": symbol, "market_state": "MORNING"} for symbol in symbols]
+
+        def close(self):
+            self.closed = True
+
+    class QuoteSdk(FakeSdk):
+        OpenQuoteContext = FakeQuoteContext
+
+    broker = MooMooGenericAdapter(
+        instrument_resolver=resolver(),
+        external_account_id="42",
+        sdk_module=QuoteSdk,
+        trade_context=FakeTradeContext(),
+    )
+    assert broker.connect()
+    report = broker.get_authoritative_market_state(["US.AAPL", "US.MSFT"])
+    assert report["market"] == "US"
+    assert report["complete"] is True
+    assert [row["market_state"] for row in report["rows"]] == ["MORNING", "MORNING"]
+    assert quote_contexts and quote_contexts[0].closed is False
+    broker.disconnect()
+    assert quote_contexts[0].closed is True
+
+
 def request(
     *,
     order_type: str = "LIMIT",

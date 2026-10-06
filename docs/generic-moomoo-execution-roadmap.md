@@ -675,6 +675,12 @@ python scripts/generic_stage6_pilot.py validate `
 python scripts/generic_stage6_pilot.py dry-run `
   --config configs/stage6-pilot.json
 
+# Fresh authoritative SIM account facts and provider US market/RTH state only.
+# This connects through the generic adapter, creates no ledger order rows, and
+# never imports the legacy evidence database or reaches a broker command.
+python scripts/generic_stage6_pilot.py broker-preflight `
+  --config configs/stage6-pilot.json --json
+
 # Explicit SIM compatibility checkpoint; read-only provider facts plus a
 # transactional import of the verified bounded legacy order ledger.  This
 # creates no order and requires the operator's explicit flat-state confirmation.
@@ -706,6 +712,13 @@ market state, and no broker/local blockers immediately before `sim-submit`.
 This is configuration/readiness tooling only and does not constitute Stage 6
 pilot evidence or completion.
 
+The connected `broker-preflight` command is the read-only checkpoint for this
+checklist.  It reports the exact configured SIM account, complete fresh
+account facts, provider market/RTH rows, execution-evidence mode, local
+reconciliation/book blockers, and every configured book/allocation/mapping/
+quantity.  It does not call submit, cancel, replace, recovery, or legacy
+evidence-import code, and disconnects the configured adapter before returning.
+
 Moomoo SIM currently rejects the deal-history endpoint.  The adapter therefore
 advertises `CUMULATIVE_ORDER_SNAPSHOTS` with bounded current/historical order
 coverage, never fabricates an external deal ID, and only derives fill evidence
@@ -717,8 +730,17 @@ must freshly verify the account is flat and import the exact known legacy
 claims into a retired `legacy-smoke` strategy/book; the persisted baseline is
 then required to clear the bounded history-gap blocker.  Those imported rows
 are not attributed to either new Stage 6 sleeve and the source database is
-read-only.  Re-running the exact baseline is idempotent; changed or unmatched
-source/account/order evidence is rejected.
+read-only.  Re-running with the same label and exact source claims is intended
+to be idempotent; changed or unmatched source/account/order evidence is
+rejected.
+
+**Known baseline-import limitation (separate from broker-preflight):**
+`import_legacy_order_evidence()` deduplicates by its generated local order ID
+before inserting the source `(account_id, external_order_id)`.  A previously
+imported source order under a different legacy label can therefore hit the
+SQLite account/external-order uniqueness constraint.  The new broker-preflight
+does not invoke this importer; this remains a compatibility defect to repair
+separately.
 
 After offline review, a separately approved RTH SIM run uses:
 
@@ -955,12 +977,13 @@ python scripts/generic_stage6_pilot.py stage-status `
   --config configs/stage6-pilot-sim-next-entry-20261005.json --json
 ```
 
-These commands do not connect to OpenD or submit orders.  When preflight
+These validation commands do not connect to OpenD or submit orders.  When preflight
 evidence is omitted, `session-preflight` invokes the existing runner's
 `DRY_RUN` mode to capture its no-submit report, including any normal
 allocation bookkeeping that mode already performs; it then persists only the
-validation observation.  `sim-submit` remains the only broker-capable Stage 6
-command and still dispatches exclusively through `Stage6PilotRunner` →
+validation observation.  `broker-preflight` is the only connected read-only
+Stage 6 command; `sim-submit` remains the only broker-order command and still
+dispatches exclusively through `Stage6PilotRunner` →
 `GenericOMS`.
 The Oct 5 narrative evidence predates this durable validation ledger and does
 not contain a persisted validator recovery observation, so it is retained as

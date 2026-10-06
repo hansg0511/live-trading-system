@@ -705,13 +705,37 @@ class Stage6PilotConfig:
     def ensure_repository(self, repository: SQLiteTradingRepository) -> None:
         """Persist and compare every declaration used by the executable run."""
 
+        repository.initialize()
+        existing = self.validate_repository(repository)
+        existing_account = existing["account"]
+        existing_strategy = existing["strategy"]
+        existing_books = existing["books"]
+        existing_instruments = existing["instruments"]
+        existing_mappings = existing["mappings"]
+
+        if existing_account is None:
+            repository.save_account(self.account)
+        if existing_strategy is None:
+            repository.save_strategy(self.strategy)
+        for book in self.books:
+            if existing_books[book.id] is None:
+                repository.save_book(book)
+        for instrument in self.instruments:
+            if existing_instruments[instrument.id] is None:
+                repository.save_instrument(instrument)
+        for mapping in self.mappings:
+            if existing_mappings[mapping.id] is None:
+                repository.save_instrument_mapping(mapping)
+
+    def validate_repository(self, repository: SQLiteTradingRepository) -> dict[str, Any]:
+        """Compare declarations with an existing repository without writes."""
+
         configured_db = self.state_db.resolve(strict=False)
         repository_db = repository.db_path.resolve(strict=False)
         if configured_db != repository_db:
             raise Stage6ConfigError(
                 f"repository DB path {repository_db} does not match configured state_db {configured_db}"
             )
-        repository.initialize()
         existing_account = repository.get_account(self.account.id)
         if existing_account is not None and existing_account != self.account:
             raise Stage6ConfigError("persisted account identity does not match the config")
@@ -753,20 +777,13 @@ class Stage6PilotConfig:
                 raise Stage6ConfigError(
                     f"persisted Moomoo instrument mapping does not match the config: {mapping.instrument_id}"
                 )
-
-        if existing_account is None:
-            repository.save_account(self.account)
-        if existing_strategy is None:
-            repository.save_strategy(self.strategy)
-        for book in self.books:
-            if existing_books[book.id] is None:
-                repository.save_book(book)
-        for instrument in self.instruments:
-            if existing_instruments[instrument.id] is None:
-                repository.save_instrument(instrument)
-        for mapping in self.mappings:
-            if existing_mappings[mapping.id] is None:
-                repository.save_instrument_mapping(mapping)
+        return {
+            "account": existing_account,
+            "strategy": existing_strategy,
+            "books": existing_books,
+            "instruments": existing_instruments,
+            "mappings": existing_mappings,
+        }
 
     def build_runner(
         self,

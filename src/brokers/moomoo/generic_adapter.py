@@ -498,6 +498,7 @@ class MooMooGenericAdapter(BrokerAdapter):
         self.security_firm = security_firm
         self._sdk = _moomoo if sdk_module is None else sdk_module
         self.trade_context = trade_context
+        self._quote_context: Any | None = None
         self._connected = False
         self._selected_account_id: str | None = None
         self._account_rows: list[dict[str, Any]] = []
@@ -567,6 +568,12 @@ class MooMooGenericAdapter(BrokerAdapter):
         return True
 
     def disconnect(self) -> bool:
+        if self._quote_context is not None:
+            try:
+                self._quote_context.close()
+            except Exception:
+                pass
+            self._quote_context = None
         if self.trade_context is not None:
             try:
                 self.trade_context.close()
@@ -896,6 +903,54 @@ class MooMooGenericAdapter(BrokerAdapter):
     def get_authoritative_account_facts(self, account: Account) -> BrokerFactSnapshot:
         """Query account facts without using the bounded order-query cache."""
         return self._get_account_facts(account, force_refresh=True)
+
+    def get_authoritative_market_state(self, symbols: Sequence[str]) -> dict[str, Any]:
+        """Query provider market/session state through OpenD's quote channel.
+
+        This is deliberately a read-only capability for the Stage 6 broker
+        preflight.  It does not infer RTH from the local clock or execution
+        policy, and it never uses the trade command channel.
+        """
+
+        self._require_connected()
+        requested = tuple(dict.fromkeys(_normalise_symbol(symbol) for symbol in symbols))
+        if not requested:
+            raise MoomooAdapterError("Moomoo market-state query requires at least one symbol")
+        if self._sdk is None:
+            raise MoomooAdapterError("Moomoo quote market-state capability is unavailable")
+        if self._quote_context is None:
+            constructor = getattr(self._sdk, "OpenQuoteContext", None)
+            if not callable(constructor):
+                raise MoomooAdapterError("Moomoo SDK lacks read-only OpenQuoteContext market-state capability")
+            try:
+                self._quote_context = constructor(host=self.host, port=self.port)
+            except Exception as exc:
+                raise MoomooAdapterError(f"Moomoo quote market-state connection failed: {exc}") from exc
+        rows = self._quote_call("get_market_state", symbols=list(requested))
+        if not rows:
+            raise MoomooAdapterError("Moomoo get_market_state returned no symbol rows")
+        normalized: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise MoomooAdapterError(f"Moomoo market-state row {index} is malformed")
+            symbol = _normalise_symbol(get_value(row, "code", "symbol", "ticker"))
+            state = str(get_value(row, "market_state", "session", "state", default="")).strip().upper()
+            if not state:
+                raise MoomooAdapterError(f"Moomoo market-state row {symbol} has no state")
+            normalized.append({"symbol": symbol, "market_state": state})
+        observed = {row["symbol"] for row in normalized}
+        if observed != set(requested):
+            raise MoomooAdapterError(
+                "Moomoo market-state symbols do not match the requested configuration: "
+                f"expected {sorted(set(requested))}, observed {sorted(observed)}"
+            )
+        return {
+            "market": self.market,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "complete": True,
+            "rows": normalized,
+            "source": "moomoo_quote_market_state",
+        }
 
     def _get_account_facts(self, account: Account, *, force_refresh: bool) -> BrokerFactSnapshot:
         """Query a complete account fact set for the generic safety gate.
@@ -1342,6 +1397,42 @@ class MooMooGenericAdapter(BrokerAdapter):
             except Exception as exc:
                 if not self._is_rate_limit_response("exception", exc):
                     raise
+                ret, data = "exception", exc
+            if ret == 0:
+                self._last_read_error = None
+                return self._as_records(data, method=method)
+            last_error = data
+            if not self._is_rate_limit_response(ret, data):
+                raise MoomooAdapterError(f"Moomoo {method} failed with ret={ret}: {data}")
+            if attempt >= self._read_max_retries:
+                break
+            backoff = min(5.0, self._read_backoff_base * (2**attempt))
+            try:
+                jitter = float(self._read_jitter(backoff * 0.25))
+            except (TypeError, ValueError):
+                jitter = 0.0
+            self._read_sleep(max(0.0, backoff + min(backoff * 0.25, jitter)))
+        error = MoomooRateLimitError(
+            f"Moomoo {method} remained rate-limited after {self._read_max_retries + 1} bounded read attempt(s): {last_error}"
+        )
+        self._last_read_error = error
+        raise error
+
+    def _quote_call(self, method: str, **kwargs: Any) -> list[dict[str, Any]]:
+        """Call one quote endpoint with the same bounded read discipline."""
+
+        context = self._quote_context
+        if context is None:
+            raise ConnectionError("MooMoo quote context is not connected")
+        last_error: object = None
+        for attempt in range(self._read_max_retries + 1):
+            self._wait_for_read_slot()
+            self._last_read_at = self._read_clock()
+            try:
+                ret, data = getattr(context, method)(**kwargs)
+            except Exception as exc:
+                if not self._is_rate_limit_response("exception", exc):
+                    raise MoomooAdapterError(f"Moomoo {method} failed: {exc}") from exc
                 ret, data = "exception", exc
             if ret == 0:
                 self._last_read_error = None
