@@ -926,7 +926,7 @@ class MooMooGenericAdapter(BrokerAdapter):
                 self._quote_context = constructor(host=self.host, port=self.port)
             except Exception as exc:
                 raise MoomooAdapterError(f"Moomoo quote market-state connection failed: {exc}") from exc
-        rows = self._quote_call("get_market_state", symbols=list(requested))
+        rows = self._quote_call("get_market_state", code_list=list(requested))
         if not rows:
             raise MoomooAdapterError("Moomoo get_market_state returned no symbol rows")
         normalized: list[dict[str, Any]] = []

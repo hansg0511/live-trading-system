@@ -177,14 +177,16 @@ def adapter(context: FakeTradeContext | None = None) -> MooMooGenericAdapter:
 
 def test_generic_adapter_market_state_is_read_only_and_closed_with_adapter():
     quote_contexts = []
+    requested_code_lists = []
 
     class FakeQuoteContext:
         def __init__(self, **_kwargs):
             self.closed = False
             quote_contexts.append(self)
 
-        def get_market_state(self, symbols):
-            return 0, [{"code": symbol, "market_state": "MORNING"} for symbol in symbols]
+        def get_market_state(self, code_list):
+            requested_code_lists.append(list(code_list))
+            return 0, [{"code": symbol, "market_state": "MORNING"} for symbol in code_list]
 
         def close(self):
             self.closed = True
@@ -203,6 +205,7 @@ def test_generic_adapter_market_state_is_read_only_and_closed_with_adapter():
     assert report["market"] == "US"
     assert report["complete"] is True
     assert [row["market_state"] for row in report["rows"]] == ["MORNING", "MORNING"]
+    assert requested_code_lists == [["US.AAPL", "US.MSFT"]]
     assert quote_contexts and quote_contexts[0].closed is False
     broker.disconnect()
     assert quote_contexts[0].closed is True
