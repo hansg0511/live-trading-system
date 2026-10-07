@@ -639,6 +639,23 @@ def test_explicit_sim_arm_dispatches_both_through_generic_oms_and_persists_run_m
         for item in stored
         if item
     )
+    assert all(
+        {
+            "process_id",
+            "run_id",
+            "mode",
+            "execution_compatibility",
+            "submitted_at",
+            "correlation",
+        }.issubset(item["metadata"]["stage6_submission"])
+        for item in stored
+        if item
+    )
+    assert all(
+        item["metadata"]["stage6_submission"]["execution_compatibility"] == "stage6-execution-v2"
+        for item in stored
+        if item
+    )
     assert len(report.after_status) >= 2
 
 
@@ -838,6 +855,30 @@ def test_closed_historical_fills_are_not_unmatched_broker_exposure(tmp_path):
     assert blocked.preflight_passed is False
     assert blocked.stop_reasons
     assert len(adapter.submit_calls) == 4
+
+
+def test_final_state_attributes_verified_retired_baseline_orders_but_not_foreign_orders(
+    tmp_path,
+    monkeypatch,
+):
+    account, sleeves, repository, _adapter, runner = make_retired_baseline_runner(tmp_path)
+
+    baseline_result = runner.final_state(make_spec(account, sleeves))
+    assert baseline_result["final_state_passed"] is True
+    assert baseline_result["final"]["all_orders_attributable"] is True
+
+    original = repository.book_broker_orders
+
+    def with_foreign_order(account_id, *, book_id=None):
+        rows = original(account_id, book_id=book_id)
+        rows.append({"id": "foreign-order", "book_id": "unverified-book", "intent_id": "foreign-intent"})
+        return rows
+
+    monkeypatch.setattr(repository, "book_broker_orders", with_foreign_order)
+    foreign_result = runner.final_state(make_spec(account, sleeves))
+    assert foreign_result["final_state_passed"] is False
+    assert foreign_result["final"]["all_orders_attributable"] is False
+    assert "unattributed book" in " ".join(foreign_result["stop_reasons"])
 
 
 def test_one_sleeve_capacity_reject_stops_before_dispatching_the_other(tmp_path):

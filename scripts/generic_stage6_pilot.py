@@ -42,10 +42,13 @@ from src.strategies.stat_arb.stage6_config import (  # noqa: E402
     load_stage6_config,
 )
 from src.strategies.stat_arb.stage6_pilot import (  # noqa: E402
+    BROKER_CLOCK_SKEW_TOLERANCE_SECONDS,
+    BROKER_FACT_MAX_AGE_SECONDS,
     STAGE6_EXECUTION_COMPATIBILITY,
     Stage6RunMode,
 )
 from src.trading_core.repository import SQLiteTradingRepository  # noqa: E402
+from src.trading_core.ports import BrokerFactSnapshot  # noqa: E402
 from src.trading_core.stage6_validation import (  # noqa: E402
     Stage6SessionOutcome,
     Stage6ValidationError,
@@ -301,6 +304,8 @@ def _recovery_report(
     before_external_order_ids: set[str],
     before_fill_keys: set[tuple[str, str]],
     recovered: list[dict[str, Any]],
+    fresh_facts: BrokerFactSnapshot | None,
+    fresh_facts_error: str | None = None,
 ) -> dict[str, Any]:
     """Serialize one read-only broker recovery and its durable local delta."""
 
@@ -353,11 +358,73 @@ def _recovery_report(
     intents_preserved = set(before_intent_ids).issubset(after_intent_ids)
     orders_preserved = before_external_order_ids.issubset(after_external_order_ids)
     no_duplicate_attempts = not duplicate_legs and not new_order_ids
+    durable_exposure: dict[str, Decimal] = {}
+    for allocation in repository.position_allocations(account_id):
+        if str(allocation.get("ownership_class", "")).upper() != "MANAGED":
+            continue
+        instrument_id = str(allocation.get("instrument_id") or "").strip()
+        try:
+            quantity = Decimal(str(allocation.get("signed_quantity", "0")))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if instrument_id and quantity.is_finite():
+            durable_exposure[instrument_id] = durable_exposure.get(instrument_id, Decimal("0")) + quantity
+    durable_exposure = {key: value for key, value in durable_exposure.items() if value != 0}
+    broker_exposure: dict[str, Decimal] = {}
+    facts_valid = bool(
+        isinstance(fresh_facts, BrokerFactSnapshot)
+        and fresh_facts.complete
+        and not fresh_facts.error
+        and fresh_facts.account_id == account_id
+    )
+    if facts_valid and fresh_facts is not None:
+        captured_at = fresh_facts.captured_at
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            facts_valid = False
+        else:
+            age_seconds = (completed_at - captured_at.astimezone(timezone.utc)).total_seconds()
+            if age_seconds < -BROKER_CLOCK_SKEW_TOLERANCE_SECONDS or age_seconds > BROKER_FACT_MAX_AGE_SECONDS:
+                facts_valid = False
+        if fresh_facts.open_orders:
+            facts_valid = False
+        raw_by_instrument: dict[str, list[Decimal]] = {}
+        for position in fresh_facts.positions:
+            try:
+                quantity = Decimal(str(position.signed_quantity))
+            except (InvalidOperation, TypeError, ValueError):
+                facts_valid = False
+                break
+            if not quantity.is_finite():
+                facts_valid = False
+                break
+            instrument_id = str(position.instrument_id)
+            raw_by_instrument.setdefault(instrument_id, []).append(quantity)
+            broker_exposure[instrument_id] = broker_exposure.get(instrument_id, Decimal("0")) + quantity
+        if any(
+            len(values) > 1
+            and any(value != 0 for value in values)
+            and sum(values, Decimal("0")) == 0
+            for values in raw_by_instrument.values()
+        ):
+            # Do not infer that contradictory/non-netted provider rows are a
+            # proven flat exposure merely because their aggregate is zero.
+            facts_valid = False
+    broker_exposure = {key: value for key, value in broker_exposure.items() if value != 0}
+    exposure_agrees = facts_valid and broker_exposure == durable_exposure
+    exposure_stop_reasons: list[str] = []
+    if fresh_facts_error:
+        exposure_stop_reasons.append(f"fresh authoritative account facts unavailable: {fresh_facts_error}")
+    if not facts_valid:
+        exposure_stop_reasons.append("fresh broker facts are incomplete, stale, account-mismatched, open-order-bearing, or contradictory")
+    if not exposure_agrees:
+        exposure_stop_reasons.append(
+            "fresh broker exposure does not exactly match durable managed exposure"
+        )
     terminal_statuses = {"FILLED", "COMPLETED"}
     recovered_statuses = [str(item.get("status")) for item in after_status]
     recovery_clean = bool(before_intent_ids) and fresh_process and all(
         status in terminal_statuses for status in recovered_statuses
-    ) and not open_issues and not open_actions and intents_preserved and orders_preserved and no_duplicate_attempts
+    ) and not open_issues and not open_actions and intents_preserved and orders_preserved and no_duplicate_attempts and exposure_agrees
     restart_recovery = {
         "performed": True,
         "broker_contacted": True,
@@ -375,7 +442,11 @@ def _recovery_report(
         "orders_preserved": orders_preserved,
         "no_duplicate_attempts": no_duplicate_attempts,
         "no_resubmission": True,
-        "exposure_agrees": recovery_clean,
+        "exposure_agrees": exposure_agrees,
+        "durable_managed_exposure": {key: str(value) for key, value in sorted(durable_exposure.items())},
+        "broker_observed_exposure": {key: str(value) for key, value in sorted(broker_exposure.items())},
+        "fresh_facts_complete": facts_valid,
+        "fresh_facts_error": fresh_facts_error,
     }
     return {
         "run_id": config.spec().run_id,
@@ -414,6 +485,9 @@ def _recovery_report(
         ],
         "open_reconciliation_issues": open_issues,
         "open_recovery_actions": open_actions,
+        "durable_managed_exposure": {key: str(value) for key, value in sorted(durable_exposure.items())},
+        "broker_observed_exposure": {key: str(value) for key, value in sorted(broker_exposure.items())},
+        "fresh_facts_error": fresh_facts_error,
         "duplicate_attempt_status": {
             "detected": bool(duplicate_legs),
             "by_leg": attempts_by_leg,
@@ -435,7 +509,7 @@ def _recovery_report(
             "replace_calls": 0,
             "recovery_calls": 1,
         },
-        "stop_reasons": [],
+        "stop_reasons": list(dict.fromkeys(exposure_stop_reasons)),
     }
 
 
@@ -991,6 +1065,26 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                 adapter.connect()
                 connected = True
                 runner = config.build_runner(repository, adapter=adapter)
+                market_symbols = tuple(mapping.external_symbol for mapping in config.mappings)
+                rth_gate = runner.compensating_exit_preflight(
+                    config.spec(),
+                    market_symbols=market_symbols,
+                )
+                if not rth_gate.get("preflight_passed"):
+                    rth_gate.update(
+                        {
+                            "source_intent_id": str(args.source_intent_id),
+                            "stop_reasons": list(rth_gate.get("stop_reasons", ())),
+                            "compensating_exit_intent_id": None,
+                            "orders_submitted": 0,
+                        }
+                    )
+                    return 2, rth_gate
+                pre_existing_intents = {
+                    str(row.get("id"))
+                    for row in repository.book_intents(config.account.id)
+                    if row.get("id") is not None
+                }
                 result = runner.submit_verified_compensating_exit(
                     account=config.account,
                     source_intent_id=args.source_intent_id,
@@ -1013,6 +1107,14 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         exit_intent_id = str(candidates[0]["id"])
                 if not exit_intent_id:
                     raise Stage6ConfigError("compensating exit did not return a durable intent identity")
+                if exit_intent_id not in pre_existing_intents:
+                    runner._record_submission_process_identity(
+                        intent_id=exit_intent_id,
+                        account_id=config.account.id,
+                        run_id=config.spec().run_id,
+                        mode="COMPENSATING_EXIT",
+                        source_intent_id=args.source_intent_id,
+                    )
                 snapshots = _recovery_intent_snapshot(repository, config.account.id, [exit_intent_id])
                 attempts = [
                     attempt
@@ -1042,6 +1144,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         "stop_reasons": [],
                         "duplicate_attempt": _has_duplicate_attempts_per_leg(snapshots),
                         "broker_submission_count": len(attempts),
+                        "rth_preflight": rth_gate,
                     }
                 )
                 return 0, result
@@ -1108,6 +1211,17 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
             adapter.connect()
             connected = True
             recovered = config.build_runner(repository, adapter=adapter).recover(config.account)
+            facts_getter = getattr(adapter, "get_authoritative_account_facts", None)
+            fresh_facts_error = None
+            if callable(facts_getter):
+                try:
+                    fresh_facts = facts_getter(config.account)
+                except Exception as exc:
+                    fresh_facts = None
+                    fresh_facts_error = str(exc)
+            else:
+                fresh_facts = None
+                fresh_facts_error = "adapter lacks authoritative fresh account-facts capability"
         finally:
             if connected:
                 adapter.disconnect()
@@ -1121,6 +1235,8 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
             before_external_order_ids=before_external_order_ids,
             before_fill_keys=set(before_fill_rows),
             recovered=recovered,
+            fresh_facts=fresh_facts,
+            fresh_facts_error=fresh_facts_error,
         )
         return 0, payload
 

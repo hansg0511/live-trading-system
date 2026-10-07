@@ -1,4 +1,5 @@
-from datetime import timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -216,6 +217,10 @@ def test_recover_cli_runs_existing_oms_recovery_and_keeps_book_b_untouched(tmp_p
     )
     seed_runner.run(config.spec(), mode=Stage6RunMode.SIM_SUBMIT)
     adapter._release_pending()
+    # The CLI recovery path applies the production freshness gate against
+    # wall-clock time, so model a newly captured provider snapshot after the
+    # deterministic seed run has completed.
+    adapter.facts = replace(adapter.facts, captured_at=datetime.now(timezone.utc))
     adapter.allow_submission = False
     monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
     monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "separate-recovery-process")

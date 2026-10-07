@@ -20,6 +20,7 @@ from enum import Enum
 import json
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 class Stage6SessionOutcome(str, Enum):
@@ -47,6 +48,8 @@ _EXECUTION_PATHS = {
     "STAGE6PILOTRUNNER->GENERICOMS",
     "STAGE6_PILOT_RUNNER_GENERIC_OMS",
 }
+_US_EASTERN = ZoneInfo("America/New_York")
+_PROVENANCE_MODES = {"SIM_SUBMIT", "COMPENSATING_EXIT"}
 
 
 def _mapping(value: object, name: str) -> Mapping[str, Any] | None:
@@ -488,6 +491,84 @@ def _validate_final(
             reasons.append("final.book_exposure book identities do not match preflight books")
 
 
+def _validate_execution_provenance(
+    evidence: Mapping[str, Any],
+    reasons: list[str],
+    *,
+    run_ids: set[str],
+    entry_intent_ids: set[str],
+    exit_intent_ids: set[str],
+    compatibility: str,
+    trading_date: date,
+) -> None:
+    """Require immutable execution identity for every order-bearing intent."""
+
+    raw = evidence.get("execution_provenance")
+    if not isinstance(raw, Mapping):
+        reasons.append("execution_provenance is required for a durable clean session")
+        return
+    observed_dates: set[str] = set()
+    observed_compatibilities: set[str] = set()
+    for label, intent_ids in (("entry", entry_intent_ids), ("exit", exit_intent_ids)):
+        section = raw.get(label)
+        if not isinstance(section, Mapping):
+            reasons.append(f"execution_provenance.{label} is required")
+            continue
+        if set(str(key) for key in section) != intent_ids:
+            reasons.append(f"execution_provenance.{label} does not exactly cover its intent IDs")
+        for intent_id in sorted(intent_ids):
+            marker = section.get(intent_id)
+            if not isinstance(marker, Mapping):
+                reasons.append(f"execution provenance is missing for {label} intent {intent_id}")
+                continue
+            for field_name in ("process_id", "run_id", "mode", "execution_compatibility", "submitted_at"):
+                if not isinstance(marker.get(field_name), str) or not str(marker.get(field_name)).strip():
+                    reasons.append(f"execution provenance {intent_id}.{field_name} is required")
+            mode = str(marker.get("mode", "")).strip().upper()
+            if mode not in _PROVENANCE_MODES:
+                reasons.append(f"execution provenance {intent_id}.mode is unsupported: {mode}")
+            marker_run_id = str(marker.get("run_id", "")).strip()
+            if marker_run_id not in run_ids:
+                reasons.append(f"execution provenance {intent_id}.run_id is not a declared run")
+            marker_compatibility = str(marker.get("execution_compatibility", "")).strip()
+            if marker_compatibility:
+                observed_compatibilities.add(marker_compatibility)
+                if marker_compatibility != compatibility:
+                    reasons.append(
+                        f"execution provenance {intent_id} uses incompatible execution semantics"
+                    )
+            correlation = marker.get("correlation")
+            if not isinstance(correlation, Mapping):
+                reasons.append(f"execution provenance {intent_id}.correlation is required")
+            else:
+                for field_name in ("intent_id", "run_id", "source_signal_id", "idempotency_key"):
+                    if not isinstance(correlation.get(field_name), str) or not str(correlation.get(field_name)).strip():
+                        reasons.append(f"execution provenance {intent_id}.correlation.{field_name} is required")
+                if str(correlation.get("intent_id", "")) != intent_id:
+                    reasons.append(f"execution provenance {intent_id}.correlation intent identity differs")
+                if str(correlation.get("run_id", "")) != marker_run_id:
+                    reasons.append(f"execution provenance {intent_id}.correlation run identity differs")
+            try:
+                submitted_at = _timestamp(marker.get("submitted_at"), f"execution provenance {intent_id}.submitted_at")
+                observed_dates.add(submitted_at.astimezone(_US_EASTERN).date().isoformat())
+            except Stage6ValidationError as exc:
+                reasons.append(str(exc))
+    if evidence.get("provenance_complete") is not True:
+        reasons.append("provenance_complete must be true")
+    if observed_compatibilities and observed_compatibilities != {compatibility}:
+        reasons.append("durable execution provenance does not use one compatible execution identity")
+    derived_date = evidence.get("derived_us_trading_date")
+    if not isinstance(derived_date, str) or not derived_date.strip():
+        reasons.append("derived_us_trading_date is required from durable execution timestamps")
+    elif derived_date != trading_date.isoformat():
+        reasons.append("us_trading_date disagrees with derived durable execution date")
+    if observed_dates != {trading_date.isoformat()}:
+        reasons.append(
+            "durable execution timestamps do not derive the supplied US trading date: "
+            + ", ".join(sorted(observed_dates or {"<missing>"}))
+        )
+
+
 def evaluate_stage6_session(evidence: Mapping[str, Any]) -> "Stage6SessionResult":
     """Validate an explicit Stage6 evidence document without side effects."""
 
@@ -548,6 +629,16 @@ def evaluate_stage6_session(evidence: Mapping[str, Any]) -> "Stage6SessionResult
         reasons.append("entry_intent_ids contains duplicates")
     if len(set(exit_intent_ids)) != len(exit_intent_ids):
         reasons.append("exit_intent_ids contains duplicates")
+
+    _validate_execution_provenance(
+        evidence,
+        reasons,
+        run_ids=set(run_ids),
+        entry_intent_ids=set(entry_intent_ids),
+        exit_intent_ids=set(exit_intent_ids),
+        compatibility=compatibility,
+        trading_date=trading_date,
+    )
 
     preflight = _mapping(evidence.get("preflight"), "preflight")
     expected_book_ids: set[str] | None = None

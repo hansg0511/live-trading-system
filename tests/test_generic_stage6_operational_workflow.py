@@ -17,6 +17,7 @@ from scripts.generic_stage6_pilot import main
 from scripts.generic_stage6_pilot import (
     _derived_exit_config,
     _has_duplicate_attempts_per_leg,
+    _recovery_report,
     _write_new_json,
 )
 import scripts.generic_stage6_pilot as stage6_cli
@@ -29,9 +30,12 @@ from tests.test_generic_stage6_pilot import (
     make_runner,
     make_sleeves,
     make_spec,
+    make_targets,
     make_account,
     PilotFakeAdapter,
     DelayedPilotAdapter,
+    make_retired_baseline_runner,
+    seed_verified_book_exposure,
 )
 
 
@@ -188,6 +192,44 @@ def test_sim_submit_rechecks_rth_and_submits_nothing_when_session_changes(tmp_pa
 
     assert report.preflight_passed is False
     assert any("not RTH" in reason for reason in report.stop_reasons)
+    assert adapter.submit_calls == []
+
+
+@pytest.mark.parametrize("condition", ("closed", "stale", "incomplete"))
+def test_compensating_exit_requires_fresh_rth_before_oms_boundary(tmp_path, condition):
+    account, sleeves, _repository, adapter, runner = make_runner(tmp_path)
+
+    def market_state(symbols):
+        captured_at = NOW if condition != "stale" else NOW - timedelta(seconds=61)
+        return {
+            "market": "US",
+            "captured_at": captured_at.isoformat(),
+            "complete": condition != "incomplete",
+            "rows": [
+                {
+                    "symbol": str(symbol),
+                    "market_state": "CLOSED" if condition == "closed" else "RTH",
+                }
+                for symbol in symbols
+            ],
+        }
+
+    adapter.get_authoritative_market_state = market_state
+    gate = runner.compensating_exit_preflight(make_spec(account, sleeves))
+
+    assert gate["preflight_passed"] is False
+    assert gate["broker_submission_count"] == 0
+    assert gate["mutations"]["submission_calls"] == 0
+    assert adapter.submit_calls == []
+
+
+def test_compensating_exit_fresh_rth_gate_passes_without_mutation(tmp_path):
+    account, sleeves, _repository, adapter, runner = make_runner(tmp_path)
+
+    gate = runner.compensating_exit_preflight(make_spec(account, sleeves))
+
+    assert gate["preflight_passed"] is True
+    assert gate["market_state"]["rth"]["observed"] is True
     assert adapter.submit_calls == []
 
 
@@ -356,6 +398,135 @@ def test_compensating_duplicate_attempt_flag_is_per_leg():
 
     assert _has_duplicate_attempts_per_leg(normal_pair) is False
     assert _has_duplicate_attempts_per_leg(repeated_attempt) is True
+
+
+@pytest.mark.parametrize("variant", ("mismatch", "unknown", "net_zero", "missing"))
+def test_recovery_exposure_proof_exposes_maps_and_blocks_ambiguous_facts(tmp_path, variant):
+    account, sleeves, repository, adapter, _runner = make_runner(tmp_path)
+    seed_verified_book_exposure(repository, account, sleeves, quantities=("1", "1"))
+    values = _config_dict(tmp_path)
+    config_path = tmp_path / f"recovery-{variant}.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    config = Stage6PilotConfig.load(config_path)
+    durable = {
+        "pilot-a-1": Decimal("1"),
+        "pilot-a-2": Decimal("-1"),
+        "pilot-b-1": Decimal("1"),
+        "pilot-b-2": Decimal("-1"),
+    }
+    if variant == "missing":
+        facts = None
+    else:
+        positions = [
+            PositionSnapshot(
+                id=f"recovery-position-{instrument_id}",
+                broker_snapshot_id="recovery-snapshot",
+                account_id=account.id,
+                instrument_id=instrument_id,
+                signed_quantity=quantity,
+                captured_at=NOW,
+            )
+            for instrument_id, quantity in durable.items()
+        ]
+        if variant == "mismatch":
+            positions = positions[:-1]
+        elif variant == "unknown":
+            positions.append(
+                PositionSnapshot(
+                    id="recovery-position-unknown",
+                    broker_snapshot_id="recovery-snapshot",
+                    account_id=account.id,
+                    instrument_id="pilot-unknown",
+                    signed_quantity=Decimal("1"),
+                    captured_at=NOW,
+                )
+            )
+        elif variant == "net_zero":
+            positions.append(
+                PositionSnapshot(
+                    id="recovery-position-net-zero",
+                    broker_snapshot_id="recovery-snapshot",
+                    account_id=account.id,
+                    instrument_id="pilot-a-1",
+                    signed_quantity=Decimal("-1"),
+                    captured_at=NOW,
+                )
+            )
+        facts = replace(adapter.facts, captured_at=datetime.now(timezone.utc), positions=tuple(positions))
+
+    report = _recovery_report(
+        config=config,
+        repository=repository,
+        started_at=NOW,
+        before_intent_ids=[],
+        before_status=[],
+        before_order_ids=set(),
+        before_external_order_ids=set(),
+        before_fill_keys=set(),
+        recovered=[],
+        fresh_facts=facts,
+    )
+    restart = report["restart_recovery"]
+    assert restart["durable_managed_exposure"] == {
+        key: str(value) for key, value in sorted(durable.items())
+    }
+    assert restart["exposure_agrees"] is False
+    assert restart["fresh_facts_complete"] is (variant not in {"missing", "net_zero"})
+
+
+def test_recovery_exposure_proof_accepts_exact_fresh_maps(tmp_path):
+    account, sleeves, repository, adapter, _runner = make_runner(tmp_path)
+    seed_verified_book_exposure(repository, account, sleeves, quantities=("1", "1"))
+    values = _config_dict(tmp_path)
+    config_path = tmp_path / "recovery-match.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    config = Stage6PilotConfig.load(config_path)
+    positions = tuple(
+        PositionSnapshot(
+            id=f"recovery-position-{instrument_id}",
+            broker_snapshot_id="recovery-snapshot",
+            account_id=account.id,
+            instrument_id=instrument_id,
+            signed_quantity=quantity,
+            captured_at=NOW,
+        )
+        for instrument_id, quantity in (
+            ("pilot-a-1", Decimal("1")),
+            ("pilot-a-2", Decimal("-1")),
+            ("pilot-b-1", Decimal("1")),
+            ("pilot-b-2", Decimal("-1")),
+        )
+    )
+    report = _recovery_report(
+        config=config,
+        repository=repository,
+        started_at=NOW,
+        before_intent_ids=[],
+        before_status=[],
+        before_order_ids=set(),
+        before_external_order_ids=set(),
+        before_fill_keys=set(),
+        recovered=[],
+        fresh_facts=replace(adapter.facts, captured_at=datetime.now(timezone.utc), positions=positions),
+    )
+    assert report["restart_recovery"]["exposure_agrees"] is True
+    assert report["restart_recovery"]["broker_observed_exposure"] == report["restart_recovery"]["durable_managed_exposure"]
+
+
+def test_clean_preflight_dryrun_finalstate_includes_verified_retired_baseline(tmp_path):
+    account, sleeves, _repository, _adapter, runner = make_retired_baseline_runner(tmp_path)
+    spec = make_spec(account, sleeves, targets=make_targets(sleeves, quantities=("1", "1")))
+
+    preflight = runner.broker_preflight(
+        spec,
+        market_symbols=tuple(symbol for sleeve in sleeves for symbol in sleeve.symbols),
+    )
+    assert preflight["preflight_passed"] is True, preflight["stop_reasons"]
+    dry_run = runner.run(spec, mode=Stage6RunMode.DRY_RUN)
+    assert dry_run.preflight_passed is True
+    final = runner.final_state(spec)
+    assert final["final_state_passed"] is True
+    assert final["final"]["all_orders_attributable"] is True
 
 
 def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(

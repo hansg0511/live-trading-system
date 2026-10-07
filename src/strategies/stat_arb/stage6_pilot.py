@@ -26,6 +26,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from src.trading_core.domain import (
     Account,
@@ -70,6 +71,7 @@ class Stage6RunMode(str, Enum):
 STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v2"
 BROKER_FACT_MAX_AGE_SECONDS = 60
 BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
+_US_EASTERN = ZoneInfo("America/New_York")
 
 
 def _utc_now() -> datetime:
@@ -376,6 +378,8 @@ class Stage6PilotRunner:
         intent_id: str,
         account_id: str,
         run_id: str,
+        mode: str = Stage6RunMode.SIM_SUBMIT.value,
+        source_intent_id: str | None = None,
     ) -> None:
         """Retain the process that created a new SIM submission intent.
 
@@ -385,13 +389,45 @@ class Stage6PilotRunner:
         later claim a verified fresh-process recovery.
         """
 
+        intent = self.repository.get_intent(intent_id)
+        if intent is None or str(intent.get("account_id")) != str(account_id):
+            raise ValueError("cannot record Stage 6 provenance for an unknown account intent")
+        stage5 = intent.get("metadata", {}).get("stage5", {})
+        if not isinstance(stage5, Mapping):
+            stage5 = {}
+        submitted_at: datetime | None = None
+        for leg in intent.get("legs", ()):
+            for order in self.repository.broker_orders_for_leg(str(leg.get("id"))):
+                value = order.get("submitted_at") or order.get("updated_at")
+                if value:
+                    try:
+                        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is None or parsed.utcoffset() is None:
+                        continue
+                    parsed = parsed.astimezone(timezone.utc)
+                    submitted_at = parsed if submitted_at is None else min(submitted_at, parsed)
+        if submitted_at is None:
+            submitted_at = self._now()
+        correlation = {
+            "intent_id": str(intent_id),
+            "run_id": str(run_id),
+            "source_signal_id": str(intent.get("source_signal_id") or stage5.get("signal_id") or ""),
+            "idempotency_key": str(intent.get("idempotency_key") or ""),
+        }
+        if source_intent_id:
+            correlation["source_intent_id"] = str(source_intent_id)
         self.repository.append_intent_metadata(
             intent_id,
             {
                 "stage6_submission": {
                     "process_id": str(os.getpid()),
                     "run_id": str(run_id),
-                    "mode": Stage6RunMode.SIM_SUBMIT.value,
+                    "mode": str(mode),
+                    "execution_compatibility": STAGE6_EXECUTION_COMPATIBILITY,
+                    "submitted_at": submitted_at.isoformat(),
+                    "correlation": correlation,
                 }
             },
             account_id=account_id,
@@ -1052,6 +1088,50 @@ class Stage6PilotRunner:
             },
         }
 
+    def compensating_exit_preflight(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        market_symbols: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Require a fresh authoritative RTH observation before an exit.
+
+        The proof-gated OMS primitive remains the only submit path.  This
+        read-only gate is deliberately separate so a closed, stale, missing,
+        or contradictory market observation returns before that primitive is
+        invoked.
+        """
+
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 compensating exits accept SIM accounts only")
+        report, reasons = self._fresh_market_state(
+            spec,
+            tuple(market_symbols) or self._configured_symbols(spec),
+            require_rth=True,
+        )
+        return {
+            "run_id": spec.run_id,
+            "mode": "COMPENSATING_EXIT_PREFLIGHT",
+            "broker_contacted": True,
+            "market_state": report,
+            "preflight_passed": not reasons,
+            "stop_reasons": list(dict.fromkeys(reasons)),
+            "broker_submission_count": 0,
+            "cancel_count": 0,
+            "replace_count": 0,
+            "recovery_calls": 0,
+            "mutations": {
+                "order_intents": 0,
+                "order_legs": 0,
+                "broker_orders": 0,
+                "fills": 0,
+                "submission_calls": 0,
+                "cancel_calls": 0,
+                "replace_calls": 0,
+                "recovery_calls": 0,
+            },
+        }
+
     @staticmethod
     def _configured_symbols(spec: Stage6PilotSpec) -> tuple[str, ...]:
         return tuple(
@@ -1221,7 +1301,11 @@ class Stage6PilotRunner:
             reasons.append("not every managed intent is terminal")
         orders = self.repository.book_broker_orders(spec.account.id)
         configured_books = set(spec.book_ids)
-        all_attributable = all(str(row.get("book_id")) in configured_books for row in orders)
+        all_attributable = all(
+            str(row.get("book_id")) in configured_books
+            or str(row.get("intent_id")) in closed_historical
+            for row in orders
+        )
         if not all_attributable:
             reasons.append("account broker orders include an unattributed book")
         broker_facts = {
@@ -1397,7 +1481,7 @@ class Stage6PilotRunner:
         final: Mapping[str, Any] | None = None,
         commit_sha: str = "UNKNOWN",
         trading_date: str | None = None,
-        execution_compatibility: str = STAGE6_EXECUTION_COMPATIBILITY,
+        execution_compatibility: str | None = None,
     ) -> dict[str, Any]:
         """Derive validator-shaped entry/exit evidence from durable rows only."""
 
@@ -1542,10 +1626,48 @@ class Stage6PilotRunner:
         exit_section["submitted_via"] = "Stage6PilotRunner->GenericOMS"
         started_candidates: list[datetime] = []
         completed_candidates: list[datetime] = []
+        execution_provenance: dict[str, dict[str, dict[str, Any]]] = {
+            "entry": {},
+            "exit": {},
+        }
+        provenance_compatibilities: set[str] = set()
+        provenance_dates: set[str] = set()
+        provenance_run_ids: set[str] = set()
+        provenance_missing: list[str] = []
         for intent_id in (*entry_intent_ids, *exit_intent_ids):
             intent = self.repository.get_intent(str(intent_id))
             if intent is None:
+                provenance_missing.append(f"intent {intent_id} is not durable for execution provenance")
                 continue
+            metadata = intent.get("metadata")
+            marker = metadata.get("stage6_submission") if isinstance(metadata, Mapping) else None
+            label = "entry" if intent_id in entry_intent_ids else "exit"
+            if not isinstance(marker, Mapping):
+                provenance_missing.append(f"{label} intent {intent_id} lacks durable Stage 6 submission provenance")
+            else:
+                marker_value = {str(key): _stable_value(value) for key, value in marker.items()}
+                execution_provenance[label][str(intent_id)] = marker_value
+                compatibility = str(marker.get("execution_compatibility") or "").strip()
+                if compatibility:
+                    provenance_compatibilities.add(compatibility)
+                marker_run_id = str(marker.get("run_id") or "").strip()
+                if marker_run_id:
+                    provenance_run_ids.add(marker_run_id)
+                submitted_text = str(marker.get("submitted_at") or "").strip()
+                if submitted_text:
+                    try:
+                        submitted = datetime.fromisoformat(submitted_text.replace("Z", "+00:00"))
+                        if submitted.tzinfo is None or submitted.utcoffset() is None:
+                            raise ValueError("timestamp has no timezone")
+                        submitted = submitted.astimezone(timezone.utc)
+                        started_candidates.append(submitted)
+                        provenance_dates.add(submitted.astimezone(_US_EASTERN).date().isoformat())
+                    except ValueError:
+                        provenance_missing.append(
+                            f"{label} intent {intent_id} has an invalid durable submission timestamp"
+                        )
+                else:
+                    provenance_missing.append(f"{label} intent {intent_id} lacks durable submission timestamp")
             for field_name, collection in (("created_at", started_candidates), ("updated_at", completed_candidates)):
                 value = intent.get(field_name)
                 if value:
@@ -1558,26 +1680,47 @@ class Stage6PilotRunner:
                         pass
         started = min(started_candidates).isoformat() if started_candidates else self._now().isoformat()
         completed = max(completed_candidates).isoformat() if completed_candidates else started
+        derived_trading_date = next(iter(provenance_dates)) if len(provenance_dates) == 1 else None
+        if len(provenance_dates) > 1:
+            provenance_missing.append(
+                "durable Stage 6 submission timestamps span multiple US trading dates: "
+                + ", ".join(sorted(provenance_dates))
+            )
+        derived_compatibility = next(iter(provenance_compatibilities)) if len(provenance_compatibilities) == 1 else None
+        if len(provenance_compatibilities) > 1:
+            provenance_missing.append("durable Stage 6 submissions use incompatible execution identities")
         evidence: dict[str, Any] = {
             "session_id": str(session_id),
-            "us_trading_date": trading_date or started[:10],
+            "us_trading_date": trading_date or derived_trading_date or started[:10],
+            "derived_us_trading_date": derived_trading_date,
             "started_at": started,
             "completed_at": completed,
             "commit_sha": commit_sha,
-            "execution_compatibility": execution_compatibility,
+            "execution_compatibility": execution_compatibility or derived_compatibility or STAGE6_EXECUTION_COMPATIBILITY,
+            "derived_execution_compatibility": derived_compatibility,
             "account_id": spec.account.id,
             "environment": spec.account.environment.value,
             "execution_path": "Stage6PilotRunner->GenericOMS",
             "execution_mode": "SIM_SUBMIT",
             "supervised": True,
-            "run_ids": [spec.run_id],
+            "run_ids": sorted({str(spec.run_id), *provenance_run_ids}),
             "entry_intent_ids": [str(value) for value in entry_intent_ids],
             "exit_intent_ids": [str(value) for value in exit_intent_ids],
             "evidence_class": "DURABLE",
             "entry": entry,
             "exit": exit_section,
+            "execution_provenance": execution_provenance,
+            "provenance_complete": not provenance_missing
         }
-        missing = entry_missing + exit_missing + missing_basis_reasons
+        missing = entry_missing + exit_missing + missing_basis_reasons + provenance_missing
+        if derived_trading_date is not None and trading_date is not None and str(trading_date) != derived_trading_date:
+            missing.append(
+                f"supplied US trading date {trading_date} disagrees with durable execution date {derived_trading_date}"
+            )
+        if execution_compatibility and derived_compatibility and execution_compatibility != derived_compatibility:
+            missing.append(
+                "supplied execution compatibility disagrees with durable submission provenance"
+            )
         if preflight is not None:
             evidence["preflight"] = dict(preflight.get("preflight", preflight))
         else:

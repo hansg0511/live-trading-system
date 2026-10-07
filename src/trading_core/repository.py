@@ -2911,6 +2911,39 @@ class SQLiteTradingRepository:
             _fingerprint(json.loads(evidence_json)),
         )
 
+    @staticmethod
+    def _stage6_execution_identity_tokens(
+        *,
+        entry_intent_ids: Any,
+        exit_intent_ids: Any,
+        evidence: Any,
+    ) -> set[str]:
+        """Collect durable intent/order identities used by a clean session."""
+
+        tokens: set[str] = set()
+        for prefix, values in (("intent", entry_intent_ids), ("intent", exit_intent_ids)):
+            if isinstance(values, (list, tuple)):
+                for value in values:
+                    normalized = str(value).strip()
+                    if normalized:
+                        tokens.add(f"{prefix}:{normalized}")
+        if isinstance(evidence, Mapping):
+            for section_name in ("entry", "exit"):
+                section = evidence.get(section_name)
+                if not isinstance(section, Mapping):
+                    continue
+                orders = section.get("actual_orders")
+                if not isinstance(orders, list):
+                    continue
+                for order in orders:
+                    if not isinstance(order, Mapping):
+                        continue
+                    for key in ("external_order_id", "order_id", "broker_order_id"):
+                        value = str(order.get(key) or "").strip()
+                        if value:
+                            tokens.add(f"order:{value}")
+        return tokens
+
     def save_stage6_validation_session(
         self,
         result: Stage6SessionResult | Mapping[str, Any],
@@ -2966,6 +2999,42 @@ class SQLiteTradingRepository:
                 if existing_hash != str(values[-1]):
                     raise ValueError("Stage 6 validation session is immutable; evidence changed")
                 return normalized
+            if normalized.outcome is Stage6SessionOutcome.CLEAN_PASS:
+                same_date = conn.execute(
+                    """SELECT 1 FROM core_stage6_validation_sessions
+                        WHERE account_id = ? AND us_trading_date = ?
+                          AND result = 'CLEAN_PASS' AND qualified = 1
+                        LIMIT 1""",
+                    (normalized.account_id, normalized.us_trading_date),
+                ).fetchone()
+                if same_date is not None:
+                    raise ValueError(
+                        f"CLEAN_PASS already exists for US trading date {normalized.us_trading_date}"
+                    )
+                candidate_tokens = self._stage6_execution_identity_tokens(
+                    entry_intent_ids=normalized.entry_intent_ids,
+                    exit_intent_ids=normalized.exit_intent_ids,
+                    evidence=normalized.evidence,
+                )
+                prior_rows = conn.execute(
+                    """SELECT entry_intent_ids_json, exit_intent_ids_json, evidence_json
+                         FROM core_stage6_validation_sessions
+                        WHERE account_id = ? AND result = 'CLEAN_PASS'
+                          AND qualified = 1 AND counted_for_completion = 1""",
+                    (normalized.account_id,),
+                ).fetchall()
+                for prior in prior_rows:
+                    prior_tokens = self._stage6_execution_identity_tokens(
+                        entry_intent_ids=_decode(prior["entry_intent_ids_json"]),
+                        exit_intent_ids=_decode(prior["exit_intent_ids_json"]),
+                        evidence=_decode(prior["evidence_json"]),
+                    )
+                    overlap = sorted(candidate_tokens & prior_tokens)
+                    if overlap:
+                        raise ValueError(
+                            "CLEAN_PASS reuses durable execution identity: "
+                            + ", ".join(overlap)
+                        )
             try:
                 placeholders = ", ".join("?" for _ in range(28))
                 conn.execute(

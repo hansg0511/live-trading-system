@@ -57,6 +57,24 @@ def _evidence(
     compatibility: str = "stage6-execution-v1",
     legacy: bool = False,
 ) -> dict:
+    entry_ids = [f"entry-a-{trading_date}", f"entry-b-{trading_date}"]
+    exit_ids = [f"exit-a-{trading_date}", f"exit-b-{trading_date}"]
+
+    def provenance(intent_id: str, *, mode: str = "SIM_SUBMIT") -> dict:
+        return {
+            "process_id": "stage6-submit-process-1",
+            "run_id": f"stage6-run-{trading_date}",
+            "mode": mode,
+            "execution_compatibility": compatibility,
+            "submitted_at": f"{trading_date}T13:40:00+00:00",
+            "correlation": {
+                "intent_id": intent_id,
+                "run_id": f"stage6-run-{trading_date}",
+                "source_signal_id": f"signal-{intent_id}",
+                "idempotency_key": f"idempotency-{intent_id}",
+            },
+        }
+
     return {
         "session_id": f"session-{trading_date}",
         "us_trading_date": trading_date,
@@ -71,8 +89,14 @@ def _evidence(
         "execution_mode": "SIM_SUBMIT",
         "supervised": True,
         "run_ids": [f"stage6-run-{trading_date}"],
-        "entry_intent_ids": [f"entry-a-{trading_date}", f"entry-b-{trading_date}"],
-        "exit_intent_ids": [f"exit-a-{trading_date}", f"exit-b-{trading_date}"],
+        "entry_intent_ids": entry_ids,
+        "exit_intent_ids": exit_ids,
+        "derived_us_trading_date": trading_date,
+        "provenance_complete": True,
+        "execution_provenance": {
+            "entry": {intent_id: provenance(intent_id) for intent_id in entry_ids},
+            "exit": {intent_id: provenance(intent_id) for intent_id in exit_ids},
+        },
         "legacy": legacy,
         "preflight": {
             "account_identity": {"account_id": "validation-account", "environment": "SIM"},
@@ -96,8 +120,8 @@ def _evidence(
         },
         "entry": {
             "expected_intents": [{"intent_id": f"entry-a-{trading_date}"}, {"intent_id": f"entry-b-{trading_date}"}],
-            "expected_orders": [{"order_id": "entry-order-a"}, {"order_id": "entry-order-b"}],
-            "actual_orders": [_order("entry-order-a", f"entry-a-{trading_date}"), _order("entry-order-b", f"entry-b-{trading_date}", side="SELL")],
+            "expected_orders": [{"order_id": f"entry-order-a-{trading_date}"}, {"order_id": f"entry-order-b-{trading_date}"}],
+            "actual_orders": [_order(f"entry-order-a-{trading_date}", f"entry-a-{trading_date}"), _order(f"entry-order-b-{trading_date}", f"entry-b-{trading_date}", side="SELL")],
             "unexpected_attempts": 0,
             "duplicate_attempts": 0,
             "fills_complete": True,
@@ -117,7 +141,7 @@ def _evidence(
             },
             "source_submission_process_identity_complete": True,
             "preserved_intent_ids": [f"entry-a-{trading_date}", f"entry-b-{trading_date}"],
-            "preserved_order_ids": ["entry-order-a", "entry-order-b"],
+            "preserved_order_ids": [f"entry-order-a-{trading_date}", f"entry-order-b-{trading_date}"],
             "intents_preserved": True,
             "orders_preserved": True,
             "no_duplicate_attempts": True,
@@ -125,8 +149,8 @@ def _evidence(
             "exposure_agrees": True,
         },
         "exit": {
-            "expected_orders": [{"order_id": "exit-order-a"}, {"order_id": "exit-order-b"}],
-            "actual_orders": [_order("exit-order-a", f"exit-a-{trading_date}", side="SELL"), _order("exit-order-b", f"exit-b-{trading_date}", side="BUY")],
+            "expected_orders": [{"order_id": f"exit-order-a-{trading_date}"}, {"order_id": f"exit-order-b-{trading_date}"}],
+            "actual_orders": [_order(f"exit-order-a-{trading_date}", f"exit-a-{trading_date}", side="SELL"), _order(f"exit-order-b-{trading_date}", f"exit-b-{trading_date}", side="BUY")],
             "unexpected_attempts": 0,
             "duplicate_attempts": 0,
             "fills_complete": True,
@@ -237,6 +261,41 @@ def test_recovery_identity_and_numeric_evidence_are_strictly_checked():
     result = evaluate_stage6_session(wrong_final_book)
     assert result.outcome is Stage6SessionOutcome.INVALID
     assert any("book identities" in item for item in result.failure_reasons)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        (lambda value: value.pop("execution_provenance"), "execution_provenance"),
+        (lambda value: value["execution_provenance"]["entry"][value["entry_intent_ids"][0]].update({"execution_compatibility": "stage6-execution-v1-other"}), "incompatible execution"),
+        (lambda value: value["execution_provenance"]["exit"][value["exit_intent_ids"][0]].update({"submitted_at": "2026-10-06T13:40:00+00:00"}), "derive the supplied US trading date"),
+        (lambda value: value.update({"derived_us_trading_date": "2026-10-06"}), "disagrees with derived"),
+    ),
+)
+def test_durable_provenance_date_and_compatibility_guards_fail_closed(mutation, reason):
+    value = _evidence()
+    mutation(value)
+    result = evaluate_stage6_session(value)
+    assert result.outcome is Stage6SessionOutcome.INVALID
+    assert any(reason in item for item in result.failure_reasons)
+
+
+def test_clean_pass_cannot_reuse_intents_or_orders_on_another_date(tmp_path):
+    repository = _repository(tmp_path)
+    first = _evidence("2026-10-05")
+    repository.save_stage6_validation_session(evaluate_stage6_session(first))
+
+    reused = copy.deepcopy(first)
+    reused["session_id"] = "reused-execution-on-new-date"
+    reused["us_trading_date"] = "2026-10-06"
+    reused["derived_us_trading_date"] = "2026-10-06"
+    for section in ("entry", "exit"):
+        for marker in reused["execution_provenance"][section].values():
+            marker["submitted_at"] = "2026-10-06T13:40:00+00:00"
+    result = evaluate_stage6_session(reused)
+    assert result.outcome is Stage6SessionOutcome.CLEAN_PASS
+    with pytest.raises(ValueError, match="reuses durable execution identity"):
+        repository.save_stage6_validation_session(result)
 
 
 def test_failed_run_duplicate_attempt_and_missing_recovery_are_not_clean():
