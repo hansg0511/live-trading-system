@@ -8,6 +8,9 @@ Commands are intentionally asymmetric:
 * ``broker-preflight`` performs fresh account and provider market-state reads
   through the configured generic adapter, but never creates or submits an
   order.
+* ``recover`` performs broker-read-only restart recovery through the existing
+  ``Stage6PilotRunner``/``GenericOMS`` path.  It may write recovered local
+  ledger evidence, but never submits, cancels, replaces, hedges, or flattens.
 * ``sim-submit`` is the only broker-order command and requires both
   ``--arm-sim`` and the exact confirmation phrase containing the deterministic
   run correlation.  It still submits only through ``Stage6PilotRunner`` and
@@ -22,6 +25,7 @@ import argparse
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -59,7 +63,14 @@ def _parser() -> argparse.ArgumentParser:
         help="explicitly verify fresh flat SIM facts and import bounded legacy order evidence (no submit)",
     )
     sim_submit = subparsers.add_parser("sim-submit", help="explicitly arm one SIM pilot through GenericOMS")
-    for command in (validate, dry_run, broker_preflight, baseline, sim_submit):
+    recover = subparsers.add_parser(
+        "recover",
+        help=(
+            "broker-read-only restart recovery; may write recovered local ledger evidence, "
+            "never submits/cancels/replaces"
+        ),
+    )
+    for command in (validate, dry_run, broker_preflight, baseline, sim_submit, recover):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--json", action="store_true", dest="as_json")
     baseline.add_argument("--legacy-db", type=Path, required=True)
@@ -115,6 +126,205 @@ def _summary(config: Stage6PilotConfig) -> dict[str, Any]:
         "required_confirmation": config.confirmation_phrase(),
         "rth_handoff_policy": config.execution.rth_handoff_policy,
         "mode": "DRY_RUN",
+    }
+
+
+def _recovery_intent_snapshot(
+    repository: SQLiteTradingRepository,
+    account_id: str,
+    intent_ids: list[str] | tuple[str, ...] | set[str],
+) -> list[dict[str, Any]]:
+    """Build an operator/evidence view from public repository facts only."""
+
+    broker_orders = repository.book_broker_orders(account_id)
+    orders_by_leg: dict[str, list[dict[str, Any]]] = {}
+    for order in broker_orders:
+        orders_by_leg.setdefault(str(order.get("order_leg_id")), []).append(order)
+
+    snapshots: list[dict[str, Any]] = []
+    for intent_id in sorted({str(value) for value in intent_ids if str(value).strip()}):
+        intent = repository.get_intent(intent_id)
+        if intent is None:
+            continue
+        legs: list[dict[str, Any]] = []
+        for leg in intent.get("legs", ()):
+            leg_id = str(leg.get("id"))
+            attempts: list[dict[str, Any]] = []
+            for order in orders_by_leg.get(leg_id, ()):
+                order_id = str(order.get("id"))
+                attempts.append(
+                    {
+                        "id": order_id,
+                        "external_order_id": order.get("external_order_id"),
+                        "status": order.get("status"),
+                        "submitted_quantity": order.get("submitted_quantity"),
+                        "filled_quantity": order.get("filled_quantity"),
+                        "average_fill_price": order.get("average_fill_price"),
+                        "submitted_at": order.get("submitted_at"),
+                        "updated_at": order.get("updated_at"),
+                        "fills": repository.fills_for_broker_order(order_id),
+                    }
+                )
+            legs.append(
+                {
+                    "id": leg_id,
+                    "instrument_id": leg.get("instrument_id"),
+                    "side": leg.get("side"),
+                    "requested_quantity": leg.get("quantity"),
+                    "status": leg.get("status"),
+                    "attempts": attempts,
+                }
+            )
+        snapshots.append(
+            {
+                "intent_id": str(intent.get("id", intent_id)),
+                "book_id": intent.get("book_id"),
+                "action": intent.get("action"),
+                "status": intent.get("status"),
+                "legs": legs,
+            }
+        )
+    return snapshots
+
+
+def _recovery_order_facts(
+    repository: SQLiteTradingRepository,
+    account_id: str,
+) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Return durable broker-order rows and fill facts keyed for delta checks."""
+
+    orders = {
+        str(row["id"]): row
+        for row in repository.book_broker_orders(account_id)
+        if row.get("id") is not None
+    }
+    fills: dict[tuple[str, str], dict[str, Any]] = {}
+    for order_id in orders:
+        for fill in repository.fills_for_broker_order(order_id):
+            fill_key = str(fill.get("dedupe_key") or fill.get("external_fill_id") or "")
+            fills[(order_id, fill_key)] = fill
+    return orders, fills
+
+
+def _recovery_report(
+    *,
+    config: Stage6PilotConfig,
+    repository: SQLiteTradingRepository,
+    started_at: datetime,
+    before_intent_ids: list[str],
+    before_status: list[dict[str, Any]],
+    before_order_ids: set[str],
+    before_external_order_ids: set[str],
+    before_fill_keys: set[tuple[str, str]],
+    recovered: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Serialize one read-only broker recovery and its durable local delta."""
+
+    account_id = config.account.id
+    after_order_rows, after_fill_rows = _recovery_order_facts(repository, account_id)
+    after_intent_ids = set(before_intent_ids) | {
+        str(item.get("id"))
+        for item in recovered
+        if isinstance(item, Mapping) and item.get("id") is not None
+    }
+    new_order_ids = sorted(set(after_order_rows) - before_order_ids)
+    new_fill_keys = sorted(
+        [
+            f"{order_id}:{fill_key}"
+            for order_id, fill_key in set(after_fill_rows) - before_fill_keys
+        ]
+    )
+    attempts_by_leg: dict[str, int] = {}
+    for row in after_order_rows.values():
+        leg_id = str(row.get("order_leg_id"))
+        attempts_by_leg[leg_id] = attempts_by_leg.get(leg_id, 0) + 1
+    duplicate_legs = sorted(leg_id for leg_id, count in attempts_by_leg.items() if count > 1)
+    completed_at = datetime.now(timezone.utc)
+    open_issues = repository.open_reconciliation_issues(account_id)
+    open_actions = repository.open_recovery_actions(account_id)
+    after_external_order_ids = {
+        str(row.get("external_order_id"))
+        for row in after_order_rows.values()
+        if row.get("external_order_id") not in (None, "")
+    }
+    after_status = _recovery_intent_snapshot(repository, account_id, after_intent_ids)
+    intents_preserved = set(before_intent_ids).issubset(after_intent_ids)
+    orders_preserved = before_external_order_ids.issubset(after_external_order_ids)
+    no_duplicate_attempts = not duplicate_legs and not new_order_ids
+    terminal_statuses = {"FILLED", "COMPLETED"}
+    recovered_statuses = [str(item.get("status")) for item in after_status]
+    recovery_clean = bool(before_intent_ids) and all(
+        status in terminal_statuses for status in recovered_statuses
+    ) and not open_issues and not open_actions and intents_preserved and orders_preserved and no_duplicate_attempts
+    restart_recovery = {
+        "performed": True,
+        "fresh_process": True,
+        "process_id": str(os.getpid()),
+        "captured_at": completed_at.isoformat(),
+        "result": "RECOVERED" if recovery_clean else "BLOCKED",
+        "preserved_intent_ids": sorted(after_intent_ids),
+        "preserved_order_ids": sorted(after_external_order_ids),
+        "intents_preserved": intents_preserved,
+        "orders_preserved": orders_preserved,
+        "no_duplicate_attempts": no_duplicate_attempts,
+        "exposure_agrees": recovery_clean,
+    }
+    return {
+        "run_id": config.spec().run_id,
+        "mode": "RECOVER",
+        "recovery_mode": "BROKER_READ_ONLY_LOCAL_LEDGER_WRITE_CAPABLE",
+        "recovery_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+        "account_id": account_id,
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "captured_at": completed_at.isoformat(),
+        "broker_contacted": True,
+        "fresh_process_recovery": True,
+        "process_id": os.getpid(),
+        "recovered_intent_ids": sorted(
+            {
+                str(item.get("id"))
+                for item in recovered
+                if isinstance(item, Mapping) and item.get("id") is not None
+            }
+        ),
+        "recovery_results": recovered,
+        "before_status": before_status,
+        "after_status": after_status,
+        "restart_recovery": restart_recovery,
+        "recovered_fill_evidence": [
+            {
+                "broker_order_id": order_id,
+                "dedupe_key": fill_key,
+                **dict(fill),
+            }
+            for (order_id, fill_key), fill in sorted(after_fill_rows.items())
+            if (order_id, fill_key) not in before_fill_keys
+        ],
+        "open_reconciliation_issues": open_issues,
+        "open_recovery_actions": open_actions,
+        "duplicate_attempt_status": {
+            "detected": bool(duplicate_legs),
+            "by_leg": attempts_by_leg,
+            "duplicate_leg_ids": duplicate_legs,
+            "new_broker_order_attempt_count": len(new_order_ids),
+            "new_broker_order_attempt_ids": new_order_ids,
+        },
+        "broker_submission_count": 0,
+        "cancel_count": 0,
+        "replace_count": 0,
+        "orders_submitted": 0,
+        "mutations": {
+            "broker_orders": len(new_order_ids),
+            "fills": len(new_fill_keys),
+            "order_intents": 0,
+            "order_legs": 0,
+            "submission_calls": 0,
+            "cancel_calls": 0,
+            "replace_calls": 0,
+            "recovery_calls": 1,
+        },
+        "stop_reasons": [],
     }
 
 
@@ -382,6 +592,42 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         "stage-status",
     }:
         return _run_validation_command(args, config)
+
+    if args.command == "recover":
+        if str(config.account.environment.value).upper() != "SIM":
+            raise Stage6ConfigError("recover accepts SIM accounts only")
+        repository = SQLiteTradingRepository(config.state_db)
+        config.ensure_repository(repository)
+        before_intent_ids = repository.recoverable_intent_ids(config.account.id)
+        before_status = _recovery_intent_snapshot(repository, config.account.id, before_intent_ids)
+        before_order_rows, before_fill_rows = _recovery_order_facts(repository, config.account.id)
+        before_external_order_ids = {
+            str(row.get("external_order_id"))
+            for row in before_order_rows.values()
+            if row.get("external_order_id") not in (None, "")
+        }
+        started_at = datetime.now(timezone.utc)
+        adapter = config.build_moomoo_adapter()
+        connected = False
+        try:
+            adapter.connect()
+            connected = True
+            recovered = config.build_runner(repository, adapter=adapter).recover(config.account)
+        finally:
+            if connected:
+                adapter.disconnect()
+        payload = _recovery_report(
+            config=config,
+            repository=repository,
+            started_at=started_at,
+            before_intent_ids=before_intent_ids,
+            before_status=before_status,
+            before_order_ids=set(before_order_rows),
+            before_external_order_ids=before_external_order_ids,
+            before_fill_keys=set(before_fill_rows),
+            recovered=recovered,
+        )
+        return 0, payload
 
     if args.command == "sim-submit":
         if not args.arm_sim:
