@@ -3106,6 +3106,8 @@ class SQLiteTradingRepository:
             candidate_orders: list[dict[str, Any]] = []
             for row in order_rows:
                 external_id = str(row["external_order_id"]).strip()
+                if str(row["broker"]).strip() != target_account.broker:
+                    raise ValueError(f"legacy evidence order {external_id} belongs to a different broker")
                 if str(row["status"]).upper() != BrokerOrderStatus.FILLED.value:
                     raise ValueError(f"legacy evidence order {external_id} is not a complete FILLED order")
                 if str(row["leg_status"]).upper() != LegStatus.FILLED.value:
@@ -3314,8 +3316,357 @@ class SQLiteTradingRepository:
         finally:
             source.close()
 
+        def _same_text(left: Any, right: Any) -> bool:
+            return ("" if left is None else str(left)) == ("" if right is None else str(right))
+
+        def _same_decimal(left: Any, right: Any) -> bool:
+            try:
+                return Decimal(str(left)) == Decimal(str(right))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+
+        def _same_optional_decimal(left: Any, right: Any) -> bool:
+            if left is None or right is None:
+                return left is None and right is None
+            return _same_decimal(left, right)
+
+        def _metadata(value: Any) -> dict[str, Any]:
+            decoded = _decode(value) if isinstance(value, str) or value is None else value
+            return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+        def _without_source_database(value: Mapping[str, Any]) -> dict[str, Any]:
+            result = dict(value)
+            result.pop("source_database", None)
+            return result
+
+        def _reuse_existing_graph() -> dict[str, Any] | None:
+            """Return the exact retired graph, or None when no claim exists."""
+
+            placeholders = ",".join("?" for _ in source_order_ids)
+            with self.transaction() as conn:
+                existing_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT * FROM core_broker_orders "
+                        f"WHERE account_id = ? AND external_order_id IN ({placeholders}) "
+                        "ORDER BY external_order_id, id",
+                        (str(account_id), *source_order_ids),
+                    ).fetchall()
+                ]
+                if not existing_rows:
+                    # A prior transaction should create the whole retired
+                    # graph atomically.  If a matching provenance marker is
+                    # nevertheless present without any of the source order
+                    # claims, treat it as an incomplete graph rather than
+                    # silently rebuilding it under a new label.
+                    provenance_rows = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT id, metadata_json FROM core_strategies "
+                            "UNION ALL SELECT id, metadata_json FROM core_books"
+                        ).fetchall()
+                    ]
+                    for row in provenance_rows:
+                        metadata = _metadata(row.get("metadata_json"))
+                        if (
+                            metadata.get("legacy_import") is True
+                            and metadata.get("retired") is True
+                            and str(metadata.get("source_ledger_fingerprint", "")) == source_fingerprint
+                        ):
+                            raise ValueError(
+                                "existing legacy graph has provenance but no broker-order claims"
+                            )
+                    return None
+                existing_by_external: dict[str, list[dict[str, Any]]] = {}
+                for row in existing_rows:
+                    existing_by_external.setdefault(str(row["external_order_id"]), []).append(row)
+                if set(existing_by_external) != set(source_order_ids):
+                    raise ValueError(
+                        "legacy evidence partially overlaps existing target broker-order claims"
+                    )
+                if any(len(rows) != 1 for rows in existing_by_external.values()):
+                    raise ValueError("legacy evidence has ambiguous existing broker-order claims")
+
+                imported_intents: dict[str, str] = {}
+                imported_legs: dict[str, str] = {}
+                imported_orders: dict[str, str] = {}
+                imported_fills: dict[str, str] = {}
+                imported_allocations: dict[str, str] = {}
+                target_strategy_ids: set[str] = set()
+                target_book_ids: set[str] = set()
+                mapped_source_legs: set[str] = set()
+
+                for external_id in source_order_ids:
+                    source_order = by_external[external_id]
+                    existing_order = existing_by_external[external_id][0]
+                    existing_metadata = _metadata(existing_order.get("metadata_json"))
+                    expected_order_metadata = _metadata(source_order.get("metadata_json"))
+                    expected_order_metadata.update(
+                        {
+                            "legacy_import": True,
+                            "source_broker_order_id": str(source_order["id"]),
+                            "source_ledger_fingerprint": source_fingerprint,
+                            "retired": True,
+                        }
+                    )
+                    if (
+                        str(existing_order["account_id"]) != str(account_id)
+                        or str(existing_order["broker"]) != target_account.broker
+                        or str(existing_order["external_order_id"]) != external_id
+                        or str(existing_order["status"]).upper() != BrokerOrderStatus.FILLED.value
+                        or int(existing_order["attempt_number"]) != int(source_order["attempt_number"])
+                        or not _same_text(existing_order["client_order_id"], source_order["client_order_id"])
+                        or not _same_decimal(existing_order["submitted_quantity"], source_order["submitted_quantity"])
+                        or existing_metadata != expected_order_metadata
+                    ):
+                        raise ValueError(f"existing legacy broker-order evidence conflicts for {external_id}")
+
+                    source_leg_id = str(source_order["order_leg_id"])
+                    source_leg = source_legs.get(source_leg_id)
+                    if source_leg is None:
+                        raise ValueError(f"existing legacy graph is missing source leg {source_leg_id}")
+                    target_leg_id = str(existing_order["order_leg_id"])
+                    if source_leg_id in imported_legs and imported_legs[source_leg_id] != target_leg_id:
+                        raise ValueError(f"existing legacy graph maps source leg {source_leg_id} ambiguously")
+                    imported_legs[source_leg_id] = target_leg_id
+                    mapped_source_legs.add(source_leg_id)
+                    target_leg = conn.execute(
+                        "SELECT * FROM core_order_legs WHERE id = ?", (target_leg_id,)
+                    ).fetchone()
+                    if target_leg is None:
+                        raise ValueError(f"existing legacy graph is missing target leg {target_leg_id}")
+                    target_leg = dict(target_leg)
+                    target_instrument_id = target_instrument_ids[str(source_leg["instrument_id"])]
+                    expected_leg_metadata = _metadata(source_leg.get("metadata_json"))
+                    expected_leg_metadata.setdefault(
+                        "legacy_source_instrument_id", str(source_leg["instrument_id"])
+                    )
+                    if (
+                        str(target_leg["instrument_id"]) != target_instrument_id
+                        or int(target_leg["sequence"]) != int(source_leg["sequence"])
+                        or str(target_leg["side"]).upper() != str(source_leg["side"]).upper()
+                        or not _same_decimal(target_leg["quantity"], source_leg["quantity"])
+                        or not _same_text(target_leg["quantity_unit"], source_leg["quantity_unit"])
+                        or not _same_text(target_leg["order_type"], source_leg["order_type"])
+                        or not _same_text(target_leg["limit_price"], source_leg["limit_price"])
+                        or not _same_text(target_leg["stop_price"], source_leg["stop_price"])
+                        or not _same_text(target_leg["time_in_force"], source_leg["time_in_force"])
+                        or str(target_leg["status"]).upper() != str(source_leg["status"]).upper()
+                        or not _same_decimal(
+                            target_leg["cumulative_filled_quantity"], source_leg["cumulative_filled_quantity"]
+                        )
+                        or not _same_optional_decimal(target_leg["average_fill_price"], source_leg["average_fill_price"])
+                        or _metadata(target_leg.get("metadata_json")) != expected_leg_metadata
+                    ):
+                        raise ValueError(f"existing legacy leg evidence conflicts for {external_id}")
+
+                    source_intent_id = str(source_order["intent_id"])
+                    target_intent_id = str(target_leg["intent_id"])
+                    if source_intent_id in imported_intents and imported_intents[source_intent_id] != target_intent_id:
+                        raise ValueError(f"existing legacy graph maps source intent {source_intent_id} ambiguously")
+                    imported_intents[source_intent_id] = target_intent_id
+                    source_intent = source_intents.get(source_intent_id)
+                    if source_intent is None:
+                        raise ValueError(f"existing legacy graph is missing source intent {source_intent_id}")
+                    target_intent = conn.execute(
+                        "SELECT * FROM core_order_intents WHERE id = ?", (target_intent_id,)
+                    ).fetchone()
+                    if target_intent is None:
+                        raise ValueError(f"existing legacy graph is missing target intent {target_intent_id}")
+                    target_intent = dict(target_intent)
+                    expected_intent_metadata = _metadata(source_intent.get("metadata_json"))
+                    expected_intent_metadata.update(
+                        {
+                            "legacy_import": True,
+                            "source_intent_id": source_intent_id,
+                            "source_ledger_fingerprint": source_fingerprint,
+                            "retired": True,
+                        }
+                    )
+                    if (
+                        str(target_intent["account_id"]) != str(account_id)
+                        or not _same_text(target_intent["action"], source_intent["action"])
+                        or not _same_text(target_intent["status"], source_intent["status"])
+                        or not _same_text(target_intent["source_signal_id"], source_intent["source_signal_id"])
+                        or not _same_text(target_intent["payload_hash"], source_intent["payload_hash"])
+                        or not _same_text(
+                            target_intent["execution_policy_json"], source_intent["execution_policy_json"]
+                        )
+                        or _metadata(target_intent.get("metadata_json")) != expected_intent_metadata
+                    ):
+                        raise ValueError(f"existing legacy intent evidence conflicts for {external_id}")
+                    target_strategy_ids.add(str(target_intent["strategy_id"]))
+                    target_book_ids.add(str(target_intent["book_id"]))
+
+                    target_fills = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM core_fills WHERE broker_order_id = ? ORDER BY id",
+                            (str(existing_order["id"]),),
+                        ).fetchall()
+                    ]
+                    if len(target_fills) != 1:
+                        raise ValueError(f"existing legacy graph has incomplete fills for {external_id}")
+                    target_fill = target_fills[0]
+                    source_fill = source_order["_fill"]
+                    if (
+                        str(target_fill["order_leg_id"]) != target_leg_id
+                        or not _same_text(target_fill["external_fill_id"], source_fill["external_fill_id"])
+                        or not _same_text(target_fill["dedupe_key"], source_fill["dedupe_key"])
+                        or not _same_decimal(target_fill["quantity"], source_fill["quantity"])
+                        or not _same_decimal(target_fill["price"], source_fill["price"])
+                        or not _same_text(target_fill["fee"], source_fill["fee"])
+                        or not _same_text(target_fill["fee_currency"], source_fill["fee_currency"])
+                        or not _same_text(target_fill["filled_at"], source_fill["filled_at"])
+                        or str(target_fill["evidence_mode"]) != ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS.value
+                        or _metadata(target_fill.get("metadata_json")) != source_order["_fill_metadata"]
+                    ):
+                        raise ValueError(f"existing legacy fill evidence conflicts for {external_id}")
+                    imported_orders[external_id] = str(existing_order["id"])
+                    imported_fills[str(source_fill["id"])] = str(target_fill["id"])
+
+                if mapped_source_legs != set(source_legs):
+                    raise ValueError("existing legacy graph is incomplete: not every source leg is represented")
+                if len(target_strategy_ids) != 1 or len(target_book_ids) != 1:
+                    raise ValueError("existing legacy graph has ambiguous strategy or book ownership")
+                target_strategy_id = next(iter(target_strategy_ids))
+                target_book_id = next(iter(target_book_ids))
+                strategy_row = conn.execute(
+                    "SELECT * FROM core_strategies WHERE id = ?", (target_strategy_id,)
+                ).fetchone()
+                book_row = conn.execute("SELECT * FROM core_books WHERE id = ?", (target_book_id,)).fetchone()
+                if strategy_row is None or book_row is None:
+                    raise ValueError("existing legacy graph is missing its strategy or book")
+                expected_strategy_metadata = {
+                    "legacy_import": True,
+                    "source_database": str(source_path),
+                    "source_strategy_id": source_strategy_id,
+                    "source_ledger_fingerprint": source_fingerprint,
+                    "source_to_target_instrument_mapping": mapping_metadata,
+                    "retired": True,
+                }
+                expected_book_metadata = {
+                    "legacy_import": True,
+                    "source_database": str(source_path),
+                    "source_ledger_fingerprint": source_fingerprint,
+                    "source_to_target_instrument_mapping": mapping_metadata,
+                    "retired": True,
+                }
+                if (
+                    _without_source_database(_metadata(strategy_row["metadata_json"]))
+                    != _without_source_database(expected_strategy_metadata)
+                    or _without_source_database(_metadata(book_row["metadata_json"]))
+                    != _without_source_database(expected_book_metadata)
+                ):
+                    raise ValueError("existing legacy strategy/book provenance conflicts")
+
+                graph_intents = {
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"SELECT id FROM core_order_intents WHERE account_id = ? AND strategy_id = ? "
+                        "AND book_id = ?",
+                        (str(account_id), target_strategy_id, target_book_id),
+                    ).fetchall()
+                }
+                if graph_intents != set(imported_intents.values()):
+                    raise ValueError("existing legacy graph has incomplete or extra intent rows")
+                graph_intent_placeholders = ",".join("?" for _ in graph_intents)
+                graph_legs = {
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"SELECT l.id FROM core_order_legs l JOIN core_order_intents i ON i.id = l.intent_id "
+                        f"WHERE i.account_id = ? AND i.strategy_id = ? AND i.book_id = ? "
+                        f"AND i.id IN ({graph_intent_placeholders})",
+                        (str(account_id), target_strategy_id, target_book_id, *graph_intents),
+                    ).fetchall()
+                }
+                if graph_legs != set(imported_legs.values()):
+                    raise ValueError("existing legacy graph has incomplete or extra leg rows")
+                graph_leg_placeholders = ",".join("?" for _ in graph_legs)
+                graph_orders = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT b.* FROM core_broker_orders b JOIN core_order_legs l ON l.id = b.order_leg_id "
+                        f"WHERE l.id IN ({graph_leg_placeholders})",
+                        tuple(graph_legs),
+                    ).fetchall()
+                ]
+                if len(graph_orders) != len(source_order_ids) or {
+                    str(row["external_order_id"]) for row in graph_orders
+                } != set(source_order_ids):
+                    raise ValueError("existing legacy graph has incomplete or extra broker-order rows")
+
+                nonzero_source_allocations = []
+                for allocation in allocations:
+                    if Decimal(str(allocation["signed_quantity"])) != 0:
+                        nonzero_source_allocations.append(allocation)
+                allocation_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM core_position_allocations WHERE account_id = ? AND strategy_id = ? AND book_id = ?",
+                        (str(account_id), target_strategy_id, target_book_id),
+                    ).fetchall()
+                ]
+                source_allocation_ids = {str(row["id"]) for row in nonzero_source_allocations}
+                existing_allocation_by_source: dict[str, dict[str, Any]] = {}
+                for row in allocation_rows:
+                    metadata = _metadata(row.get("metadata_json"))
+                    source_allocation_id = str(metadata.get("source_allocation_id", "")).strip()
+                    if not source_allocation_id or source_allocation_id in existing_allocation_by_source:
+                        raise ValueError("existing legacy graph has ambiguous allocation provenance")
+                    existing_allocation_by_source[source_allocation_id] = row
+                if set(existing_allocation_by_source) != source_allocation_ids:
+                    raise ValueError("existing legacy graph has incomplete or extra allocation rows")
+                for source_allocation in nonzero_source_allocations:
+                    source_allocation_id = str(source_allocation["id"])
+                    target_allocation = existing_allocation_by_source[source_allocation_id]
+                    target_source_intent = imported_intents.get(str(source_allocation.get("source_intent_id")))
+                    expected_allocation_metadata = _metadata(source_allocation.get("metadata_json"))
+                    expected_allocation_metadata.update(
+                        {
+                            "legacy_import": True,
+                            "source_allocation_id": source_allocation_id,
+                            "legacy_source_instrument_id": str(source_allocation["instrument_id"]),
+                            "retired": True,
+                        }
+                    )
+                    if (
+                        str(target_allocation["account_id"]) != str(account_id)
+                        or str(target_allocation["instrument_id"])
+                        != target_instrument_ids[str(source_allocation["instrument_id"])]
+                        or str(target_allocation["strategy_id"]) != target_strategy_id
+                        or str(target_allocation["book_id"]) != target_book_id
+                        or str(target_allocation["ownership_class"]) != str(source_allocation["ownership_class"])
+                        or not _same_decimal(target_allocation["signed_quantity"], source_allocation["signed_quantity"])
+                        or str(target_allocation["source_intent_id"]) != str(target_source_intent)
+                        or not _same_text(target_allocation["updated_at"], source_allocation["updated_at"])
+                        or _metadata(target_allocation.get("metadata_json")) != expected_allocation_metadata
+                    ):
+                        raise ValueError(f"existing legacy allocation evidence conflicts for {source_allocation_id}")
+                    imported_allocations[source_allocation_id] = str(target_allocation["id"])
+
+                return {
+                    "source_database": str(source_path),
+                    "source_ledger_fingerprint": source_fingerprint,
+                    "source_order_ids": source_order_ids,
+                    "legacy_strategy_id": target_strategy_id,
+                    "legacy_book_id": target_book_id,
+                    "source_to_target_instrument_mapping": mapping_metadata,
+                    "imported_intents": imported_intents,
+                    "imported_legs": imported_legs,
+                    "imported_orders": imported_orders,
+                    "imported_fills": imported_fills,
+                    "imported_allocations": imported_allocations,
+                    "verified_flat": True,
+                    "evidence_mode": ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS.value,
+                    "reused_existing_graph": True,
+                }
+
         legacy_strategy_id = f"{label}:{account_id}:strategy"
         legacy_book_id = f"{label}:{account_id}:book"
+        reused = _reuse_existing_graph()
+        if reused is not None:
+            return reused
         now = _timestamp(utc_now())
         imported_intents: dict[str, str] = {}
         imported_legs: dict[str, str] = {}
@@ -3512,6 +3863,7 @@ class SQLiteTradingRepository:
             "imported_allocations": imported_allocations,
             "verified_flat": True,
             "evidence_mode": ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS.value,
+            "reused_existing_graph": False,
         }
 
     def save_position_allocation(

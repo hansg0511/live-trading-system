@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from dataclasses import replace
+import json
 import sqlite3
 import shutil
 
@@ -924,6 +925,8 @@ def test_legacy_import_is_flat_distinct_and_idempotent(tmp_path):
     second = target.import_legacy_order_evidence(source, _account().id)
 
     assert first["source_ledger_fingerprint"] == second["source_ledger_fingerprint"]
+    assert first["reused_existing_graph"] is False
+    assert second["reused_existing_graph"] is True
     assert first["source_order_ids"] == ("3408387", "3408388", "3408464", "3408465")
     assert len(target.broker_orders_for_external_order_id("3408387")) == 1
     assert target.broker_orders_for_external_order_id("3408387")[0]["id"].startswith("legacy-smoke:order:")
@@ -931,6 +934,211 @@ def test_legacy_import_is_flat_distinct_and_idempotent(tmp_path):
         first["legacy_book_id"]
     }
     assert sqlite3.connect(source).execute("SELECT COUNT(*) FROM core_broker_orders").fetchone()[0] == before
+
+
+def _legacy_graph_counts(repository):
+    with repository.transaction() as connection:
+        return tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "core_strategies",
+                "core_books",
+                "core_order_intents",
+                "core_order_legs",
+                "core_broker_orders",
+                "core_fills",
+                "core_position_allocations",
+            )
+        )
+
+
+def test_legacy_import_reuses_exact_graph_across_labels_and_baseline_checkpoint(tmp_path):
+    target, first, baseline = _imported_retired_target(tmp_path)
+    before = _legacy_graph_counts(target)
+
+    reused = target.import_legacy_order_evidence(
+        "data/generic-sim-smoke.db",
+        _account().id,
+        legacy_label="second-label",
+    )
+
+    assert reused["reused_existing_graph"] is True
+    assert reused["legacy_strategy_id"] == first["legacy_strategy_id"]
+    assert reused["legacy_book_id"] == first["legacy_book_id"]
+    assert reused["imported_intents"] == first["imported_intents"]
+    assert reused["imported_legs"] == first["imported_legs"]
+    assert reused["imported_orders"] == first["imported_orders"]
+    assert reused["imported_fills"] == first["imported_fills"]
+    assert reused["imported_allocations"] == first["imported_allocations"]
+    assert _legacy_graph_counts(target) == before
+    assert target.verified_retired_book_closure(
+        _account().id,
+        baseline.metadata["legacy_book_id"],
+        baseline,
+    )[0] is True
+
+
+def test_legacy_import_rejects_partial_existing_external_claim(tmp_path):
+    target = _repository(tmp_path)
+    target.create_intent(_intent())
+    target.create_broker_order(
+        broker_order_id="current-broker-order",
+        order_leg_id="compat-leg",
+        account_id=_account().id,
+        broker="moomoo",
+        attempt_number=1,
+        client_order_id="current-client-order",
+        submitted_quantity=Decimal("1"),
+        now=NOW,
+    )
+    target.record_submission(
+        "current-broker-order",
+        status=BrokerOrderStatus.SUBMITTING,
+        external_order_id="3408387",
+        metadata={"current": True},
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="partially overlaps"):
+        target.import_legacy_order_evidence("data/generic-sim-smoke.db", _account().id)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "nonlegacy",
+        "instrument",
+        "side",
+        "quantity",
+        "fill_quantity",
+        "fill_price",
+        "fill_timestamp",
+        "status",
+        "incomplete_fill",
+    ),
+)
+def test_legacy_import_rejects_conflicting_existing_graph(tmp_path, mutation):
+    target = _repository(tmp_path / mutation)
+    target.import_legacy_order_evidence("data/generic-sim-smoke.db", _account().id)
+    order = target.broker_orders_for_external_order_id("3408387")[0]
+    order_id = str(order["id"])
+    leg_id = str(order["order_leg_id"])
+    with target.transaction() as connection:
+        if mutation == "nonlegacy":
+            metadata = dict(order["metadata"])
+            metadata["legacy_import"] = False
+            connection.execute(
+                "UPDATE core_broker_orders SET metadata_json = ? WHERE id = ?",
+                (json.dumps(metadata), order_id),
+            )
+        elif mutation == "instrument":
+            connection.execute(
+                "UPDATE core_order_legs SET instrument_id = ? WHERE id = ?",
+                ("compat-instrument", leg_id),
+            )
+        elif mutation == "side":
+            current = connection.execute(
+                "SELECT side FROM core_order_legs WHERE id = ?", (leg_id,)
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE core_order_legs SET side = ? WHERE id = ?",
+                ("SELL" if str(current).upper() == "BUY" else "BUY", leg_id),
+            )
+        elif mutation == "quantity":
+            connection.execute(
+                "UPDATE core_broker_orders SET submitted_quantity = '2' WHERE id = ?",
+                (order_id,),
+            )
+        elif mutation == "fill_quantity":
+            connection.execute(
+                "UPDATE core_fills SET quantity = '2' WHERE broker_order_id = ?",
+                (order_id,),
+            )
+        elif mutation == "fill_price":
+            connection.execute(
+                "UPDATE core_fills SET price = '999' WHERE broker_order_id = ?",
+                (order_id,),
+            )
+        elif mutation == "fill_timestamp":
+            connection.execute(
+                "UPDATE core_fills SET filled_at = '2030-01-01T00:00:00+00:00' WHERE broker_order_id = ?",
+                (order_id,),
+            )
+        elif mutation == "status":
+            connection.execute(
+                "UPDATE core_broker_orders SET status = 'WORKING' WHERE id = ?",
+                (order_id,),
+            )
+        elif mutation == "incomplete_fill":
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("DELETE FROM core_fills WHERE broker_order_id = ?", (order_id,))
+
+    with pytest.raises(ValueError, match="existing legacy|retired"):
+        target.import_legacy_order_evidence(
+            "data/generic-sim-smoke.db",
+            _account().id,
+            legacy_label="conflicting-label",
+        )
+
+
+def test_legacy_import_rejects_source_fingerprint_change(tmp_path):
+    target = _repository(tmp_path / "target")
+    target.import_legacy_order_evidence("data/generic-sim-smoke.db", _account().id)
+    source = tmp_path / "changed-source.db"
+    shutil.copyfile("data/generic-sim-smoke.db", source)
+    with sqlite3.connect(source) as connection:
+        row = connection.execute(
+            "SELECT id, metadata_json FROM core_fills ORDER BY id LIMIT 1"
+        ).fetchone()
+        metadata = json.loads(row[1])
+        metadata["raw"]["offline_fingerprint_change"] = True
+        connection.execute(
+            "UPDATE core_fills SET metadata_json = ? WHERE id = ?",
+            (json.dumps(metadata), row[0]),
+        )
+
+    with pytest.raises(ValueError, match="existing legacy"):
+        target.import_legacy_order_evidence(
+            source,
+            _account().id,
+            legacy_label="changed-source-label",
+        )
+
+
+def test_legacy_import_preserves_external_order_uniqueness(tmp_path):
+    target = _repository(tmp_path)
+    imported = target.import_legacy_order_evidence("data/generic-sim-smoke.db", _account().id)
+    existing = target.broker_orders_for_external_order_id(imported["source_order_ids"][0])[0]
+
+    with target.transaction() as connection:
+        ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'core_broker_orders'"
+        ).fetchone()[0]
+        assert "UNIQUE (account_id, external_order_id)" in ddl
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with target.transaction() as connection:
+            connection.execute(
+                """INSERT INTO core_broker_orders
+                   (id, order_leg_id, account_id, broker, attempt_number, external_order_id,
+                    client_order_id, status, submitted_quantity, submitted_at, updated_at,
+                    replaces_broker_order_id, metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    "duplicate-external-order",
+                    existing["order_leg_id"],
+                    _account().id,
+                    "moomoo",
+                    99,
+                    existing["external_order_id"],
+                    "duplicate-client-order",
+                    "FILLED",
+                    "1",
+                    existing["submitted_at"],
+                    existing["updated_at"],
+                    "{}",
+                ),
+            )
 
 
 def test_legacy_import_rejects_source_account_mismatch(tmp_path):
