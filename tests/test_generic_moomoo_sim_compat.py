@@ -1004,6 +1004,86 @@ def test_legacy_import_rejects_partial_existing_external_claim(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("target_status", "reuses"),
+    (
+        (IntentStatus.FILLED.value, True),
+        (IntentStatus.COMPLETED.value, True),
+        (IntentStatus.WORKING.value, False),
+        (IntentStatus.CANCELLED.value, False),
+        (IntentStatus.REJECTED.value, False),
+        (IntentStatus.FAILED.value, False),
+    ),
+)
+def test_legacy_import_status_compatibility_is_narrow(tmp_path, target_status, reuses):
+    target = _repository(tmp_path / target_status)
+    first = target.import_legacy_order_evidence("data/generic-sim-smoke.db", _account().id)
+    before = _legacy_graph_counts(target)
+    with target.transaction() as connection:
+        intent_id = connection.execute(
+            """SELECT i.id FROM core_order_intents i
+                 JOIN core_order_legs l ON l.intent_id = i.id
+                 JOIN core_broker_orders b ON b.order_leg_id = l.id
+                WHERE b.external_order_id = ?""",
+            ("3408387",),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE core_order_intents SET status = ? WHERE id = ?",
+            (target_status, intent_id),
+        )
+
+    if reuses:
+        reused = target.import_legacy_order_evidence(
+            "data/generic-sim-smoke.db",
+            _account().id,
+            legacy_label=f"status-{target_status}",
+        )
+        assert reused["reused_existing_graph"] is True
+        assert reused["legacy_strategy_id"] == first["legacy_strategy_id"]
+        assert _legacy_graph_counts(target) == before
+    else:
+        with pytest.raises(ValueError, match="existing legacy intent evidence conflicts"):
+            target.import_legacy_order_evidence(
+                "data/generic-sim-smoke.db",
+                _account().id,
+                legacy_label=f"status-{target_status}",
+            )
+        assert _legacy_graph_counts(target) == before
+
+
+def test_legacy_import_does_not_accept_completed_to_filled(tmp_path):
+    source = tmp_path / "completed-source.db"
+    shutil.copyfile("data/generic-sim-smoke.db", source)
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            """UPDATE core_order_intents
+                  SET status = 'COMPLETED'
+                WHERE id = 'generic-sim-smoke-entry-aapl-msft-a5a28459897a6b4e'"""
+        )
+
+    target = _repository(tmp_path / "completed-target")
+    target.import_legacy_order_evidence(source, _account().id)
+    with target.transaction() as connection:
+        intent_id = connection.execute(
+            """SELECT i.id FROM core_order_intents i
+                 JOIN core_order_legs l ON l.intent_id = i.id
+                 JOIN core_broker_orders b ON b.order_leg_id = l.id
+                WHERE b.external_order_id = ?""",
+            ("3408387",),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE core_order_intents SET status = 'FILLED' WHERE id = ?",
+            (intent_id,),
+        )
+
+    with pytest.raises(ValueError, match="existing legacy intent evidence conflicts"):
+        target.import_legacy_order_evidence(
+            source,
+            _account().id,
+            legacy_label="completed-to-filled",
+        )
+
+
+@pytest.mark.parametrize(
     "mutation",
     (
         "nonlegacy",

@@ -3330,6 +3330,14 @@ class SQLiteTradingRepository:
                 return left is None and right is None
             return _same_decimal(left, right)
 
+        def _legacy_intent_status_matches(source_status: Any, target_status: Any) -> bool:
+            source_value = str(source_status).upper()
+            target_value = str(target_status).upper()
+            return target_value == source_value or (
+                source_value == IntentStatus.FILLED.value
+                and target_value == IntentStatus.COMPLETED.value
+            )
+
         def _metadata(value: Any) -> dict[str, Any]:
             decoded = _decode(value) if isinstance(value, str) or value is None else value
             return dict(decoded) if isinstance(decoded, Mapping) else {}
@@ -3486,7 +3494,9 @@ class SQLiteTradingRepository:
                     if (
                         str(target_intent["account_id"]) != str(account_id)
                         or not _same_text(target_intent["action"], source_intent["action"])
-                        or not _same_text(target_intent["status"], source_intent["status"])
+                        or not _legacy_intent_status_matches(
+                            source_intent["status"], target_intent["status"]
+                        )
                         or not _same_text(target_intent["source_signal_id"], source_intent["source_signal_id"])
                         or not _same_text(target_intent["payload_hash"], source_intent["payload_hash"])
                         or not _same_text(
