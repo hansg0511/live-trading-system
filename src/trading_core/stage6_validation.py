@@ -377,10 +377,12 @@ def _validate_recovery(
         return
     for field_name in (
         "performed",
+        "broker_contacted",
         "fresh_process",
         "intents_preserved",
         "orders_preserved",
         "no_duplicate_attempts",
+        "no_resubmission",
         "exposure_agrees",
     ):
         if recovery.get(field_name) is not True:
@@ -421,6 +423,34 @@ def _validate_recovery(
             reasons.append("recovery did not preserve every entry order identity")
     except Stage6ValidationError as exc:
         reasons.append(str(exc))
+    source_intents_raw = recovery.get("source_intent_ids")
+    try:
+        source_intents = _string_tuple(
+            source_intents_raw,
+            "recovery.source_intent_ids",
+            required=True,
+        )
+        if set(source_intents) != set(preserved_intents):
+            reasons.append("recovery source intents do not exactly match preserved intents")
+    except (Stage6ValidationError, UnboundLocalError) as exc:
+        reasons.append(str(exc))
+        source_intents = ()
+    source_processes = recovery.get("source_submission_process_ids")
+    if not isinstance(source_processes, Mapping):
+        reasons.append("recovery source submission process identities are required")
+    else:
+        normalized_processes = {
+            str(key).strip(): str(value).strip()
+            for key, value in source_processes.items()
+        }
+        if set(normalized_processes) != set(source_intents) or any(
+            not key or not value for key, value in normalized_processes.items()
+        ):
+            reasons.append("recovery source submission process identities are malformed")
+        if isinstance(process_id, str) and process_id.strip() in set(normalized_processes.values()):
+            reasons.append("recovery process identity matches an original SIM submission process")
+    if recovery.get("source_submission_process_identity_complete") is not True:
+        reasons.append("recovery source submission process identity coverage is incomplete")
 
 
 def _validate_final(

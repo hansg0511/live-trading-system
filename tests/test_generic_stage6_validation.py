@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 import copy
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from src.trading_core.stage6_validation import (
     Stage6ValidationError,
     evaluate_stage6_session,
 )
+from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
 from scripts.generic_stage6_pilot import main as stage6_cli
 from tests.test_generic_stage6_config_cli import _config_dict
 
@@ -64,6 +66,7 @@ def _evidence(
         "execution_compatibility": compatibility,
         "account_id": "validation-account",
         "environment": "SIM",
+        "broker_contacted": True,
         "execution_path": "Stage6PilotRunner->GenericOMS",
         "execution_mode": "SIM_SUBMIT",
         "supervised": True,
@@ -102,15 +105,23 @@ def _evidence(
         },
         "restart_recovery": {
             "performed": True,
+            "broker_contacted": True,
             "fresh_process": True,
             "process_id": "stage6-recovery-process-2",
             "captured_at": "2026-10-05T13:46:40+00:00",
             "result": "PASS",
+            "source_intent_ids": [f"entry-a-{trading_date}", f"entry-b-{trading_date}"],
+            "source_submission_process_ids": {
+                f"entry-a-{trading_date}": "stage6-submit-process-1",
+                f"entry-b-{trading_date}": "stage6-submit-process-1",
+            },
+            "source_submission_process_identity_complete": True,
             "preserved_intent_ids": [f"entry-a-{trading_date}", f"entry-b-{trading_date}"],
             "preserved_order_ids": ["entry-order-a", "entry-order-b"],
             "intents_preserved": True,
             "orders_preserved": True,
             "no_duplicate_attempts": True,
+            "no_resubmission": True,
             "exposure_agrees": True,
         },
         "exit": {
@@ -307,6 +318,39 @@ def test_validation_cli_records_phases_finalizes_and_reports_without_broker(tmp_
     config_values = _config_dict(tmp_path)
     config_path = tmp_path / "stage6.json"
     config_path.write_text(json.dumps(config_values), encoding="utf-8")
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    config.ensure_repository(repository)
+    source_intent_ids = [f"entry-a-2026-10-05", f"entry-b-2026-10-05"]
+    for sleeve, target, source_intent_id in zip(
+        config.sleeves,
+        config.targets,
+        source_intent_ids,
+        strict=True,
+    ):
+        intent = sleeve.to_intent(target)
+        legs = tuple(
+            replace(leg, id=f"{source_intent_id}-leg-{leg.sequence}", intent_id=source_intent_id)
+            for leg in intent.legs
+        )
+        intent = replace(
+            intent,
+            id=source_intent_id,
+            idempotency_key=f"validation|{source_intent_id}",
+            legs=legs,
+        )
+        repository.create_intent(intent)
+        repository.append_intent_metadata(
+            source_intent_id,
+            {
+                "stage6_submission": {
+                    "process_id": "stage6-submit-process-1",
+                    "run_id": "validation-run",
+                    "mode": "SIM_SUBMIT",
+                }
+            },
+            account_id=config.account.id,
+        )
     evidence = _evidence()
     evidence["session_id"] = "cli-session"
     evidence["account_id"] = "pilot-account"
@@ -324,7 +368,7 @@ def test_validation_cli_records_phases_finalizes_and_reports_without_broker(tmp_
     recovery_path.write_text(json.dumps(recovery_evidence), encoding="utf-8")
     assert stage6_cli([
         "session-recover", "--config", str(config_path), "--evidence", str(recovery_path),
-        "--fresh-process", "--process-id", "fresh-process-2", "--json",
+        "--fresh-process", "--process-id", "stage6-recovery-process-2", "--json",
     ]) == 0
     capsys.readouterr()
 

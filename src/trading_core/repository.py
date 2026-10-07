@@ -1303,6 +1303,54 @@ class SQLiteTradingRepository:
                 leg["metadata"] = _decode(leg.pop("metadata_json"))
             return result
 
+    def append_intent_metadata(
+        self,
+        intent_id: str,
+        metadata: Mapping[str, Any],
+        *,
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append immutable provenance to one existing intent row.
+
+        This is intentionally narrower than a general intent update: callers
+        may add keys, but an existing key can never be overwritten with a
+        different value.  Stage 6 uses it after the normal OMS submission
+        boundary to retain the submitting process identity without changing
+        the idempotency payload or OMS execution semantics.
+        """
+
+        normalized_id = str(intent_id).strip()
+        if not normalized_id or not isinstance(metadata, Mapping) or not metadata:
+            raise ValueError("intent_id and non-empty metadata are required")
+        additions = {str(key): value for key, value in metadata.items()}
+        if any(not key.strip() for key in additions):
+            raise ValueError("intent metadata keys must be non-empty")
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT account_id, metadata_json FROM core_order_intents WHERE id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown intent: {normalized_id}")
+            if account_id is not None and str(row["account_id"]) != str(account_id):
+                raise ValueError("intent metadata account does not match supplied account")
+            current = _decode(row["metadata_json"])
+            if not isinstance(current, Mapping):
+                raise ValueError("persisted intent metadata is not an object")
+            merged = dict(current)
+            for key, value in additions.items():
+                if key in merged and merged[key] != value:
+                    raise ValueError(f"intent metadata key {key!r} is immutable")
+                merged[key] = value
+            conn.execute(
+                "UPDATE core_order_intents SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                (_json(merged), _timestamp(utc_now()), normalized_id),
+            )
+        result = self.get_intent(normalized_id)
+        if result is None:  # pragma: no cover - protected by the transaction above
+            raise KeyError(f"Unknown intent: {normalized_id}")
+        return result
+
     def cancel_unsubmitted_intent(
         self,
         intent_id: str,

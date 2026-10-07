@@ -22,8 +22,9 @@ REAL/LIVE and non-RTH handoffs are rejected by the configuration boundary.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -40,7 +41,10 @@ from src.strategies.stat_arb.stage6_config import (  # noqa: E402
     Stage6PilotConfig,
     load_stage6_config,
 )
-from src.strategies.stat_arb.stage6_pilot import Stage6RunMode  # noqa: E402
+from src.strategies.stat_arb.stage6_pilot import (  # noqa: E402
+    STAGE6_EXECUTION_COMPATIBILITY,
+    Stage6RunMode,
+)
 from src.trading_core.repository import SQLiteTradingRepository  # noqa: E402
 from src.trading_core.stage6_validation import (  # noqa: E402
     Stage6SessionOutcome,
@@ -70,7 +74,39 @@ def _parser() -> argparse.ArgumentParser:
             "never submits/cancels/replaces"
         ),
     )
-    for command in (validate, dry_run, broker_preflight, baseline, sim_submit, recover):
+    compensating_exit = subparsers.add_parser(
+        "compensating-exit",
+        help="submit one proof-gated SIM exit for one exact filled source intent",
+    )
+    resolve_roundtrip = subparsers.add_parser(
+        "resolve-roundtrip",
+        help="persist one proof-backed entry/exit closure; never submits orders",
+    )
+    final_state = subparsers.add_parser(
+        "final-state",
+        help="obtain fresh broker/local final state without lifecycle mutation",
+    )
+    prepare_exit = subparsers.add_parser(
+        "prepare-exit",
+        help="derive normal two-book EXIT quantities from fresh broker/local exposure",
+    )
+    session_evidence = subparsers.add_parser(
+        "session-evidence",
+        help="derive validator evidence from durable repository rows and captured artifacts",
+    )
+    for command in (
+        validate,
+        dry_run,
+        broker_preflight,
+        baseline,
+        sim_submit,
+        recover,
+        compensating_exit,
+        resolve_roundtrip,
+        final_state,
+        prepare_exit,
+        session_evidence,
+    ):
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--json", action="store_true", dest="as_json")
     baseline.add_argument("--legacy-db", type=Path, required=True)
@@ -85,10 +121,36 @@ def _parser() -> argparse.ArgumentParser:
         "--confirm",
         help="must exactly equal: ARM STAGE6 SIM <deterministic-run-id>",
     )
+    compensating_exit.add_argument("--source-intent-id", required=True)
+    compensating_exit.add_argument(
+        "--external-order",
+        action="append",
+        default=[],
+        metavar="INSTRUMENT_ID=EXTERNAL_ORDER_ID",
+        help="repeat for every source leg; exact durable provider identity is required",
+    )
+    compensating_exit.add_argument("--arm-sim", action="store_true", help="required explicit SIM arm")
+    compensating_exit.add_argument(
+        "--confirm",
+        help="must exactly equal: ARM STAGE6 SIM COMPENSATING EXIT <source-intent-id>",
+    )
+    resolve_roundtrip.add_argument("--entry-intent-id", required=True)
+    resolve_roundtrip.add_argument("--exit-intent-id", required=True)
+    prepare_exit.add_argument("--output", type=Path, help="optional new derived artifact; existing files are never overwritten")
+    session_evidence.add_argument("--session-id", required=True)
+    session_evidence.add_argument("--entry-intent-id", action="append", default=[])
+    session_evidence.add_argument("--exit-intent-id", action="append", default=[])
+    session_evidence.add_argument("--preflight-evidence", type=Path)
+    session_evidence.add_argument("--recovery-evidence", type=Path)
+    session_evidence.add_argument("--final-evidence", type=Path)
+    session_evidence.add_argument("--commit-sha", required=True)
+    session_evidence.add_argument("--execution-compatibility", default=STAGE6_EXECUTION_COMPATIBILITY)
+    session_evidence.add_argument("--trading-date")
     validation_commands = {}
     for name, help_text in (
         ("session-preflight", "record one no-submit Stage 6 preflight evidence observation"),
         ("session-recover", "record an existing fresh-process recovery observation; never submits"),
+        ("session-final", "record one captured final-state Stage 6 validation observation"),
         ("session-finalize", "derive and immutably persist one Stage 6 validation result"),
         ("session-status", "show retained observations and one immutable session result"),
         ("stage-status", "show retained Stage 6 history and the three-date completion gate"),
@@ -125,6 +187,7 @@ def _summary(config: Stage6PilotConfig) -> dict[str, Any]:
         "run_id": spec.run_id,
         "required_confirmation": config.confirmation_phrase(),
         "rth_handoff_policy": config.execution.rth_handoff_policy,
+        "execution_compatibility": STAGE6_EXECUTION_COMPATIBILITY,
         "mode": "DRY_RUN",
     }
 
@@ -206,6 +269,27 @@ def _recovery_order_facts(
     return orders, fills
 
 
+def _durable_submission_process_ids(
+    repository: SQLiteTradingRepository,
+    intent_ids: Sequence[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Read the immutable Stage 6 submission-process provenance on intents."""
+
+    identities: dict[str, str] = {}
+    missing: list[str] = []
+    for raw_intent_id in sorted({str(value).strip() for value in intent_ids if str(value).strip()}):
+        intent = repository.get_intent(raw_intent_id)
+        metadata = intent.get("metadata", {}) if intent is not None else {}
+        marker = metadata.get("stage6_submission") if isinstance(metadata, Mapping) else None
+        process_id = marker.get("process_id") if isinstance(marker, Mapping) else None
+        normalized = str(process_id).strip() if process_id is not None else ""
+        if normalized:
+            identities[raw_intent_id] = normalized
+        else:
+            missing.append(raw_intent_id)
+    return identities, missing
+
+
 def _recovery_report(
     *,
     config: Stage6PilotConfig,
@@ -242,6 +326,24 @@ def _recovery_report(
     completed_at = datetime.now(timezone.utc)
     open_issues = repository.open_reconciliation_issues(account_id)
     open_actions = repository.open_recovery_actions(account_id)
+    source_submission_process_ids, missing_source_process_ids = _durable_submission_process_ids(
+        repository,
+        before_intent_ids,
+    )
+    recovery_process_id = str(os.getpid())
+    source_process_values = set(source_submission_process_ids.values())
+    fresh_process = bool(before_intent_ids) and not missing_source_process_ids and recovery_process_id not in source_process_values
+    if not before_intent_ids:
+        process_identity_reason = "no recoverable source intents were present"
+    elif missing_source_process_ids:
+        process_identity_reason = (
+            "source intent submission process identity is missing for: "
+            + ", ".join(sorted(missing_source_process_ids))
+        )
+    elif not fresh_process:
+        process_identity_reason = "recovery process identity matches the original SIM submission process"
+    else:
+        process_identity_reason = "recovery process identity is distinct from every source submission process"
     after_external_order_ids = {
         str(row.get("external_order_id"))
         for row in after_order_rows.values()
@@ -253,13 +355,18 @@ def _recovery_report(
     no_duplicate_attempts = not duplicate_legs and not new_order_ids
     terminal_statuses = {"FILLED", "COMPLETED"}
     recovered_statuses = [str(item.get("status")) for item in after_status]
-    recovery_clean = bool(before_intent_ids) and all(
+    recovery_clean = bool(before_intent_ids) and fresh_process and all(
         status in terminal_statuses for status in recovered_statuses
     ) and not open_issues and not open_actions and intents_preserved and orders_preserved and no_duplicate_attempts
     restart_recovery = {
         "performed": True,
-        "fresh_process": True,
-        "process_id": str(os.getpid()),
+        "broker_contacted": True,
+        "fresh_process": fresh_process,
+        "process_id": recovery_process_id,
+        "source_intent_ids": sorted(str(value) for value in before_intent_ids),
+        "source_submission_process_ids": source_submission_process_ids,
+        "source_submission_process_identity_complete": bool(before_intent_ids) and not missing_source_process_ids,
+        "process_identity_reason": process_identity_reason,
         "captured_at": completed_at.isoformat(),
         "result": "RECOVERED" if recovery_clean else "BLOCKED",
         "preserved_intent_ids": sorted(after_intent_ids),
@@ -267,6 +374,7 @@ def _recovery_report(
         "intents_preserved": intents_preserved,
         "orders_preserved": orders_preserved,
         "no_duplicate_attempts": no_duplicate_attempts,
+        "no_resubmission": True,
         "exposure_agrees": recovery_clean,
     }
     return {
@@ -279,8 +387,11 @@ def _recovery_report(
         "completed_at": completed_at.isoformat(),
         "captured_at": completed_at.isoformat(),
         "broker_contacted": True,
-        "fresh_process_recovery": True,
-        "process_id": os.getpid(),
+        "fresh_process_recovery": fresh_process,
+        "process_id": recovery_process_id,
+        "source_intent_ids": sorted(str(value) for value in before_intent_ids),
+        "source_submission_process_ids": source_submission_process_ids,
+        "source_submission_process_identity_complete": bool(before_intent_ids) and not missing_source_process_ids,
         "recovered_intent_ids": sorted(
             {
                 str(item.get("id"))
@@ -369,6 +480,184 @@ def _read_evidence(path: Path | None) -> dict[str, Any] | None:
     return value
 
 
+def _read_artifact_section(path: Path | None, key: str) -> dict[str, Any] | None:
+    value = _read_evidence(path)
+    if value is None:
+        return None
+    selected = value.get(key)
+    if isinstance(selected, Mapping):
+        return dict(selected)
+    return value
+
+
+def _parse_external_order_args(values: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for raw in values:
+        text = str(raw).strip()
+        if "=" not in text:
+            raise Stage6ConfigError(
+                "--external-order must use INSTRUMENT_ID=EXTERNAL_ORDER_ID"
+            )
+        instrument_id, external_order_id = (item.strip() for item in text.split("=", 1))
+        if not instrument_id or not external_order_id or instrument_id in mapping:
+            raise Stage6ConfigError("--external-order identities must be non-empty and unique")
+        mapping[instrument_id] = external_order_id
+    return mapping
+
+
+def _has_duplicate_attempts_per_leg(snapshots: Sequence[Mapping[str, Any]]) -> bool:
+    """Detect repeated attempts by logical leg, not by total pair-leg count."""
+
+    seen_leg_ids: set[str] = set()
+    seen_attempt_ids: set[str] = set()
+    seen_external_order_ids: set[str] = set()
+    for snapshot in snapshots:
+        if not isinstance(snapshot, Mapping):
+            return True
+        legs = snapshot.get("legs", ())
+        if not isinstance(legs, (list, tuple)):
+            return True
+        for leg in legs:
+            if not isinstance(leg, Mapping):
+                return True
+            leg_id = str(leg.get("id", "")).strip()
+            if not leg_id or leg_id in seen_leg_ids:
+                return True
+            seen_leg_ids.add(leg_id)
+            attempts = leg.get("attempts", ())
+            if not isinstance(attempts, (list, tuple)):
+                return True
+            if len(attempts) > 1:
+                return True
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping):
+                    return True
+                attempt_id = str(attempt.get("id", "")).strip()
+                if not attempt_id or attempt_id in seen_attempt_ids:
+                    return True
+                seen_attempt_ids.add(attempt_id)
+                external_order_id = str(attempt.get("external_order_id", "")).strip()
+                if external_order_id:
+                    if external_order_id in seen_external_order_ids:
+                        return True
+                    seen_external_order_ids.add(external_order_id)
+    return False
+
+
+def _derive_external_order_mapping(
+    repository: SQLiteTradingRepository,
+    source_intent_id: str,
+) -> dict[str, str]:
+    intent = repository.get_intent(source_intent_id)
+    if intent is None:
+        raise Stage6ConfigError(f"unknown source intent: {source_intent_id}")
+    mapping: dict[str, str] = {}
+    for leg in intent.get("legs", ()):
+        attempts = repository.broker_orders_for_leg(str(leg.get("id")))
+        if len(attempts) != 1 or not attempts[0].get("external_order_id"):
+            raise Stage6ConfigError(
+                f"source leg {leg.get('id')} does not have exactly one durable external order identity"
+            )
+        instrument_id = str(leg.get("instrument_id"))
+        if instrument_id in mapping:
+            raise Stage6ConfigError("source intent has ambiguous instrument identities")
+        mapping[instrument_id] = str(attempts[0]["external_order_id"])
+    if not mapping:
+        raise Stage6ConfigError("source intent has no durable broker legs")
+    return mapping
+
+
+def _compensating_confirmation(source_intent_id: str) -> str:
+    return f"ARM STAGE6 SIM COMPENSATING EXIT {str(source_intent_id).strip()}"
+
+
+def _write_new_json(path: Path | None, payload: Mapping[str, Any]) -> str | None:
+    if path is None:
+        return None
+    if path.exists():
+        raise Stage6ConfigError(f"refusing to overwrite existing artifact: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True, indent=2, default=str) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _json_quantity(value: object, label: str) -> int | float:
+    """Convert one verified exposure quantity to a JSON numeric scalar."""
+
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise Stage6ConfigError(f"{label} is not a finite numeric quantity") from exc
+    if not quantity.is_finite() or quantity == 0:
+        raise Stage6ConfigError(f"{label} must be a non-zero finite quantity")
+    if quantity == quantity.to_integral_value():
+        return int(quantity)
+    result = float(quantity)
+    if not result or not (result == result) or result in {float("inf"), float("-inf")}:
+        raise Stage6ConfigError(f"{label} cannot be represented as a JSON number")
+    return result
+
+
+def _derived_exit_config(
+    config: Stage6PilotConfig,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Clone the validated source config and replace targets with verified EXIT basis."""
+
+    if config.source_path is None:
+        raise Stage6ConfigError("prepare-exit requires a source config path")
+    try:
+        source = json.loads(config.source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Stage6ConfigError(f"could not read source config for EXIT derivation: {exc}") from exc
+    if not isinstance(source, dict) or type(source.get("targets")) is not list:
+        raise Stage6ConfigError("source config targets are unavailable for EXIT derivation")
+    run_id = str(result.get("run_id") or "").strip()
+    captured_at = str(result.get("captured_at") or "").strip()
+    quantities = result.get("derived_signed_quantities")
+    if not run_id or not captured_at or not isinstance(quantities, Mapping):
+        raise Stage6ConfigError("verified EXIT derivation lacks run, capture, or quantity evidence")
+
+    derived = json.loads(json.dumps(source))
+    derived["mode"] = "SIM_SUBMIT"
+    token = run_id[-12:]
+    for index, target in enumerate(derived["targets"]):
+        if not isinstance(target, dict):
+            raise Stage6ConfigError(f"targets[{index}] is malformed")
+        instrument_ids = target.get("instrument_ids")
+        if type(instrument_ids) is not list or len(instrument_ids) != 2:
+            raise Stage6ConfigError(f"targets[{index}].instrument_ids is malformed")
+        target_quantities: list[int | float] = []
+        for instrument_id in instrument_ids:
+            if str(instrument_id) not in quantities:
+                raise Stage6ConfigError(
+                    f"verified EXIT exposure lacks configured instrument {instrument_id}"
+                )
+            target_quantities.append(
+                _json_quantity(quantities[str(instrument_id)], f"EXIT quantity {instrument_id}")
+            )
+        original_cycle = str(target.get("cycle_id") or "").strip()
+        original_signal = str(target.get("signal_id") or "").strip()
+        if not original_cycle or not original_signal:
+            raise Stage6ConfigError(f"targets[{index}] lacks durable cycle/signal identity")
+        target["signed_quantities"] = target_quantities
+        target["action"] = "EXIT"
+        target["cycle_id"] = f"{original_cycle}-exit-{token}"
+        target["signal_id"] = f"{original_signal}-exit-{token}"
+        target["evaluated_at"] = captured_at
+        provenance = dict(target.get("provenance") or {})
+        provenance.update(
+            {
+                "derived_from": "Stage6PilotRunner.prepare_exit",
+                "source_run_id": run_id,
+                "basis_captured_at": captured_at,
+                "pre_negation_applied": False,
+            }
+        )
+        target["provenance"] = provenance
+    return derived
+
+
 def _validation_defaults(
     config: Stage6PilotConfig,
     args: argparse.Namespace,
@@ -383,7 +672,7 @@ def _validation_defaults(
     value.setdefault("account_id", config.account.id)
     value.setdefault("environment", config.account.environment.value)
     value.setdefault("execution_path", "Stage6PilotRunner->GenericOMS")
-    value.setdefault("execution_compatibility", args.execution_compatibility or "UNKNOWN")
+    value.setdefault("execution_compatibility", args.execution_compatibility or STAGE6_EXECUTION_COMPATIBILITY)
     value.setdefault("commit_sha", args.commit_sha or "UNKNOWN")
     value.setdefault("us_trading_date", args.trading_date or value.get("trading_date"))
     value.setdefault("started_at", now)
@@ -434,7 +723,9 @@ def _record_validation_observation(
             },
         }
     value = _validation_defaults(config, args, evidence)
-    phase_evidence = value.get("preflight" if phase == "PREFLIGHT" else "restart_recovery")
+    phase_evidence = value.get(
+        "preflight" if phase == "PREFLIGHT" else "final" if phase == "FINAL" else "restart_recovery"
+    )
     captured_at = value.get("captured_at")
     if phase_evidence is not None and isinstance(phase_evidence, Mapping):
         captured_at = phase_evidence.get("captured_at", captured_at)
@@ -447,13 +738,69 @@ def _record_validation_observation(
     session_id = str(value["session_id"])
     observation_id = f"{session_id}:{phase.lower()}:{uuid.uuid4().hex}"
     process_id = args.process_id
-    if phase == "RECOVERY" and args.fresh_process:
-        value["restart_recovery"] = {
-            **dict(value.get("restart_recovery") or {}),
-            "fresh_process": True,
-            "process_id": process_id or value.get("process_id") or "operator-provided",
+    if phase == "RECOVERY":
+        recovery = value.get("restart_recovery")
+        if not isinstance(recovery, Mapping):
+            raise Stage6ConfigError(
+                "session-recover requires restart_recovery evidence emitted by recover; "
+                "the recorder will not manufacture a fresh-process claim"
+            )
+        if recovery.get("fresh_process") is not True:
+            raise Stage6ConfigError(
+                "recovery artifact must prove a process identity distinct from every source submission"
+            )
+        artifact_process_id = str(recovery.get("process_id", "")).strip()
+        if not artifact_process_id:
+            raise Stage6ConfigError("recovery artifact must contain its process_id")
+        top_level_process_id = str(value.get("process_id", "")).strip()
+        if top_level_process_id and top_level_process_id != artifact_process_id:
+            raise Stage6ConfigError("recovery process identity disagrees with the artifact envelope")
+        if value.get("broker_contacted") is not True:
+            raise Stage6ConfigError("recovery artifact must prove broker_contacted=true")
+        source_intent_ids = recovery.get("source_intent_ids")
+        if not isinstance(source_intent_ids, list) or not source_intent_ids:
+            raise Stage6ConfigError("recovery artifact must identify source submission intents")
+        normalized_source_intent_ids = [str(item).strip() for item in source_intent_ids]
+        if any(not item for item in normalized_source_intent_ids) or len(set(normalized_source_intent_ids)) != len(normalized_source_intent_ids):
+            raise Stage6ConfigError("recovery source submission intent identities are malformed")
+        preserved_intent_ids = recovery.get("preserved_intent_ids")
+        if not isinstance(preserved_intent_ids, list) or {
+            str(item).strip() for item in preserved_intent_ids
+        } != set(normalized_source_intent_ids):
+            raise Stage6ConfigError(
+                "recovery preserved intent identities do not exactly cover source submissions"
+            )
+        durable_process_ids, missing_process_ids = _durable_submission_process_ids(
+            repository,
+            normalized_source_intent_ids,
+        )
+        if missing_process_ids:
+            raise Stage6ConfigError(
+                "durable source submission process identity is missing for: "
+                + ", ".join(sorted(missing_process_ids))
+            )
+        artifact_process_ids = recovery.get("source_submission_process_ids")
+        if not isinstance(artifact_process_ids, Mapping):
+            raise Stage6ConfigError("recovery artifact must carry source submission process identities")
+        normalized_artifact_process_ids = {
+            str(key).strip(): str(item).strip()
+            for key, item in artifact_process_ids.items()
         }
-        process_id = str(value["restart_recovery"]["process_id"])
+        if normalized_artifact_process_ids != durable_process_ids:
+            raise Stage6ConfigError(
+                "recovery source submission process identities do not match durable intent metadata"
+            )
+        if artifact_process_id in set(durable_process_ids.values()):
+            raise Stage6ConfigError(
+                "recovery process identity matches an original SIM submission process"
+            )
+        if recovery.get("source_submission_process_identity_complete") is not True:
+            raise Stage6ConfigError("recovery artifact must prove complete source process identity coverage")
+        if args.fresh_process and recovery.get("fresh_process") is not True:
+            raise Stage6ConfigError("--fresh-process does not override recovery evidence")
+        if process_id is not None and str(process_id) != artifact_process_id:
+            raise Stage6ConfigError("--process-id does not match the recovery artifact")
+        process_id = artifact_process_id
     repository.record_stage6_validation_observation(
         observation_id=observation_id,
         session_id=session_id,
@@ -525,20 +872,17 @@ def _merge_validation_observations(
 def _run_validation_command(args: argparse.Namespace, config: Stage6PilotConfig) -> tuple[int, Any]:
     repository = SQLiteTradingRepository(config.state_db)
     config.ensure_repository(repository)
-    if args.command == "session-preflight":
+    if args.command in {"session-preflight", "session-recover", "session-final"}:
+        phase = {
+            "session-preflight": "PREFLIGHT",
+            "session-recover": "RECOVERY",
+            "session-final": "FINAL",
+        }[args.command]
         return 0, _record_validation_observation(
             repository,
             config=config,
             args=args,
-            phase="PREFLIGHT",
-            evidence=_read_evidence(args.evidence),
-        )
-    if args.command == "session-recover":
-        return 0, _record_validation_observation(
-            repository,
-            config=config,
-            args=args,
-            phase="RECOVERY",
+            phase=phase,
             evidence=_read_evidence(args.evidence),
         )
     if args.command == "session-status":
@@ -587,11 +931,162 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
     if args.command in {
         "session-preflight",
         "session-recover",
+        "session-final",
         "session-status",
         "session-finalize",
         "stage-status",
     }:
         return _run_validation_command(args, config)
+
+    if args.command == "session-evidence":
+        repository = SQLiteTradingRepository(config.state_db)
+        try:
+            config.validate_repository(repository)
+        except Exception as exc:
+            raise Stage6ConfigError(f"existing repository validation failed: {exc}") from exc
+        if not args.entry_intent_id or not args.exit_intent_id:
+            raise Stage6ConfigError(
+                "session-evidence requires at least one --entry-intent-id and --exit-intent-id"
+            )
+        preflight = _read_artifact_section(args.preflight_evidence, "preflight")
+        recovery = _read_artifact_section(args.recovery_evidence, "restart_recovery")
+        final = _read_artifact_section(args.final_evidence, "final")
+        evidence = config.build_runner(repository).build_session_evidence(
+            config.spec(),
+            session_id=args.session_id,
+            entry_intent_ids=args.entry_intent_id,
+            exit_intent_ids=args.exit_intent_id,
+            preflight=preflight,
+            recovery=recovery,
+            final=final,
+            commit_sha=args.commit_sha,
+            trading_date=args.trading_date,
+            execution_compatibility=args.execution_compatibility,
+        )
+        return (0 if not evidence.get("evidence_builder_missing") else 2), evidence
+
+    if args.command in {"final-state", "prepare-exit", "resolve-roundtrip", "compensating-exit"}:
+        if str(config.account.environment.value).upper() != "SIM":
+            raise Stage6ConfigError(f"{args.command} accepts SIM accounts only")
+        repository = SQLiteTradingRepository(config.state_db)
+        try:
+            config.validate_repository(repository)
+        except Exception as exc:
+            raise Stage6ConfigError(f"existing repository validation failed: {exc}") from exc
+
+        if args.command == "compensating-exit":
+            expected_confirmation = _compensating_confirmation(args.source_intent_id)
+            if not args.arm_sim:
+                raise Stage6ConfigError("compensating-exit requires --arm-sim")
+            if args.confirm != expected_confirmation:
+                raise Stage6ConfigError(
+                    f"exact SIM confirmation required: {expected_confirmation!r}; no broker connection was attempted"
+                )
+            mapping = _parse_external_order_args(args.external_order)
+            if not mapping:
+                mapping = _derive_external_order_mapping(repository, args.source_intent_id)
+            adapter = config.build_moomoo_adapter()
+            connected = False
+            try:
+                adapter.connect()
+                connected = True
+                runner = config.build_runner(repository, adapter=adapter)
+                result = runner.submit_verified_compensating_exit(
+                    account=config.account,
+                    source_intent_id=args.source_intent_id,
+                    expected_external_order_ids=mapping,
+                )
+                raw_result = result.get("compensating_result", {})
+                exit_intent_id = str(raw_result.get("intent_id") or raw_result.get("id") or "")
+                if not exit_intent_id:
+                    candidates = []
+                    for row in repository.book_intents(config.account.id):
+                        candidate = repository.get_intent(str(row.get("id")))
+                        metadata = candidate.get("metadata", {}) if candidate else {}
+                        if (
+                            isinstance(metadata, Mapping)
+                            and metadata.get("source_intent_id") == args.source_intent_id
+                            and metadata.get("verified_compensating_exit") is True
+                        ):
+                            candidates.append(candidate)
+                    if len(candidates) == 1:
+                        exit_intent_id = str(candidates[0]["id"])
+                if not exit_intent_id:
+                    raise Stage6ConfigError("compensating exit did not return a durable intent identity")
+                snapshots = _recovery_intent_snapshot(repository, config.account.id, [exit_intent_id])
+                attempts = [
+                    attempt
+                    for snapshot in snapshots
+                    for leg in snapshot.get("legs", [])
+                    for attempt in leg.get("attempts", [])
+                ]
+                result.update(
+                    {
+                        "compensating_exit_intent_id": exit_intent_id,
+                        "compensating_leg_ids": [
+                            leg.get("id")
+                            for snapshot in snapshots
+                            for leg in snapshot.get("legs", [])
+                        ],
+                        "broker_order_attempt_ids": [attempt.get("id") for attempt in attempts],
+                        "external_broker_order_ids": [attempt.get("external_order_id") for attempt in attempts],
+                        "statuses": [attempt.get("status") for attempt in attempts],
+                        "fill_state": [
+                            {
+                                "external_order_id": attempt.get("external_order_id"),
+                                "filled_quantity": attempt.get("filled_quantity"),
+                                "average_fill_price": attempt.get("average_fill_price"),
+                            }
+                            for attempt in attempts
+                        ],
+                        "stop_reasons": [],
+                        "duplicate_attempt": _has_duplicate_attempts_per_leg(snapshots),
+                        "broker_submission_count": len(attempts),
+                    }
+                )
+                return 0, result
+            finally:
+                if connected:
+                    adapter.disconnect()
+
+        adapter = config.build_moomoo_adapter()
+        connected = False
+        try:
+            adapter.connect()
+            connected = True
+            runner = config.build_runner(repository, adapter=adapter)
+            if args.command == "final-state":
+                result = runner.final_state(
+                    config.spec(),
+                    market_symbols=tuple(mapping.external_symbol for mapping in config.mappings),
+                )
+                return (0 if result.get("final_state_passed") else 2), result
+            if args.command == "prepare-exit":
+                result = runner.prepare_exit(
+                    config.spec(),
+                    market_symbols=tuple(mapping.external_symbol for mapping in config.mappings),
+                )
+                if result.get("prepare_exit_passed") and args.output is not None:
+                    artifact = _derived_exit_config(config, result)
+                    result["artifact_path"] = _write_new_json(args.output, artifact)
+                    result["derived_config"] = {
+                        "mode": artifact.get("mode"),
+                        "action": "EXIT",
+                        "run_id": result.get("run_id"),
+                        "pre_negation_applied": False,
+                    }
+                else:
+                    result["artifact_path"] = None
+                return (0 if result.get("prepare_exit_passed") else 2), result
+            result = runner.resolve_verified_roundtrip(
+                account=config.account,
+                entry_intent_id=args.entry_intent_id,
+                exit_intent_id=args.exit_intent_id,
+            )
+            return 0, result
+        finally:
+            if connected:
+                adapter.disconnect()
 
     if args.command == "recover":
         if str(config.account.environment.value).upper() != "SIM":
@@ -703,6 +1198,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         report = config.build_runner(repository, adapter=adapter).run(
             config.spec(),
             mode=Stage6RunMode.SIM_SUBMIT,
+            market_symbols=tuple(mapping.external_symbol for mapping in config.mappings),
         )
     finally:
         if connected:

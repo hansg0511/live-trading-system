@@ -147,6 +147,17 @@ class PilotFakeAdapter:
         self.fact_calls += 1
         return self.facts
 
+    def get_authoritative_market_state(self, symbols):
+        return {
+            "market": "US",
+            "captured_at": NOW.isoformat(),
+            "complete": True,
+            "rows": [
+                {"symbol": str(symbol), "market_state": "RTH"}
+                for symbol in symbols
+            ],
+        }
+
     def get_positions(self, _account: Account):
         self.recovery_calls += 1
         return self.facts.positions
@@ -623,6 +634,11 @@ def test_explicit_sim_arm_dispatches_both_through_generic_oms_and_persists_run_m
     ]
     assert all(item is not None for item in stored)
     assert all(item["metadata"]["stage6_pilot"]["run_id"] == report.run_id for item in stored if item)
+    assert all(
+        item["metadata"]["stage6_submission"]["process_id"]
+        for item in stored
+        if item
+    )
     assert len(report.after_status) >= 2
 
 

@@ -4,6 +4,7 @@ import json
 import pytest
 
 from scripts.generic_stage6_pilot import _parser, main
+import scripts.generic_stage6_pilot as stage6_cli
 from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
 from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner, Stage6RunMode
 from src.trading_core.oms import GenericOMS
@@ -184,7 +185,8 @@ def test_recover_cli_uses_runner_boundary_and_emits_recovery_evidence(tmp_path, 
     assert payload["cancel_count"] == 0
     assert payload["replace_count"] == 0
     assert payload["orders_submitted"] == 0
-    assert payload["restart_recovery"]["fresh_process"] is True
+    assert payload["restart_recovery"]["fresh_process"] is False
+    assert "no recoverable source intents" in payload["restart_recovery"]["process_identity_reason"]
     assert payload["restart_recovery"]["process_id"]
 
 
@@ -216,6 +218,7 @@ def test_recover_cli_runs_existing_oms_recovery_and_keeps_book_b_untouched(tmp_p
     adapter._release_pending()
     adapter.allow_submission = False
     monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
+    monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "separate-recovery-process")
 
     assert main(["recover", "--config", str(path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)

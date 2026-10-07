@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+from datetime import datetime, timezone
 
 from scripts.generic_stage6_pilot import main
 from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
@@ -45,7 +46,7 @@ class PreflightAdapter:
         self.market_calls += 1
         return {
             "market": "US",
-            "captured_at": NOW.isoformat(),
+            "captured_at": self.facts.captured_at.isoformat(),
             "complete": True,
             "rows": [{"symbol": symbol, "market_state": self.market_state} for symbol in symbols],
         }
@@ -230,7 +231,7 @@ def test_cli_broker_preflight_uses_read_only_runner_path(tmp_path, monkeypatch, 
     config_path.write_text(json.dumps(values), encoding="utf-8")
     config = Stage6PilotConfig.load(config_path)
     config.ensure_repository(SQLiteTradingRepository(config.state_db))
-    facts = BrokerFactSnapshot(account_id=config.account.id, captured_at=NOW, complete=True)
+    facts = BrokerFactSnapshot(account_id=config.account.id, captured_at=datetime.now(timezone.utc), complete=True)
     adapter = PreflightAdapter(facts)
     monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
 

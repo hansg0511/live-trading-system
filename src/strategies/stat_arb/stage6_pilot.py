@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -37,6 +38,7 @@ from src.trading_core.domain import (
     OwnershipClass,
     PositionSnapshot,
     RiskDecisionRecord,
+    Side,
     TradingEnvironment,
 )
 from src.trading_core.oms import GenericOMS
@@ -60,6 +62,14 @@ class Stage6RunMode(str, Enum):
 
     DRY_RUN = "DRY_RUN"
     SIM_SUBMIT = "SIM_SUBMIT"
+
+
+# Same-invocation market/session validation is part of the order-capable
+# boundary.  Keep the identity explicit so validation rows cannot silently be
+# mixed with the older execution semantics.
+STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v2"
+BROKER_FACT_MAX_AGE_SECONDS = 60
+BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 
 
 def _utc_now() -> datetime:
@@ -272,6 +282,7 @@ class Stage6PilotReport:
     before_status: tuple[Mapping[str, Any], ...] = ()
     after_status: tuple[Mapping[str, Any], ...] = ()
     broker_facts: Mapping[str, Any] = field(default_factory=dict)
+    market_state: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -288,6 +299,7 @@ class Stage6PilotReport:
             "before_status": [_stable_value(item) for item in self.before_status],
             "after_status": [_stable_value(item) for item in self.after_status],
             "broker_facts": _stable_value(self.broker_facts),
+            "market_state": _stable_value(self.market_state),
         }
 
     def operator_text(self) -> str:
@@ -357,6 +369,33 @@ class Stage6PilotRunner:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("Stage 6 clock must return a timezone-aware datetime")
         return value.astimezone(timezone.utc)
+
+    def _record_submission_process_identity(
+        self,
+        *,
+        intent_id: str,
+        account_id: str,
+        run_id: str,
+    ) -> None:
+        """Retain the process that created a new SIM submission intent.
+
+        This is appended only after the normal OMS call has durably created
+        the intent.  It is provenance, not part of the idempotency payload;
+        old intents and resumed intents remain untagged and therefore cannot
+        later claim a verified fresh-process recovery.
+        """
+
+        self.repository.append_intent_metadata(
+            intent_id,
+            {
+                "stage6_submission": {
+                    "process_id": str(os.getpid()),
+                    "run_id": str(run_id),
+                    "mode": Stage6RunMode.SIM_SUBMIT.value,
+                }
+            },
+            account_id=account_id,
+        )
 
     @staticmethod
     def _is_verified_full_fill(status: Mapping[str, Any]) -> bool:
@@ -590,6 +629,12 @@ class Stage6PilotRunner:
             reasons.append(f"authoritative broker facts are incomplete: {facts.error or 'unspecified'}")
         if facts.error:
             reasons.append(f"authoritative broker facts report an error: {facts.error}")
+        reasons.extend(
+            self._freshness_reasons(
+                facts.captured_at,
+                label="authoritative broker facts",
+            )
+        )
         if facts.open_orders:
             reasons.append("unsafe outstanding broker orders are present")
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
@@ -650,6 +695,29 @@ class Stage6PilotRunner:
                     f"unattributed broker fill evidence is present for {fill.external_order_id}"
                 )
         return facts, reasons
+
+    def _freshness_reasons(
+        self,
+        captured_at: datetime,
+        *,
+        label: str,
+        max_age_seconds: int = BROKER_FACT_MAX_AGE_SECONDS,
+    ) -> list[str]:
+        """Reject stale/future safety facts at every order-capable boundary."""
+
+        now = self._now()
+        captured = captured_at
+        if captured.tzinfo is None or captured.utcoffset() is None:
+            return [f"{label} capture timestamp is not timezone-aware"]
+        captured = captured.astimezone(timezone.utc)
+        age = (now - captured).total_seconds()
+        if age < -BROKER_CLOCK_SKEW_TOLERANCE_SECONDS:
+            return [f"{label} capture timestamp is in the future"]
+        if age > max_age_seconds:
+            return [
+                f"{label} is stale ({age:.1f}s old; maximum {max_age_seconds}s)"
+            ]
+        return []
 
     def _fresh_broker_facts(self, spec: Stage6PilotSpec) -> tuple[dict[str, Any], list[str]]:
         """Run the pilot's read-only account gate before any submit call."""
@@ -724,6 +792,8 @@ class Stage6PilotRunner:
         self,
         spec: Stage6PilotSpec,
         symbols: Sequence[str],
+        *,
+        require_rth: bool = True,
     ) -> tuple[dict[str, Any], list[str]]:
         """Read authoritative provider market/session state without commands."""
 
@@ -748,6 +818,21 @@ class Stage6PilotRunner:
         captured_at = report.get("captured_at")
         if not isinstance(captured_at, str) or not captured_at.strip():
             reasons.append("authoritative market/RTH state has no capture timestamp")
+        else:
+            try:
+                parsed_capture = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            except ValueError:
+                reasons.append("authoritative market/RTH state has an invalid capture timestamp")
+            else:
+                if parsed_capture.tzinfo is None or parsed_capture.utcoffset() is None:
+                    reasons.append("authoritative market/RTH state capture timestamp has no timezone")
+                else:
+                    reasons.extend(
+                        self._freshness_reasons(
+                            parsed_capture,
+                            label="authoritative market/RTH state",
+                        )
+                    )
         raw_rows = report.get("rows")
         if type(raw_rows) is not list or not raw_rows:
             reasons.append("authoritative market/RTH state has no symbol rows")
@@ -768,7 +853,7 @@ class Stage6PilotRunner:
                 observed_symbols.add(symbol)
             if not state:
                 reasons.append(f"authoritative market/RTH row {index} has no market state")
-            elif state not in rth_states:
+            elif require_rth and state not in rth_states:
                 reasons.append(f"authoritative market state for {symbol or index} is not RTH: {state}")
             rows.append({**row, "symbol": symbol, "market_state": state})
         if observed_symbols != set(requested):
@@ -779,8 +864,11 @@ class Stage6PilotRunner:
         report["market"] = str(report.get("market", "")).strip().upper()
         report["symbols"] = list(requested)
         report["rows"] = rows
+        observed_rth = bool(rows) and not any(
+            str(row.get("market_state", "")).upper() not in rth_states for row in rows
+        )
         report["rth"] = {
-            "observed": not reasons,
+            "observed": observed_rth and not reasons,
             "market_state": (
                 rows[0].get("market_state")
                 if rows and len({row.get("market_state") for row in rows}) == 1
@@ -963,6 +1051,549 @@ class Stage6PilotRunner:
                 "recovery_calls": 0,
             },
         }
+
+    @staticmethod
+    def _configured_symbols(spec: Stage6PilotSpec) -> tuple[str, ...]:
+        return tuple(
+            symbol
+            for sleeve in spec.sleeves
+            for symbol in sleeve.symbols
+            if str(symbol).strip()
+        )
+
+    def submit_verified_compensating_exit(
+        self,
+        *,
+        account: Account,
+        source_intent_id: str,
+        expected_external_order_ids: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Expose the existing proof-gated OMS primitive without reimplementing it."""
+
+        if account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 compensating exits accept SIM accounts only")
+        result = self.oms.submit_verified_compensating_exit(
+            source_intent_id=source_intent_id,
+            expected_external_order_ids=expected_external_order_ids,
+            account=account,
+        )
+        compensating_intent_id = str(result.get("id") or result.get("intent_id") or "")
+        snapshots = self.repository.get_intent(compensating_intent_id) if compensating_intent_id else None
+        attempt_rows = [
+            attempt
+            for leg in (snapshots or {}).get("legs", ())
+            for attempt in self.repository.broker_orders_for_leg(str(leg.get("id")))
+        ]
+        return {
+            "source_intent_id": str(source_intent_id),
+            "source_external_order_ids": dict(expected_external_order_ids),
+            "compensating_result": _stable_value(result),
+            "compensating_exit_intent_id": compensating_intent_id,
+            "compensating_leg_ids": [str(leg.get("id")) for leg in (snapshots or {}).get("legs", ())],
+            "broker_order_attempt_ids": [str(row.get("id")) for row in attempt_rows],
+            "external_broker_order_ids": [str(row.get("external_order_id")) for row in attempt_rows],
+            "statuses": [str(row.get("status")) for row in attempt_rows],
+            "fill_state": [
+                {
+                    "external_order_id": str(row.get("external_order_id")),
+                    "filled_quantity": row.get("filled_quantity"),
+                    "average_fill_price": row.get("average_fill_price"),
+                }
+                for row in attempt_rows
+            ],
+            "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+            "broker_submission_count": len(attempt_rows),
+            "cancel_count": 0,
+            "replace_count": 0,
+            "duplicate_attempt": any(
+                len(self.repository.broker_orders_for_leg(str(leg.get("id")))) > 1
+                for leg in (snapshots or {}).get("legs", ())
+            ),
+            "stop_reasons": [],
+        }
+
+    def resolve_verified_roundtrip(
+        self,
+        *,
+        account: Account,
+        entry_intent_id: str,
+        exit_intent_id: str,
+    ) -> dict[str, Any]:
+        """Expose the existing proof-backed resolver as a local-only boundary."""
+
+        if account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 round-trip resolution accepts SIM accounts only")
+        result = self.oms.resolve_verified_roundtrip(
+            entry_intent_id=str(entry_intent_id),
+            exit_intent_id=str(exit_intent_id),
+            account=account,
+        )
+        return {
+            **_stable_value(result),
+            "entry_intent_id": str(entry_intent_id),
+            "exit_intent_id": str(exit_intent_id),
+            "execution_path": "Stage6PilotRunner->GenericOMS",
+            "broker_contacted": True,
+            "orders_submitted": 0,
+            "submission_count": 0,
+            "cancel_count": 0,
+            "replace_count": 0,
+        }
+
+    def final_state(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        market_symbols: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Observe fresh broker and durable local state without lifecycle writes."""
+
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 final-state accepts SIM accounts only")
+        spec.validate_repository(self.repository)
+        facts, fact_reasons = self._fresh_broker_snapshot(spec)
+        requested_symbols = tuple(market_symbols) or self._configured_symbols(spec)
+        market_report, market_reasons = self._fresh_market_state(
+            spec,
+            requested_symbols,
+            require_rth=False,
+        )
+        reasons = list(fact_reasons) + list(market_reasons)
+        open_issues = self.repository.open_reconciliation_issues(spec.account.id)
+        open_actions = self.repository.open_recovery_actions(spec.account.id)
+        if open_issues:
+            reasons.append("open reconciliation issues remain")
+        if open_actions:
+            reasons.append("open recovery actions remain")
+
+        closed_historical = self.oms._closed_historical_intent_ids(spec.account)
+        unfinished_statuses = {
+            IntentStatus.CREATED.value,
+            IntentStatus.RISK_APPROVED.value,
+            IntentStatus.SUBMITTING.value,
+            IntentStatus.WORKING.value,
+            IntentStatus.PARTIALLY_FILLED.value,
+            IntentStatus.RECONCILIATION_REQUIRED.value,
+        }
+        intents = self.repository.book_intents(spec.account.id)
+        unfinished = [
+            {
+                "intent_id": str(row.get("id")),
+                "book_id": row.get("book_id"),
+                "status": row.get("status"),
+            }
+            for row in intents
+            if str(row.get("status")) in unfinished_statuses
+            and str(row.get("id")) not in closed_historical
+        ]
+        if unfinished:
+            reasons.append(f"{len(unfinished)} unfinished intent(s) remain")
+
+        exposures: dict[str, dict[str, str]] = {}
+        exposure_totals: dict[str, str] = {}
+        for book_id in spec.book_ids:
+            try:
+                exposure = self.repository.book_signed_exposure(spec.account.id, book_id)
+                exposures[book_id] = {key: str(value) for key, value in sorted(exposure.items())}
+                # The validator's durable final-state contract uses one
+                # scalar per book.  Use gross signed-quantity magnitude so a
+                # crossed pair cannot look flat merely because its net sum is
+                # zero; retain the per-instrument map in ``book_exposures``.
+                exposure_totals[book_id] = str(sum((abs(value) for value in exposure.values()), Decimal("0")))
+                if any(value != 0 for value in exposure.values()):
+                    reasons.append(f"book {book_id} is not flat")
+            except Exception as exc:
+                reasons.append(f"book {book_id} exposure unavailable: {exc}")
+                exposure_totals[book_id] = "NaN"
+
+        terminal_statuses = {
+            IntentStatus.FILLED.value,
+            IntentStatus.COMPLETED.value,
+            IntentStatus.CANCELLED.value,
+            IntentStatus.REJECTED.value,
+            IntentStatus.FAILED.value,
+        }
+        terminal_intents = bool(intents) and all(
+            str(row.get("status")) in terminal_statuses or str(row.get("id")) in closed_historical
+            for row in intents
+        )
+        if not terminal_intents:
+            reasons.append("not every managed intent is terminal")
+        orders = self.repository.book_broker_orders(spec.account.id)
+        configured_books = set(spec.book_ids)
+        all_attributable = all(str(row.get("book_id")) in configured_books for row in orders)
+        if not all_attributable:
+            reasons.append("account broker orders include an unattributed book")
+        broker_facts = {
+            "account_id": facts.account_id if facts is not None else spec.account.id,
+            "captured_at": facts.captured_at.isoformat() if facts is not None else None,
+            "complete": facts.complete if facts is not None else False,
+            "error": facts.error if facts is not None else "authoritative broker facts unavailable",
+            "flat": not facts.positions if facts is not None else False,
+            "open_order_count": len(facts.open_orders) if facts is not None else 0,
+            "positions": [self._broker_position_payload(item) for item in facts.positions] if facts else [],
+            "open_orders": [self._broker_order_payload(item) for item in facts.open_orders] if facts else [],
+            "fills": [self._broker_fill_payload(item) for item in facts.fills] if facts else [],
+            "execution_evidence_mode": (
+                facts.execution_evidence_mode.value if facts is not None else "UNAVAILABLE"
+            ),
+            "execution_evidence_scope": sorted(facts.execution_evidence_scope) if facts is not None else [],
+        }
+        flat = bool(facts is not None and facts.complete and not facts.positions)
+        no_open_orders = bool(facts is not None and facts.complete and not facts.open_orders)
+        final = {
+            "account_identity": {
+                "account_id": spec.account.id,
+                "external_account_id": spec.account.external_account_id,
+                "broker": spec.account.broker,
+                "environment": spec.account.environment.value,
+            },
+            "captured_at": facts.captured_at.isoformat() if facts is not None else None,
+            "fresh_facts": broker_facts,
+            "flat": flat,
+            "no_open_orders": no_open_orders,
+            "open_order_count": len(facts.open_orders) if facts is not None else 0,
+            "book_exposure": exposure_totals,
+            "book_exposures": exposures,
+            "open_reconciliation_issues": _stable_value(open_issues),
+            "open_recovery_actions": _stable_value(open_actions),
+            "issues": len(open_issues),
+            "actions": len(open_actions),
+            "unfinished_intents": len(unfinished),
+            "unfinished_intent_blockers": unfinished,
+            "terminal_intents": terminal_intents,
+            "all_orders_attributable": all_attributable,
+            "terminal_intent_status": [
+                {"intent_id": str(row.get("id")), "status": str(row.get("status"))}
+                for row in intents
+            ],
+            "session_orders": [_stable_value(row) for row in orders],
+            "market_state": market_report,
+        }
+        return {
+            "run_id": spec.run_id,
+            "mode": "FINAL_STATE",
+            "account": final["account_identity"],
+            "broker_contacted": True,
+            "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+            "started_at": self._now().isoformat(),
+            "completed_at": self._now().isoformat(),
+            "captured_at": final["captured_at"],
+            "fresh_facts": broker_facts,
+            "market_state": market_report,
+            "final": final,
+            "final_state_passed": not reasons,
+            "stop_reasons": list(dict.fromkeys(reasons)),
+            "open_reconciliation_issues": _stable_value(open_issues),
+            "open_recovery_actions": _stable_value(open_actions),
+            "unfinished_intents": unfinished,
+            "broker_submission_count": 0,
+            "cancel_count": 0,
+            "replace_count": 0,
+            "orders_submitted": 0,
+            "mutations": {
+                "order_intents": 0,
+                "order_legs": 0,
+                "broker_orders": 0,
+                "fills": 0,
+                "submission_calls": 0,
+                "cancel_calls": 0,
+                "replace_calls": 0,
+                "recovery_calls": 0,
+            },
+        }
+
+    def prepare_exit(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        market_symbols: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Derive a normal two-book close from matching local and broker exposure."""
+
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 exit preparation accepts SIM accounts only")
+        spec.validate_repository(self.repository)
+        facts, fact_reasons = self._fresh_broker_snapshot(spec)
+        reasons = list(fact_reasons)
+        open_issues = self.repository.open_reconciliation_issues(spec.account.id)
+        open_actions = self.repository.open_recovery_actions(spec.account.id)
+        if open_issues:
+            reasons.append("open reconciliation issues remain")
+        if open_actions:
+            reasons.append("open recovery actions remain")
+        expected_by_instrument: dict[str, Decimal] = defaultdict(Decimal)
+        books: list[dict[str, Any]] = []
+        for sleeve in spec.sleeves:
+            local = self.repository.book_signed_exposure(spec.account.id, sleeve.book_id)
+            target: dict[str, str] = {}
+            legs: list[dict[str, Any]] = []
+            for instrument_id in sleeve.instrument_ids:
+                quantity = local.get(instrument_id, Decimal("0"))
+                expected_by_instrument[instrument_id] += quantity
+                target[instrument_id] = str(quantity)
+                if quantity == 0:
+                    reasons.append(f"book {sleeve.book_id} has no non-zero exposure for {instrument_id}")
+                    continue
+                legs.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "basis_signed_quantity": str(quantity),
+                        "quantity": str(abs(quantity)),
+                        "side": "SELL" if quantity > 0 else "BUY",
+                    }
+                )
+            books.append({"book_id": sleeve.book_id, "sleeve_id": sleeve.sleeve_id, "signed_quantities": target, "closing_legs": legs})
+        observed: dict[str, Decimal] = defaultdict(Decimal)
+        if facts is not None:
+            for position in facts.positions:
+                observed[position.instrument_id] += Decimal(str(position.signed_quantity))
+        if facts is None or not facts.complete:
+            reasons.append("fresh broker positions are unavailable")
+        elif dict(expected_by_instrument) != {key: value for key, value in observed.items() if value != 0}:
+            reasons.append(
+                f"fresh broker positions do not match durable book exposure: expected {dict(expected_by_instrument)!r}, observed {dict(observed)!r}"
+            )
+        return {
+            "run_id": spec.run_id,
+            "mode": "PREPARE_EXIT",
+            "broker_contacted": True,
+            "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+            "account": {
+                "account_id": spec.account.id,
+                "external_account_id": spec.account.external_account_id,
+                "environment": spec.account.environment.value,
+            },
+            "captured_at": facts.captured_at.isoformat() if facts is not None else None,
+            "fresh_facts": {
+                "complete": facts.complete if facts is not None else False,
+                "positions": [self._broker_position_payload(item) for item in facts.positions] if facts else [],
+                "open_order_count": len(facts.open_orders) if facts is not None else 0,
+            },
+            "books": books,
+            "current_exposure": {key: str(value) for key, value in sorted(expected_by_instrument.items())},
+            "observed_broker_exposure": {key: str(value) for key, value in sorted(observed.items()) if value != 0},
+            "derived_signed_quantities": {key: str(value) for key, value in sorted(expected_by_instrument.items())},
+            "pre_negation_applied": False,
+            "creates_order_intent": False,
+            "orders_submitted": 0,
+            "broker_submission_count": 0,
+            "cancel_count": 0,
+            "replace_count": 0,
+            "prepare_exit_passed": not reasons,
+            "stop_reasons": list(dict.fromkeys(reasons)),
+            "mutations": {"order_intents": 0, "order_legs": 0, "broker_orders": 0, "fills": 0},
+        }
+
+    def build_session_evidence(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        session_id: str,
+        entry_intent_ids: Sequence[str],
+        exit_intent_ids: Sequence[str],
+        preflight: Mapping[str, Any] | None = None,
+        recovery: Mapping[str, Any] | None = None,
+        final: Mapping[str, Any] | None = None,
+        commit_sha: str = "UNKNOWN",
+        trading_date: str | None = None,
+        execution_compatibility: str = STAGE6_EXECUTION_COMPATIBILITY,
+    ) -> dict[str, Any]:
+        """Derive validator-shaped entry/exit evidence from durable rows only."""
+
+        inverse_exposure_proven = False
+        inverse_exposure_reason = ""
+        entry_basis: dict[tuple[str, str], Decimal] = {}
+        exit_basis: dict[tuple[str, str], Decimal] = {}
+
+        def collect_basis(
+            intent_ids: Sequence[str],
+            destination: dict[tuple[str, str], Decimal],
+            label: str,
+        ) -> bool:
+            valid = True
+            for intent_id in intent_ids:
+                intent = self.repository.get_intent(str(intent_id))
+                if intent is None:
+                    inverse_exposure_reason = f"{label} intent {intent_id} is not durable"
+                    missing_basis_reasons.append(inverse_exposure_reason)
+                    valid = False
+                    continue
+                expected_action = IntentAction.ENTER.value if label == "entry" else {
+                    IntentAction.EXIT.value,
+                    IntentAction.FLATTEN.value,
+                }
+                if label == "entry":
+                    action_valid = str(intent.get("action")) == expected_action
+                else:
+                    action_valid = str(intent.get("action")) in expected_action
+                if not action_valid:
+                    missing_basis_reasons.append(
+                        f"{label} intent {intent_id} has an incompatible action"
+                    )
+                    valid = False
+                for leg in intent.get("legs", ()):
+                    instrument_id = str(leg.get("instrument_id") or "").strip()
+                    side = str(leg.get("side") or "").strip().upper()
+                    if not instrument_id or side not in {Side.BUY.value, Side.SELL.value}:
+                        missing_basis_reasons.append(
+                            f"{label} intent {intent_id} has malformed durable leg identity"
+                        )
+                        valid = False
+                        continue
+                    try:
+                        quantity = Decimal(str(leg.get("quantity")))
+                    except (InvalidOperation, TypeError, ValueError):
+                        quantity = Decimal("NaN")
+                    key = (instrument_id, side)
+                    if not quantity.is_finite() or quantity <= 0 or key in destination:
+                        missing_basis_reasons.append(
+                            f"{label} durable legs do not provide unique positive quantities"
+                        )
+                        valid = False
+                        continue
+                    destination[key] = quantity
+            return valid
+
+        missing_basis_reasons: list[str] = []
+        entry_basis_valid = collect_basis(entry_intent_ids, entry_basis, "entry")
+        exit_basis_valid = collect_basis(exit_intent_ids, exit_basis, "exit")
+        if entry_basis_valid and exit_basis_valid and entry_basis and len(entry_basis) == len(exit_basis):
+            expected_exit_basis = {
+                (instrument_id, Side.SELL.value if side == Side.BUY.value else Side.BUY.value): quantity
+                for (instrument_id, side), quantity in entry_basis.items()
+            }
+            inverse_exposure_proven = expected_exit_basis == exit_basis
+            if not inverse_exposure_proven:
+                inverse_exposure_reason = (
+                    "durable exit legs do not exactly oppose every durable entry leg"
+                )
+                missing_basis_reasons.append(inverse_exposure_reason)
+        else:
+            inverse_exposure_reason = "durable entry/exit legs are incomplete for inverse exposure proof"
+            missing_basis_reasons.append(inverse_exposure_reason)
+
+        def section(intent_ids: Sequence[str], label: str) -> tuple[dict[str, Any], list[str]]:
+            ids = tuple(str(value).strip() for value in intent_ids if str(value).strip())
+            missing: list[str] = []
+            expected: list[dict[str, Any]] = []
+            actual: list[dict[str, Any]] = []
+            duplicate_attempts = 0
+            fills_complete = True
+            attributable = True
+            for intent_id in ids:
+                intent = self.repository.get_intent(intent_id)
+                if intent is None:
+                    missing.append(f"{label} intent {intent_id} is not durable")
+                    continue
+                if str(intent.get("account_id")) != spec.account.id:
+                    missing.append(f"{label} intent {intent_id} belongs to another account")
+                for leg in intent.get("legs", ()):
+                    attempts = self.repository.broker_orders_for_leg(str(leg.get("id")))
+                    duplicate_attempts += max(0, len(attempts) - 1)
+                    if not attempts:
+                        missing.append(f"{label} leg {leg.get('id')} has no durable broker attempt")
+                    for order in attempts:
+                        external_id = str(order.get("external_order_id") or "").strip()
+                        requested = order.get("submitted_quantity", leg.get("quantity"))
+                        filled = order.get("filled_quantity", leg.get("cumulative_filled_quantity", "0"))
+                        fills = self.repository.fills_for_broker_order(str(order.get("id")))
+                        fill_price = fills[0].get("price") if len(fills) == 1 else order.get("average_fill_price")
+                        row = {
+                            "order_id": external_id,
+                            "broker_order_id": str(order.get("id")),
+                            "external_order_id": external_id,
+                            "intent_id": intent_id,
+                            "leg_id": str(leg.get("id")),
+                            "account_id": str(order.get("account_id")),
+                            "instrument_id": str(leg.get("instrument_id")),
+                            "side": str(leg.get("side")),
+                            "status": str(order.get("status")),
+                            "quantity": str(requested),
+                            "filled_quantity": str(filled),
+                            "fill_price": str(fill_price) if fill_price is not None else None,
+                            "attributable": str(order.get("account_id")) == spec.account.id and bool(external_id),
+                            "fills": _stable_value(fills),
+                        }
+                        expected.append({"order_id": external_id, "intent_id": intent_id, "quantity": str(requested)})
+                        actual.append(row)
+                        try:
+                            fills_complete = fills_complete and str(order.get("status")) == "FILLED" and Decimal(str(requested)) == Decimal(str(filled)) and len(fills) == 1
+                        except (InvalidOperation, TypeError, ValueError):
+                            fills_complete = False
+                        attributable = attributable and bool(row["attributable"])
+            return (
+                {
+                    "expected_intents": [{"intent_id": item} for item in ids],
+                    "expected_orders": expected,
+                    "actual_orders": actual,
+                    "unexpected_attempts": len(missing),
+                    "duplicate_attempts": duplicate_attempts,
+                    "fills_complete": fills_complete and not missing,
+                    "orders_attributable": attributable and not missing,
+                    "derived_from_repository": True,
+                },
+                missing,
+            )
+
+        entry, entry_missing = section(entry_intent_ids, "entry")
+        exit_section, exit_missing = section(exit_intent_ids, "exit")
+        exit_section["current_exposure_inverse"] = inverse_exposure_proven
+        exit_section["submitted_via"] = "Stage6PilotRunner->GenericOMS"
+        started_candidates: list[datetime] = []
+        completed_candidates: list[datetime] = []
+        for intent_id in (*entry_intent_ids, *exit_intent_ids):
+            intent = self.repository.get_intent(str(intent_id))
+            if intent is None:
+                continue
+            for field_name, collection in (("created_at", started_candidates), ("updated_at", completed_candidates)):
+                value = intent.get(field_name)
+                if value:
+                    try:
+                        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        collection.append(parsed.astimezone(timezone.utc))
+                    except ValueError:
+                        pass
+        started = min(started_candidates).isoformat() if started_candidates else self._now().isoformat()
+        completed = max(completed_candidates).isoformat() if completed_candidates else started
+        evidence: dict[str, Any] = {
+            "session_id": str(session_id),
+            "us_trading_date": trading_date or started[:10],
+            "started_at": started,
+            "completed_at": completed,
+            "commit_sha": commit_sha,
+            "execution_compatibility": execution_compatibility,
+            "account_id": spec.account.id,
+            "environment": spec.account.environment.value,
+            "execution_path": "Stage6PilotRunner->GenericOMS",
+            "execution_mode": "SIM_SUBMIT",
+            "supervised": True,
+            "run_ids": [spec.run_id],
+            "entry_intent_ids": [str(value) for value in entry_intent_ids],
+            "exit_intent_ids": [str(value) for value in exit_intent_ids],
+            "evidence_class": "DURABLE",
+            "entry": entry,
+            "exit": exit_section,
+        }
+        missing = entry_missing + exit_missing + missing_basis_reasons
+        if preflight is not None:
+            evidence["preflight"] = dict(preflight.get("preflight", preflight))
+        else:
+            missing.append("fresh preflight evidence artifact is required")
+        if recovery is not None:
+            evidence["restart_recovery"] = dict(recovery.get("restart_recovery", recovery))
+        else:
+            missing.append("fresh-process recovery evidence artifact is required")
+        if final is not None:
+            evidence["final"] = dict(final.get("final", final))
+        else:
+            missing.append("final-state evidence artifact is required")
+        if missing:
+            evidence["failure_reasons"] = list(dict.fromkeys(missing))
+            evidence["evidence_builder_missing"] = list(dict.fromkeys(missing))
+        return evidence
 
     @staticmethod
     def _parse_history_timestamp(value: object, *, field: str) -> datetime:
@@ -1397,6 +2028,7 @@ class Stage6PilotRunner:
         spec: Stage6PilotSpec,
         *,
         mode: Stage6RunMode = Stage6RunMode.DRY_RUN,
+        market_symbols: Sequence[str] = (),
     ) -> Stage6PilotReport:
         # Repeat the public boundary check immediately before any repository
         # initialization or allocation mutation.  This remains fail-closed if
@@ -1421,6 +2053,7 @@ class Stage6PilotRunner:
         after_status: list[Mapping[str, Any]] = []
         intent_results: list[Mapping[str, Any]] = []
         broker_facts: dict[str, Any] = {}
+        market_state: dict[str, Any] = {}
         broker_preflight_passed = False
 
         self.repository.initialize()
@@ -1491,7 +2124,17 @@ class Stage6PilotRunner:
             if selected_mode is Stage6RunMode.SIM_SUBMIT and not stop_reasons:
                 broker_facts, fresh_reasons = self._fresh_broker_facts(spec)
                 stop_reasons.extend(fresh_reasons)
-                broker_preflight_passed = not fresh_reasons
+                # This is intentionally performed in the same invocation,
+                # immediately before the first possible submit.  A prior
+                # broker-preflight/session artifact is never an execution
+                # safety substitute.
+                market_state, market_reasons = self._fresh_market_state(
+                    spec,
+                    tuple(market_symbols) or self._configured_symbols(spec),
+                    require_rth=True,
+                )
+                stop_reasons.extend(market_reasons)
+                broker_preflight_passed = not fresh_reasons and not market_reasons
             elif selected_mode is Stage6RunMode.DRY_RUN:
                 broker_facts = {"queried": False, "reason": "dry-run does not contact the broker"}
 
@@ -1531,6 +2174,7 @@ class Stage6PilotRunner:
                 before_status=tuple(before_status),
                 after_status=tuple(after_status),
                 broker_facts=broker_facts,
+                market_state=market_state,
             )
 
         for sequence, (sleeve, intent) in enumerate(intents):
@@ -1564,6 +2208,18 @@ class Stage6PilotRunner:
                 status = str(result.get("status", "UNKNOWN"))
                 wait_outcome = "FULL" if self._is_verified_full_fill(result) else status
                 final_result: Mapping[str, Any] = result
+                if existing is None:
+                    try:
+                        self._record_submission_process_identity(
+                            intent_id=intent.id,
+                            account_id=spec.account.id,
+                            run_id=spec.run_id,
+                        )
+                    except Exception as exc:
+                        stop_reasons.append(
+                            f"submission process identity persistence failed for {intent.id}: {exc}"
+                        )
+                        break
                 if status in {
                     IntentStatus.WORKING.value,
                     IntentStatus.SUBMITTING.value,
@@ -1642,10 +2298,12 @@ class Stage6PilotRunner:
             before_status=tuple(before_status),
             after_status=tuple(after_status),
             broker_facts=broker_facts,
+            market_state=market_state,
         )
 
 
 __all__ = [
+    "STAGE6_EXECUTION_COMPATIBILITY",
     "Stage6PilotReport",
     "Stage6PilotRunner",
     "Stage6PilotSpec",
