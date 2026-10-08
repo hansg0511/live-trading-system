@@ -731,7 +731,10 @@ class MooMooGenericAdapter(BrokerAdapter):
     def get_order(self, account: Account, external_order_id: str) -> BrokerOrderSnapshot | None:
         self._validate_account(account)
         identifier = str(external_order_id).strip()
-        rows = self._validated_order_rows(account, self._query_orders())
+        # A recovery/status lookup may decide whether a terminal local
+        # attempt has authoritative broker evidence.  Never answer that
+        # decision from the short-lived display/order cache.
+        rows = self._validated_order_rows(account, self._query_orders(force_refresh=True))
         for row in rows:
             if str(get_value(row, "order_id", "id", "orderid", default="")) == identifier:
                 return self._order_snapshot(account, self._snapshot_id(account), datetime.now(timezone.utc), row)

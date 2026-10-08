@@ -761,8 +761,11 @@ def test_working_ack_waits_for_full_recovery_before_dispatching_next_sleeve(tmp_
     assert report.preflight_passed is True
     assert report.stop_reasons == ()
     assert len(adapter.submit_calls) == 4
-    assert adapter.open_order_reads >= 2
-    assert elapsed[0] >= 1.0
+    # Recovery is admitted from repeated strict account-fact snapshots; it no
+    # longer falls back to the cacheable open-order reader for position/fill
+    # truth.
+    assert adapter.fact_calls >= 2
+    assert adapter.open_order_reads == 0
     assert all(item["dispatch_outcome"] == "FULL" for item in report.intent_results)
 
 

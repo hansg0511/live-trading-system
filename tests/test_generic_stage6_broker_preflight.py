@@ -4,9 +4,16 @@ from datetime import datetime, timezone
 
 from scripts.generic_stage6_pilot import main
 from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
-from src.trading_core.domain import BrokerOrderSnapshot, BrokerOrderStatus, PositionSnapshot, Side
+from src.trading_core.domain import (
+    BrokerOrderSnapshot,
+    BrokerOrderStatus,
+    ExecutionEvidenceBaseline,
+    ExecutionEvidenceMode,
+    PositionSnapshot,
+    Side,
+)
 from src.trading_core.oms import GenericOMS
-from src.trading_core.ports import BrokerFactSnapshot
+from src.trading_core.ports import BrokerFactSnapshot, BrokerFill
 from src.trading_core.repository import SQLiteTradingRepository
 from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner
 
@@ -214,6 +221,39 @@ def test_market_state_unavailable_or_non_rth_blocks_fail_closed(tmp_path):
     assert any("not RTH" in reason for reason in closed["stop_reasons"])
 
 
+def test_cumulative_preflight_requires_the_same_verified_flat_baseline_contract_as_oms(tmp_path):
+    account, sleeves, repository, adapter, runner = _runner(tmp_path)
+    adapter.facts = BrokerFactSnapshot(
+        account_id=account.id,
+        captured_at=NOW,
+        complete=True,
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
+    )
+
+    missing = _run_preflight(runner, account, sleeves)
+    assert missing["preflight_passed"] is False
+    assert any("matching account, mode, VERIFIED status, and flat proof" in reason for reason in missing["stop_reasons"])
+
+    repository.save_execution_evidence_baseline(
+        ExecutionEvidenceBaseline(
+            id="preflight-baseline",
+            account_id=account.id,
+            captured_at=NOW,
+            evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            coverage=("CURRENT_ORDER_SNAPSHOTS",),
+            source_ledger_fingerprint="source-ledger",
+            source_order_ids=("source-order",),
+            position_fingerprint="flat-positions",
+            open_order_fingerprint="empty-orders",
+            verified_flat=True,
+            status="VERIFIED",
+        )
+    )
+    verified = _run_preflight(runner, account, sleeves)
+    assert verified["preflight_passed"] is True
+
+
 def test_preflight_never_invokes_legacy_baseline_import(tmp_path, monkeypatch):
     account, sleeves, repository, _adapter, runner = _runner(tmp_path)
 
@@ -243,4 +283,60 @@ def test_cli_broker_preflight_uses_read_only_runner_path(tmp_path, monkeypatch, 
     assert payload["mutations"]["order_intents"] == 0
     assert adapter.submit_calls == 0
     assert (adapter.connect_calls, adapter.disconnect_calls) == (1, 1)
+
+
+def test_broker_preflight_rejects_unsafe_fact_metadata_before_any_submission(tmp_path):
+    account, sleeves, _repository, adapter, runner = _runner(
+        tmp_path,
+        facts=BrokerFactSnapshot(
+            account_id="pilot-account",
+            captured_at=NOW,
+            complete=True,
+            metadata={"raw": {"dealt_qty": "1"}},
+        ),
+    )
+
+    result = _run_preflight(runner, account, sleeves)
+
+    assert result["preflight_passed"] is False
+    assert any("metadata" in reason for reason in result["stop_reasons"])
+    assert adapter.submit_calls == 0
+
+
+def test_broker_preflight_rejects_conflicting_fill_identity_before_any_submission(tmp_path):
+    first = BrokerFill(
+        external_order_id="provider-order",
+        external_fill_id="provider-fill",
+        dedupe_key="provider-fill",
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=NOW,
+        received_at=NOW,
+        account_id="pilot-account",
+    )
+    conflicting = BrokerFill(
+        external_order_id="provider-order",
+        external_fill_id="provider-fill",
+        dedupe_key="provider-fill",
+        quantity=Decimal("1"),
+        price=Decimal("101"),
+        filled_at=NOW,
+        received_at=NOW,
+        account_id="pilot-account",
+    )
+    account, sleeves, _repository, adapter, runner = _runner(
+        tmp_path,
+        facts=BrokerFactSnapshot(
+            account_id="pilot-account",
+            captured_at=NOW,
+            complete=True,
+            fills=(first, conflicting),
+        ),
+    )
+
+    result = _run_preflight(runner, account, sleeves)
+
+    assert result["preflight_passed"] is False
+    assert any("contradictory duplicate fill identity" in reason for reason in result["stop_reasons"])
+    assert adapter.submit_calls == 0
 

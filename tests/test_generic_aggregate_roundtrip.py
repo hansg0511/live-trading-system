@@ -358,3 +358,96 @@ def test_aggregate_roundtrip_rejects_counter_fill_reuse_and_foreign_book(tmp_pat
         GenericOMS(clean, adapter, clock=lambda: NOW + timedelta(seconds=2)).resolve_verified_aggregate_roundtrip(
             intent_ids=_intent_ids(rows), account=_account()
         )
+
+
+@pytest.mark.parametrize("mutation", ("extra", "duplicate", "stale-history"))
+def test_aggregate_roundtrip_rejects_unknown_duplicate_or_stale_shared_evidence(tmp_path, mutation):
+    repository = _repository(tmp_path)
+    rows, adapter = _seed(repository)
+    if mutation == "extra":
+        extra = replace(
+            adapter.facts.fills[0],
+            external_order_id="unexpected-external",
+            dedupe_key="broker:unexpected-external",
+        )
+        adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills, extra))
+    elif mutation == "duplicate":
+        duplicate = replace(adapter.facts.fills[0], quantity=Decimal("1.5"))
+        adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills, duplicate))
+    else:
+        original_history = adapter.get_historical_order_facts
+
+        def stale_history(account, start, end):
+            return replace(
+                original_history(account, start, end),
+                captured_at=NOW - timedelta(days=2),
+            )
+
+        adapter.get_historical_order_facts = stale_history
+
+    with pytest.raises(OMSExecutionError):
+        GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=2)).resolve_verified_aggregate_roundtrip(
+            intent_ids=_intent_ids(rows), account=_account()
+        )
+    assert all(
+        repository.get_intent(intent_id)["status"] == IntentStatus.FILLED.value
+        for intent_id in _intent_ids(rows)
+    )
+
+
+def test_verified_roundtrip_does_not_clear_unrelated_position_query_blocker(tmp_path):
+    repository = _repository(tmp_path)
+    rows, adapter = _seed(repository)
+    source = rows[0][0]
+    unrelated_id = "unrelated-position-query"
+    unrelated_legs = tuple(
+        replace(leg, id=f"{unrelated_id}-leg-{leg.sequence}", intent_id=unrelated_id)
+        for leg in source.legs
+    )
+    unrelated = replace(
+        source,
+        id=unrelated_id,
+        idempotency_key=f"{unrelated_id}-key",
+        legs=unrelated_legs,
+    )
+    repository.create_intent(unrelated)
+    # Reuse the seeded graph as a simple two-intent round-trip by retaining
+    # only the entry and one exact opposite-side exit.  The unrelated blocker
+    # below must not be cleared by the proof route.
+    with repository.transaction() as connection:
+        connection.execute(
+            "UPDATE core_order_legs SET side = CASE WHEN side = 'BUY' THEN 'SELL' ELSE 'BUY' END "
+            "WHERE intent_id = ?",
+            ("aggregate-wrong-exit",),
+        )
+    expected_external_ids = {"external-0-0", "external-0-1", "external-1-0", "external-1-1"}
+    adapter.orders = tuple(
+        replace(
+            order,
+            side=(Side.SELL if order.side is Side.BUY else Side.BUY)
+            if str(order.external_order_id).startswith("external-1-")
+            else order.side,
+        )
+        for order in adapter.orders
+        if order.external_order_id in expected_external_ids
+    )
+    adapter.fills = tuple(item for item in adapter.fills if item.external_order_id in expected_external_ids)
+    adapter.facts = replace(adapter.facts, fills=adapter.fills)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=2))
+    oms._require_reconciliation(
+        unrelated_id,
+        _account(),
+        category="BROKER_QUERY_FAILED",
+        entity_type="ACCOUNT",
+        entity_key=f"{ACCOUNT_ID}:positions",
+        details={"message": "unrelated position query failed"},
+    )
+
+    with pytest.raises(OMSExecutionError, match="blockers remain open"):
+        oms.resolve_verified_roundtrip(
+            entry_intent_id="aggregate-entry",
+            exit_intent_id="aggregate-wrong-exit",
+            account=_account(),
+        )
+    remaining = repository.open_reconciliation_issues(ACCOUNT_ID)
+    assert any(issue["issue_key"] == f"BROKER_QUERY_FAILED:ACCOUNT:{ACCOUNT_ID}:positions" for issue in remaining)

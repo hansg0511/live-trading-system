@@ -93,6 +93,7 @@ class FakeGenericMoomooAdapter:
                 external_order_id=external_id,
                 external_fill_id=f"fill-{external_id}",
                 dedupe_key=f"fill-{external_id}",
+                instrument_id=request.order_leg.instrument_id,
                 quantity=request.order_leg.quantity,
                 price=request.order_leg.limit_price or Decimal("100"),
                 filled_at=self._now(),

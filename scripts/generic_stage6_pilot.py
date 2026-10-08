@@ -48,6 +48,7 @@ from src.strategies.stat_arb.stage6_pilot import (  # noqa: E402
     Stage6RunMode,
 )
 from src.trading_core.repository import SQLiteTradingRepository  # noqa: E402
+from src.trading_core.domain import ExecutionEvidenceMode  # noqa: E402
 from src.trading_core.ports import BrokerFactSnapshot  # noqa: E402
 from src.trading_core.stage6_validation import (  # noqa: E402
     Stage6SessionOutcome,
@@ -119,6 +120,10 @@ def _parser() -> argparse.ArgumentParser:
         "residual-exit",
         help="SIM submission: submit one exact proof-gated residual/compensating exit",
     )
+    cancel_partial = subparsers.add_parser(
+        "cancel-known-partial",
+        help="SIM submission: cancel one exact proof-gated partial broker attempt",
+    )
     final_state = subparsers.add_parser(
         "final-state",
         help="read-only facts: obtain fresh broker/local final state without lifecycle mutation",
@@ -149,6 +154,7 @@ def _parser() -> argparse.ArgumentParser:
         resolve_compensated,
         resolve_aggregate,
         residual_exit,
+        cancel_partial,
         final_state,
         prepare_exit,
         session_evidence,
@@ -196,6 +202,13 @@ def _parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--arm-sim", action="store_true", help="required explicit SIM arm")
         command.add_argument("--confirm", help="must equal the exact residual exit arm phrase")
+    cancel_partial.add_argument("--intent-id", required=True)
+    cancel_partial.add_argument("--external-order-id", required=True)
+    cancel_partial.add_argument("--arm-sim", action="store_true", help="required explicit SIM arm")
+    cancel_partial.add_argument(
+        "--confirm",
+        help="must equal: ARM STAGE6 SIM CANCEL PARTIAL <intent-id> <external-order-id>",
+    )
     prepare_exit.add_argument("--output", type=Path, help="optional new derived artifact; existing files are never overwritten")
     session_evidence.add_argument("--session-id", required=True)
     session_evidence.add_argument("--entry-intent-id", action="append", default=[])
@@ -275,6 +288,82 @@ def _resolution_exit_code(result: Mapping[str, Any]) -> int:
     if status in {"CREATED", "RISK_APPROVED", "SUBMITTING", "WORKING", "PARTIALLY_FILLED"}:
         return 2
     return 0
+
+
+_STAGE6_NONTERMINAL_ORDER_STATUSES = frozenset(
+    {
+        "RECONCILIATION_REQUIRED",
+        "REJECTED",
+        "FAILED",
+        "UNKNOWN",
+        "CREATED",
+        "RISK_APPROVED",
+        "SUBMITTING",
+        "WORKING",
+        "PARTIALLY_FILLED",
+    }
+)
+
+
+def _order_submission_exit_code(result: Mapping[str, Any]) -> int:
+    """Return 2 unless every reported broker attempt is terminal and safe."""
+
+    if not isinstance(result, Mapping):
+        return 2
+    statuses = {
+        str(value).strip().upper()
+        for value in result.get("statuses", ())
+        if str(value).strip()
+    }
+    return 2 if statuses & _STAGE6_NONTERMINAL_ORDER_STATUSES else 0
+
+
+def _cancel_partial_exit_code(
+    result: Mapping[str, Any],
+    repository: SQLiteTradingRepository,
+    account_id: str,
+) -> int:
+    """Return success only after cancellation/recovery is durably terminal.
+
+    An accepted cancellation is not completion when a late fill, remaining
+    exposure, or reconciliation blocker leaves the intent unresolved.  The
+    command must tell the operator to continue recovery in those cases.
+    """
+
+    if not isinstance(result, Mapping) or int(result.get("cancel_count", 0) or 0) != 1:
+        return 2
+    if str(result.get("cancel_status", "")).strip().upper() != "CANCELLED":
+        return 2
+    recovered = result.get("recovered")
+    if not isinstance(recovered, Mapping):
+        return 2
+    if str(recovered.get("status", "")).strip().upper() not in {
+        "CANCELLED",
+        "FILLED",
+        "COMPLETED",
+    }:
+        return 2
+    if repository.open_reconciliation_issues(account_id) or repository.open_recovery_actions(account_id):
+        return 2
+    return 0
+
+
+def _build_scoped_runner(
+    config: Stage6PilotConfig,
+    repository: SQLiteTradingRepository,
+    intent_ids: Sequence[str],
+) -> tuple[Any, Any]:
+    """Build and scope-check a runner before any adapter connection.
+
+    The adapter object is intentionally created but remains disconnected.  A
+    foreign/missing intent must fail from durable repository facts before a
+    command can reach a connected broker path.
+    """
+
+    adapter = config.build_moomoo_adapter()
+    runner = config.build_runner(repository, adapter=adapter)
+    runner.validate_recovery_scope(config.spec(), tuple(str(value) for value in intent_ids))
+    return adapter, runner
 
 
 def _recovery_intent_snapshot(
@@ -375,6 +464,32 @@ def _durable_submission_process_ids(
     return identities, missing
 
 
+def _recovery_execution_evidence_readiness(
+    repository: SQLiteTradingRepository,
+    account_id: str,
+    facts: BrokerFactSnapshot,
+) -> tuple[bool, str | None]:
+    """Mirror the OMS cumulative-evidence admission rule for CLI reporting."""
+
+    if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
+        return False, "execution evidence is unavailable"
+    if facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
+        baseline = repository.latest_execution_evidence_baseline(account_id)
+        if not (
+            baseline is not None
+            and baseline.account_id == account_id
+            and baseline.evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
+            and baseline.verified_flat
+            and baseline.status == "VERIFIED"
+        ):
+            return (
+                False,
+                "verified cumulative-order baseline requires matching account, "
+                "mode, VERIFIED status, and flat proof",
+            )
+    return True, None
+
+
 def _recovery_report(
     *,
     config: Stage6PilotConfig,
@@ -463,6 +578,8 @@ def _recovery_report(
             durable_exposure[instrument_id] = durable_exposure.get(instrument_id, Decimal("0")) + quantity
     durable_exposure = {key: value for key, value in durable_exposure.items() if value != 0}
     broker_exposure: dict[str, Decimal] = {}
+    execution_evidence_ready = False
+    execution_evidence_error: str | None = None
     facts_valid = bool(
         isinstance(fresh_facts, BrokerFactSnapshot)
         and fresh_facts.complete
@@ -503,6 +620,14 @@ def _recovery_report(
                 if any(row != rows[0] for row in rows[1:]):
                     facts_valid = False
                 broker_exposure[instrument_id] = Decimal(str(rows[0].signed_quantity))
+        if facts_valid:
+            execution_evidence_ready, execution_evidence_error = _recovery_execution_evidence_readiness(
+                repository,
+                account_id,
+                fresh_facts,
+            )
+            if not execution_evidence_ready:
+                facts_valid = False
     broker_exposure = {key: value for key, value in broker_exposure.items() if value != 0}
     exposure_agrees = facts_valid and broker_exposure == durable_exposure
     exposure_stop_reasons: list[str] = []
@@ -510,6 +635,8 @@ def _recovery_report(
         exposure_stop_reasons.append(f"fresh authoritative account facts unavailable: {fresh_facts_error}")
     if not facts_valid:
         exposure_stop_reasons.append("fresh broker facts are incomplete, stale, account-mismatched, open-order-bearing, or contradictory")
+    if execution_evidence_error:
+        exposure_stop_reasons.append(f"execution evidence is not ready: {execution_evidence_error}")
     if not exposure_agrees:
         exposure_stop_reasons.append(
             "fresh broker exposure does not exactly match durable managed exposure"
@@ -553,6 +680,8 @@ def _recovery_report(
         "no_duplicate_attempts": no_duplicate_attempts,
         "no_resubmission": True,
         "exposure_agrees": exposure_agrees,
+        "execution_evidence_ready": execution_evidence_ready,
+        "execution_evidence_error": execution_evidence_error,
         "durable_managed_exposure": {key: str(value) for key, value in sorted(durable_exposure.items())},
         "broker_observed_exposure": {key: str(value) for key, value in sorted(broker_exposure.items())},
         "fresh_facts_complete": facts_valid,
@@ -769,9 +898,38 @@ def _derive_residual_external_order_mapping(
         attempts = repository.broker_orders_for_leg(str(leg.get("id")))
         if cumulative <= 0:
             if attempts:
-                raise Stage6ConfigError(
-                    f"source leg {leg.get('id')} has an attempted zero-fill and cannot be residual-compensated"
+                if len(attempts) != 1:
+                    raise Stage6ConfigError(
+                        f"source leg {leg.get('id')} has ambiguous attempted zero-fill evidence"
+                    )
+                attempt = attempts[0]
+                metadata = attempt.get("metadata")
+                if not isinstance(metadata, Mapping):
+                    raw_metadata = attempt.get("metadata_json")
+                    if isinstance(raw_metadata, str) and raw_metadata:
+                        try:
+                            decoded_metadata = json.loads(raw_metadata)
+                        except (TypeError, ValueError):
+                            decoded_metadata = None
+                        if isinstance(decoded_metadata, Mapping):
+                            metadata = decoded_metadata
+                proven_no_submit = (
+                    str(attempt.get("status")) == "REJECTED"
+                    and not attempt.get("external_order_id")
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("definite_no_submit") is True
+                    and metadata.get("no_submit_asserted") is True
+                    and metadata.get("no_fill_asserted") is True
                 )
+                proven_terminal_zero = (
+                    str(attempt.get("status")) in {"CANCELLED", "REJECTED", "FAILED"}
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("terminal_zero_fill_proof") is True
+                )
+                if not (proven_no_submit or proven_terminal_zero):
+                    raise Stage6ConfigError(
+                        f"source leg {leg.get('id')} lacks strict terminal zero-fill evidence"
+                    )
             continue
         if len(attempts) != 1 or not attempts[0].get("external_order_id"):
             raise Stage6ConfigError(
@@ -790,6 +948,13 @@ def _compensating_confirmation(source_intent_id: str, *, residual: bool = False)
     if residual:
         return f"ARM STAGE6 SIM RESIDUAL EXIT {str(source_intent_id).strip()}"
     return f"ARM STAGE6 SIM COMPENSATING EXIT {str(source_intent_id).strip()}"
+
+
+def _cancel_partial_confirmation(intent_id: str, external_order_id: str) -> str:
+    return (
+        f"ARM STAGE6 SIM CANCEL PARTIAL {str(intent_id).strip()} "
+        f"{str(external_order_id).strip()}"
+    )
 
 
 def _write_new_json(path: Path | None, payload: Mapping[str, Any]) -> str | None:
@@ -1343,6 +1508,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         "resolve-aggregate-roundtrip",
         "compensating-exit",
         "residual-exit",
+        "cancel-known-partial",
     }:
         if str(config.account.environment.value).upper() != "SIM":
             raise Stage6ConfigError(f"{args.command} accepts SIM accounts only")
@@ -1353,12 +1519,16 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
             raise Stage6ConfigError(f"existing repository validation failed: {exc}") from exc
 
         if args.command in {"resolve-unsubmitted", "resolve-compensated-partial", "resolve-aggregate-roundtrip"}:
-            adapter = config.build_moomoo_adapter()
+            intent_ids = (
+                (args.intent_id,)
+                if args.command != "resolve-aggregate-roundtrip"
+                else tuple(args.intent_id)
+            )
+            adapter, runner = _build_scoped_runner(config, repository, intent_ids)
             connected = False
             try:
                 adapter.connect()
                 connected = True
-                runner = config.build_runner(repository, adapter=adapter)
                 if args.command == "resolve-unsubmitted":
                     result = runner.resolve_unsubmitted(
                         config.spec(),
@@ -1396,12 +1566,15 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                     repository,
                     args.source_intent_id,
                 )
-            adapter = config.build_moomoo_adapter()
+            adapter, runner = _build_scoped_runner(
+                config,
+                repository,
+                (args.source_intent_id,),
+            )
             connected = False
             try:
                 adapter.connect()
                 connected = True
-                runner = config.build_runner(repository, adapter=adapter)
                 result = runner.submit_verified_residual_exit(
                     account=config.account,
                     source_intent_id=args.source_intent_id,
@@ -1453,9 +1626,62 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         "rth_per_leg": True,
                     }
                 )
-                blocked_statuses = {"RECONCILIATION_REQUIRED", "REJECTED", "FAILED", "UNKNOWN"}
-                raw_statuses = {str(value).upper() for value in result.get("statuses", ())}
-                return (2 if raw_statuses & blocked_statuses else 0), result
+                # A broker acknowledgement that remains WORKING or
+                # PARTIALLY_FILLED is not a terminal success.  The command
+                # has contacted/submitted through the normal runner, but the
+                # operator must use the read-only recovery path before this
+                # lifecycle can be treated as complete.
+                return _order_submission_exit_code(result), result
+            finally:
+                if connected:
+                    adapter.disconnect()
+
+        if args.command == "cancel-known-partial":
+            expected_confirmation = _cancel_partial_confirmation(
+                args.intent_id,
+                args.external_order_id,
+            )
+            if not args.arm_sim:
+                raise Stage6ConfigError("cancel-known-partial requires --arm-sim")
+            if args.confirm != expected_confirmation:
+                raise Stage6ConfigError(
+                    f"exact SIM confirmation required: {expected_confirmation!r}; no broker connection was attempted"
+                )
+            adapter, runner = _build_scoped_runner(
+                config,
+                repository,
+                (args.intent_id,),
+            )
+            connected = False
+            try:
+                adapter.connect()
+                connected = True
+                result = runner.cancel_known_partial(
+                    config.spec(),
+                    intent_id=args.intent_id,
+                    external_order_id=args.external_order_id,
+                    market_symbols=tuple(item.external_symbol for item in config.mappings),
+                )
+                result = {
+                    **dict(result),
+                    "broker_contacted": True,
+                    "orders_submitted": 0,
+                    "cancel_count": int(result.get("cancel_count", 0)),
+                    "replace_count": 0,
+                    "recovery_calls": 1 if result.get("cancel_count") else 0,
+                }
+                cancel_exit_code = _cancel_partial_exit_code(
+                    result,
+                    repository,
+                    config.account.id,
+                )
+                result["terminal_success"] = cancel_exit_code == 0
+                result["operator_next_step"] = (
+                    "none"
+                    if cancel_exit_code == 0
+                    else "refresh broker facts and continue scoped recovery; cancellation did not prove terminal completion"
+                )
+                return cancel_exit_code, result
             finally:
                 if connected:
                     adapter.disconnect()
@@ -1474,12 +1700,15 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
             mapping = _parse_external_order_args(args.external_order)
             if not mapping:
                 mapping = _derive_external_order_mapping(repository, args.source_intent_id)
-            adapter = config.build_moomoo_adapter()
+            adapter, runner = _build_scoped_runner(
+                config,
+                repository,
+                (args.source_intent_id,),
+            )
             connected = False
             try:
                 adapter.connect()
                 connected = True
-                runner = config.build_runner(repository, adapter=adapter)
                 market_symbols = tuple(mapping.external_symbol for mapping in config.mappings)
                 rth_gate = runner.compensating_exit_preflight(
                     config.spec(),
@@ -1552,19 +1781,26 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         "rth_preflight": rth_gate,
                     }
                 )
-                raw_statuses = {str(value).upper() for value in result.get("statuses", ())}
-                blocked_statuses = {"RECONCILIATION_REQUIRED", "REJECTED", "FAILED", "UNKNOWN"}
-                return (2 if raw_statuses & blocked_statuses else 0), result
+                return _order_submission_exit_code(result), result
             finally:
                 if connected:
                     adapter.disconnect()
 
-        adapter = config.build_moomoo_adapter()
+        if args.command == "resolve-roundtrip":
+            adapter, runner = _build_scoped_runner(
+                config,
+                repository,
+                (args.entry_intent_id, args.exit_intent_id),
+            )
+        else:
+            adapter = config.build_moomoo_adapter()
+            runner = None
         connected = False
         try:
             adapter.connect()
             connected = True
-            runner = config.build_runner(repository, adapter=adapter)
+            if runner is None:
+                runner = config.build_runner(repository, adapter=adapter)
             if args.command == "final-state":
                 result = runner.final_state(
                     config.spec(),
@@ -1626,18 +1862,19 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         try:
             adapter.connect()
             connected = True
-            recovered = config.build_runner(repository, adapter=adapter).recover(config.account)
-            facts_getter = getattr(adapter, "get_authoritative_account_facts", None)
+            runner = config.build_runner(repository, adapter=adapter)
+            recovered = runner.recover(config.account)
             fresh_facts_error = None
-            if callable(facts_getter):
-                try:
-                    fresh_facts = facts_getter(config.account)
-                except Exception as exc:
-                    fresh_facts = None
-                    fresh_facts_error = str(exc)
-            else:
+            try:
+                fresh_facts, _normalized_positions, _normalized_open_orders = (
+                    runner.oms.strict_authoritative_account_facts(
+                        config.account,
+                        max_age_seconds=BROKER_FACT_MAX_AGE_SECONDS,
+                    )
+                )
+            except Exception as exc:
                 fresh_facts = None
-                fresh_facts_error = "adapter lacks authoritative fresh account-facts capability"
+                fresh_facts_error = str(exc)
         finally:
             if connected:
                 adapter.disconnect()

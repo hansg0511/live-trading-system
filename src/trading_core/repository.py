@@ -1443,8 +1443,11 @@ class SQLiteTradingRepository:
         This is intentionally narrower than ``cancel_unsubmitted_intent``:
         filled legs and their attempt-scoped fills remain immutable, while
         only planned/reconciliation-required zero-evidence legs are moved to
-        ``CANCELLED``.  The OMS owns the broker/history proof; this method is
-        the atomic local lifecycle commit and requires its private capability.
+        ``CANCELLED``.  A proof-gated positive partial source leg remains
+        ``RECONCILIATION_REQUIRED`` so its incomplete requested quantity is
+        never relabeled as filled or cancelled.  The OMS owns the
+        broker/history proof; this method is the atomic local lifecycle commit
+        and requires its private capability.
         """
         if _resolution_capability is not self.__resolution_capability:
             raise PermissionError("validated compensated-intent capability is required")
@@ -1466,6 +1469,11 @@ class SQLiteTradingRepository:
             ).fetchall()
             if not legs:
                 raise ValueError("compensated intent must contain at least one leg")
+            partial_source_leg_ids = {
+                str(value).strip()
+                for value in (metadata.get("partial_source_leg_ids") or ())
+                if str(value).strip()
+            }
             validate_transition(
                 IntentStatus.RECONCILIATION_REQUIRED,
                 IntentStatus.CANCELLED,
@@ -1475,6 +1483,18 @@ class SQLiteTradingRepository:
             for leg in legs:
                 current_leg = LegStatus(str(leg["status"]))
                 if current_leg is LegStatus.FILLED:
+                    continue
+                if (
+                    current_leg is LegStatus.RECONCILIATION_REQUIRED
+                    and Decimal(str(leg["cumulative_filled_quantity"] or "0")) > 0
+                ):
+                    if str(leg["id"]) not in partial_source_leg_ids:
+                        raise ValueError(
+                            f"compensated leg {leg['id']} has positive unverified partial fill"
+                        )
+                    # Preserve the partial source evidence exactly; the
+                    # terminal intent closure records that the verified
+                    # compensation offset it without rewriting its lifecycle.
                     continue
                 if current_leg not in {
                     LegStatus.PLANNED,

@@ -68,7 +68,10 @@ class Stage6RunMode(str, Enum):
 # Same-invocation market/session validation is part of the order-capable
 # boundary.  Keep the identity explicit so validation rows cannot silently be
 # mixed with the older execution semantics.
-STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v3"
+# V4 adds proof-gated partial cancellation/zero-fill recovery and generalized
+# ENTER/EXIT compensation.  It remains broker-neutral, but its durable
+# provenance and lifecycle contract is materially different from V3.
+STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v4"
 BROKER_FACT_MAX_AGE_SECONDS = 60
 BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 _US_EASTERN = ZoneInfo("America/New_York")
@@ -666,6 +669,7 @@ class Stage6PilotRunner:
         *,
         exit_target_books: set[str] | None = None,
         transient_intent: Any | None = None,
+        allow_open_order_external_ids: set[str] | None = None,
     ) -> tuple[BrokerFactSnapshot | None, list[str]]:
         """Read and validate one fresh account-scoped fact set.
 
@@ -673,37 +677,41 @@ class Stage6PilotRunner:
         capability.  ``run(..., SIM_SUBMIT)`` continues to use the same gate;
         the broker-preflight command uses it before constructing any intents.
         """
-        getter = getattr(self.oms.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            return None, ["adapter lacks authoritative fresh account-facts capability"]
         try:
-            facts = getter(spec.account)
+            facts, normalized_positions, normalized_open_orders = self.oms.strict_authoritative_account_facts(
+                spec.account,
+                max_age_seconds=BROKER_FACT_MAX_AGE_SECONDS,
+            )
         except Exception as exc:
             return None, [f"authoritative broker facts unavailable: {exc}"]
-        if not isinstance(facts, BrokerFactSnapshot):
-            return None, ["authoritative broker facts returned an invalid snapshot"]
         reasons: list[str] = []
-        if facts.account_id != spec.account.id:
-            reasons.append("authoritative broker facts belong to a different account")
-        if not facts.complete:
-            reasons.append(f"authoritative broker facts are incomplete: {facts.error or 'unspecified'}")
-        if facts.error:
-            reasons.append(f"authoritative broker facts report an error: {facts.error}")
-        reasons.extend(
-            self._freshness_reasons(
-                facts.captured_at,
-                label="authoritative broker facts",
-            )
-        )
-        if facts.open_orders:
+        allowed_open_order_ids = {
+            str(value).strip()
+            for value in (allow_open_order_external_ids or set())
+            if str(value).strip()
+        }
+        unexpected_open_orders = [
+            item
+            for item in normalized_open_orders
+            if str(item.external_order_id).strip() not in allowed_open_order_ids
+        ]
+        if unexpected_open_orders or len(normalized_open_orders) != len(allowed_open_order_ids):
             reasons.append("unsafe outstanding broker orders are present")
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
             reasons.append("execution evidence is unavailable; no SIM submission is safe")
-        elif (
-            facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
-            and self.repository.latest_execution_evidence_baseline(spec.account.id) is None
-        ):
-            reasons.append("verified bounded cumulative-order baseline is required before SIM submission")
+        elif facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
+            baseline = self.repository.latest_execution_evidence_baseline(spec.account.id)
+            cumulative_baseline_verified = (
+                baseline is not None
+                and baseline.account_id == spec.account.id
+                and baseline.evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
+                and baseline.verified_flat
+                and baseline.status == "VERIFIED"
+            )
+            if not cumulative_baseline_verified:
+                reasons.append(
+                    "verified bounded cumulative-order baseline requires matching account, mode, VERIFIED status, and flat proof"
+                )
 
         expected: dict[str, Decimal] = defaultdict(Decimal)
         closed_historical_intents = self.oms._closed_historical_intent_ids(spec.account)
@@ -723,7 +731,12 @@ class Stage6PilotRunner:
         transient_local: dict[str, Decimal] = defaultdict(Decimal)
         transient_claims: dict[str, tuple[str, Decimal]] = {}
         if transient_intent is not None:
-            transient_id = str(getattr(transient_intent, "id", "") or "").strip()
+            transient_id = str(
+                transient_intent.get("id", "")
+                if isinstance(transient_intent, Mapping)
+                else getattr(transient_intent, "id", "")
+                or ""
+            ).strip()
             persisted_transient = self.repository.get_intent(transient_id) if transient_id else None
             if persisted_transient is None:
                 reasons.append("in-flight Stage 6 intent is not durably persisted")
@@ -805,7 +818,7 @@ class Stage6PilotRunner:
             if instrument_id not in transient_provider:
                 expected[instrument_id] += local_quantity
         observed, position_reasons = self._strict_position_map(
-            facts.positions,
+            normalized_positions,
             account_id=spec.account.id,
         )
         reasons.extend(position_reasons)
@@ -1594,6 +1607,20 @@ class Stage6PilotRunner:
                         f"recovery intent {intent_id} contains an instrument outside the configured universe"
                     )
 
+    def validate_recovery_scope(
+        self,
+        spec: Stage6PilotSpec,
+        intent_ids: Sequence[str],
+    ) -> None:
+        """Validate proof/order intent ownership without contacting a broker.
+
+        CLI commands call this boundary before constructing a connected
+        adapter path.  The same check is repeated by each runner operation so
+        an in-process caller cannot bypass the repository ownership gate.
+        """
+
+        self._validate_recovery_scope(spec, intent_ids)
+
     def resolve_unsubmitted(
         self,
         spec: Stage6PilotSpec,
@@ -1624,6 +1651,67 @@ class Stage6PilotRunner:
         return _stable_value(
             self.oms.resolve_compensated_partial_intent(str(intent_id), account=spec.account)
         )
+
+    def cancel_known_partial(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        intent_id: str,
+        external_order_id: str,
+        market_symbols: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Cancel one scoped partial order after a fresh SIM/RTH gate."""
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 partial cancellation accepts SIM accounts only")
+        spec.validate_repository(self.repository)
+        self._validate_recovery_scope(spec, (intent_id,))
+        facts, fact_reasons = self._fresh_broker_snapshot(
+            spec,
+            allow_open_order_external_ids={str(external_order_id)},
+        )
+        market_report, market_reasons = self._fresh_market_state(
+            spec,
+            tuple(market_symbols) or self._configured_symbols(spec),
+            require_rth=True,
+        )
+        reasons = list(fact_reasons) + list(market_reasons)
+        if reasons:
+            return {
+                "intent_id": str(intent_id),
+                "external_order_id": str(external_order_id),
+                "mode": "CANCEL_KNOWN_PARTIAL",
+                "broker_contacted": True,
+                "cancel_count": 0,
+                "submission_count": 0,
+                "preflight_passed": False,
+                "market_state": market_report,
+                "broker_facts": (
+                    {
+                        "account_id": facts.account_id,
+                        "captured_at": facts.captured_at.isoformat(),
+                        "complete": facts.complete,
+                        "error": facts.error,
+                        "positions": [self._broker_position_payload(item) for item in facts.positions],
+                        "open_orders": [self._broker_order_payload(item) for item in facts.open_orders],
+                    }
+                    if facts is not None
+                    else None
+                ),
+                "stop_reasons": list(dict.fromkeys(reasons)),
+            }
+        result = self.oms.cancel_known_partial_attempt(
+            str(intent_id),
+            account=spec.account,
+            external_order_id=str(external_order_id),
+        )
+        return {
+            **_stable_value(result),
+            "mode": "CANCEL_KNOWN_PARTIAL",
+            "market_state": market_report,
+            "preflight_passed": True,
+            "stop_reasons": [],
+            "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+        }
 
     def resolve_aggregate_roundtrip(
         self,
@@ -2565,21 +2653,18 @@ class Stage6PilotRunner:
             raise ValueError("execution-evidence baseline requires regular RTH policy")
         self.repository.initialize()
         spec.validate_repository(self.repository)
-        getter = getattr(self.oms.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise ValueError("adapter lacks authoritative fresh account-facts capability")
-        facts = getter(spec.account)
-        if not isinstance(facts, BrokerFactSnapshot):
-            raise ValueError("adapter returned an invalid authoritative account-facts snapshot")
-        if not facts.complete or facts.error:
-            raise ValueError(f"fresh SIM account facts are incomplete: {facts.error or 'unspecified'}")
-        if facts.account_id != spec.account.id:
-            raise ValueError("fresh SIM account facts belong to a different account")
+        try:
+            facts, normalized_positions, normalized_open_orders = self.oms.strict_authoritative_account_facts(
+                spec.account,
+                max_age_seconds=BROKER_FACT_MAX_AGE_SECONDS,
+            )
+        except Exception as exc:
+            raise ValueError(f"fresh SIM account facts are unavailable: {exc}") from exc
         if facts.execution_evidence_mode is not ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
             raise ValueError("the bounded baseline path requires cumulative order snapshot evidence")
-        if facts.open_orders:
+        if normalized_open_orders:
             raise ValueError("cannot establish a flat baseline while broker open orders are present")
-        if any(position.signed_quantity != 0 for position in facts.positions):
+        if any(position.signed_quantity != 0 for position in normalized_positions):
             raise ValueError("cannot establish a flat baseline while broker positions are nonzero")
         configured_instrument_ids = {
             instrument_id
@@ -2638,15 +2723,19 @@ class Stage6PilotRunner:
             instrument_mapping=configured_mapping,
         )
         expected_orders = set(imported["source_order_ids"])
-        history_provider = getattr(self.oms.adapter, "get_historical_order_facts", None)
-        if not callable(history_provider):
-            raise ValueError("adapter lacks bounded historical-order evidence capability")
         history_start, history_end = self._legacy_history_window(
             source_db_path,
             spec.account.id,
             tuple(sorted(expected_orders)),
         )
-        history = history_provider(spec.account, history_start, history_end)
+        try:
+            history = self.oms.strict_historical_order_facts(
+                spec.account,
+                requested_start=history_start,
+                requested_end=history_end,
+            )
+        except Exception as exc:
+            raise ValueError(f"bounded historical-order evidence is unavailable: {exc}") from exc
         expected_evidence = self._persisted_legacy_evidence(tuple(sorted(expected_orders)))
         history_metadata = self._validate_historical_evidence(
             spec,

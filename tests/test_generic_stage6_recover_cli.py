@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import json
 
 import pytest
@@ -8,6 +9,7 @@ from scripts.generic_stage6_pilot import _parser, main
 import scripts.generic_stage6_pilot as stage6_cli
 from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
 from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner, Stage6RunMode
+from src.trading_core.domain import ExecutionEvidenceMode
 from src.trading_core.oms import GenericOMS
 from src.trading_core.repository import SQLiteTradingRepository
 
@@ -125,7 +127,9 @@ def test_runner_recover_advances_existing_stale_state_without_order_actions(tmp_
     assert len(adapter.submit_calls) == 2
     assert adapter.cancel_calls == 0
     assert adapter.replace_calls == 0
-    assert adapter.recovery_calls > 0
+    # Recovery must use the validated authoritative account-fact context for
+    # positions/fills rather than falling back to cacheable raw readers.
+    assert adapter.recovery_calls == 0
 
 
 def test_recover_is_idempotent_and_does_not_create_attempts_or_duplicate_fills(tmp_path):
@@ -194,6 +198,30 @@ def test_recover_cli_uses_runner_boundary_and_emits_recovery_evidence(tmp_path, 
     assert payload["restart_recovery"]["fresh_process"] is False
     assert "no recoverable source intents" in payload["restart_recovery"]["process_identity_reason"]
     assert payload["restart_recovery"]["process_id"]
+
+
+def test_recover_cli_blocks_no_recovery_needed_without_cumulative_baseline(tmp_path, monkeypatch, capsys):
+    values = _config_dict(tmp_path)
+    path = tmp_path / "cumulative-no-baseline.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    config = Stage6PilotConfig.load(path)
+    config.ensure_repository(SQLiteTradingRepository(config.state_db))
+    adapter = RecoveryAdapter()
+    adapter.facts = replace(
+        adapter.facts,
+        captured_at=datetime.now(timezone.utc),
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+    )
+    monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
+
+    assert main(["recover", "--config", str(path), "--json"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["restart_recovery"]["result"] == "BLOCKED"
+    assert payload["restart_recovery"]["execution_evidence_ready"] is False
+    assert "verified cumulative-order baseline" in payload["restart_recovery"]["execution_evidence_error"]
+    assert payload["restart_recovery"]["no_resubmission"] is True
+    assert payload["broker_submission_count"] == 0
 
 
 def test_recover_cli_runs_existing_oms_recovery_and_keeps_book_b_untouched(tmp_path, monkeypatch, capsys):

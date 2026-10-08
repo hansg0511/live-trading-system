@@ -8,6 +8,7 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - "requirements*.txt"
+      - "docs/generic-moomoo-execution-roadmap.md"
       - ".github/workflows/stage6-offline-tests.yml"
   pull_request:
     paths:
@@ -16,15 +17,22 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - "requirements*.txt"
+      - "docs/generic-moomoo-execution-roadmap.md"
       - ".github/workflows/stage6-offline-tests.yml"
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    env:
+      PYTHONPATH: .
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install pytest
+      - run: python -m pip install --disable-pip-version-check --no-input pytest
+      - run: python -m compileall -q src scripts tests
       - run: python -m pytest -q

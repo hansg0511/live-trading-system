@@ -13,6 +13,7 @@ from src.trading_core.domain import (
     BrokerOrderEvent,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
+    ExecutionEvidenceMode,
     ExecutionPolicy,
     ExecutionSession,
     Fill,
@@ -22,6 +23,7 @@ from src.trading_core.domain import (
     LegStatus,
     OrderIntent,
     OrderLeg,
+    PositionSnapshot,
     QuantityUnit,
     RiskDecisionRecord,
     Side,
@@ -121,6 +123,11 @@ def ready_repository(tmp_path, count: int) -> SQLiteTradingRepository:
     for index in range(count):
         repository.save_instrument(instrument(index))
     return repository
+
+
+def make_oms(repository, adapter):
+    """Keep fake broker timestamps aligned with the test clock."""
+    return GenericOMS(repository, adapter, clock=lambda: NOW)
 
 
 class FakeAdapter:
@@ -233,7 +240,7 @@ class UncertainRejectAdapter(FakeAdapter):
 def test_oms_persists_all_legs_before_submit_and_supports_n_legs(tmp_path, count):
     repository = ready_repository(tmp_path, count)
     adapter = FakeAdapter(repository, inspect_persistence=True)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(count)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -246,7 +253,7 @@ def test_oms_persists_all_legs_before_submit_and_supports_n_legs(tmp_path, count
 def test_duplicate_intent_returns_existing_state_without_resubmission(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
 
     first = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -260,7 +267,7 @@ def test_oms_propagates_the_explicit_extended_hours_toggle_to_the_adapter(tmp_pa
     adapter = FakeAdapter(repository)
     order_intent = replace(make_intent(1), execution_policy=ExecutionPolicy(allow_extended_hours=True))
 
-    GenericOMS(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    make_oms(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
 
     assert adapter.submit_calls[0].allow_extended_hours is True
 
@@ -270,7 +277,7 @@ def test_oms_propagates_the_explicit_overnight_session_to_the_adapter(tmp_path):
     adapter = FakeAdapter(repository)
     order_intent = replace(make_intent(1), execution_policy=ExecutionPolicy(execution_session=ExecutionSession.OVERNIGHT))
 
-    GenericOMS(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    make_oms(repository, adapter).submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
 
     assert adapter.submit_calls[0].execution_session is ExecutionSession.OVERNIGHT
     assert adapter.submit_calls[0].allow_extended_hours is False
@@ -279,7 +286,7 @@ def test_oms_propagates_the_explicit_overnight_session_to_the_adapter(tmp_path):
 def test_mixed_leg_states_remain_visible_after_later_rejection(tmp_path):
     repository = ready_repository(tmp_path, 3)
     adapter = FakeAdapter(repository, reject_call=2)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(3)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -296,7 +303,7 @@ def test_mixed_leg_states_remain_visible_after_later_rejection(tmp_path):
 def test_definite_no_submit_rejection_stops_before_later_leg_and_stays_terminal(tmp_path):
     repository = ready_repository(tmp_path, 3)
     adapter = FakeAdapter(repository, reject_call=1)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(3)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -320,7 +327,7 @@ def test_definite_no_submit_rejection_stops_before_later_leg_and_stays_terminal(
 def test_rejection_without_explicit_no_submit_contract_stays_blocked(tmp_path):
     repository = ready_repository(tmp_path, 2)
     adapter = UncertainRejectAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(2)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -350,7 +357,7 @@ def test_unrecognized_fill_shaped_rejection_payload_is_not_clean(tmp_path, raw_p
 
     repository = ready_repository(tmp_path, 1)
     adapter = OpaqueRejectAdapter(repository)
-    result = GenericOMS(repository, adapter).submit_intent(
+    result = make_oms(repository, adapter).submit_intent(
         make_intent(1),
         account=account(),
         risk_decision=decision("intent-1"),
@@ -363,7 +370,7 @@ def test_unrecognized_fill_shaped_rejection_payload_is_not_clean(tmp_path, raw_p
 def test_ambiguous_submit_is_not_retried_and_requires_reconciliation(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository, ambiguous_call=1)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
@@ -411,7 +418,7 @@ def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_pat
     repository.transition_intent(order_intent.id, IntentStatus.RECONCILIATION_REQUIRED)
 
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     oms._require_reconciliation(
         order_intent.id,
         account(),
@@ -436,7 +443,7 @@ def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_pat
         def get_fills(self, _account, since=None):
             raise AssertionError("clean no-submit rejection must not query deal history")
 
-    recovered = GenericOMS(repository, NoFillHistoryAdapter(repository)).recover_intent(
+    recovered = make_oms(repository, NoFillHistoryAdapter(repository)).recover_intent(
         order_intent.id,
         account=account(),
     )
@@ -532,17 +539,18 @@ def test_restart_applies_broker_fill_facts_and_broker_truth_wins(tmp_path):
             price=Decimal("101"),
             filled_at=NOW,
             received_at=NOW,
+            instrument_id="instrument-0",
         )
     ]
 
     recovered = oms.recover_intent(order_intent.id, account=account())
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
-    assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
-    assert len(repository.fills_for_leg(order_intent.legs[0].id)) == 1
-    assert repository.position_allocations("acct")[0]["signed_quantity"] == "10"
+    assert recovered["legs"][0]["status"] == LegStatus.WORKING.value
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    assert repository.position_allocations("acct") == []
     assert any(
-        issue["category"] == "UNKNOWN_BROKER_FILL"
+        issue["category"] == "BROKER_FACT_UNAVAILABLE"
         for issue in repository.open_reconciliation_issues("acct")
     )
 
@@ -591,6 +599,7 @@ def test_recovery_keeps_reconciliation_when_one_leg_is_only_partial(tmp_path):
             price=Decimal("101"),
             filled_at=NOW,
             received_at=NOW,
+            instrument_id="instrument-0",
         )
     ]
 
@@ -639,6 +648,7 @@ def test_recovery_resolves_exact_unsupported_fill_issue_after_all_legs_are_evide
             price=Decimal("101") if index == 0 else Decimal("201"),
             filled_at=NOW,
             received_at=NOW,
+            instrument_id=f"instrument-{index}",
         )
         for index, attempt in enumerate(attempts)
     ]
@@ -697,7 +707,7 @@ def test_recovery_keeps_unsupported_or_ambiguous_fill_query_reconciliation(tmp_p
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
-    assert any(issue["category"] == "BROKER_QUERY_FAILED" for issue in repository.open_reconciliation_issues("acct"))
+    assert any(issue["category"] == "BROKER_SNAPSHOT_MISMATCH" for issue in repository.open_reconciliation_issues("acct"))
 
 
 def test_retryable_position_poll_stops_one_recovery_cycle_without_duplicate_poll_blockers(tmp_path):
@@ -738,19 +748,25 @@ def test_retryable_position_poll_stops_one_recovery_cycle_without_duplicate_poll
 
     assert first["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert second["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
-    assert adapter.position_calls == 2
+    assert adapter.position_calls == 0
     assert adapter.order_calls == 0
     assert adapter.fill_calls == 0
     actions = repository.open_recovery_actions("acct")
-    assert [item["action_key"] for item in actions] == ["POLL_ERROR:acct:positions"]
+    assert actions and any(
+        item["action_key"].startswith(("AMBIGUOUS_ORDER:", "TERMINAL_ORDER_EVIDENCE:"))
+        for item in actions
+    )
     issues = repository.open_reconciliation_issues("acct")
-    assert [item["category"] for item in issues] == ["BROKER_QUERY_FAILED"]
+    assert issues and any(
+        item["category"] in {"AMBIGUOUS_ORDER_MATCH", "BROKER_TERMINAL_EVIDENCE_MISSING"}
+        for item in issues
+    )
 
 
 def test_open_reconciliation_issue_blocks_new_submission(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository, ambiguous_call=1)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     first = make_intent(1)
     oms.submit_intent(first, account=account(), risk_decision=decision(first.id))
     second_id = "intent-blocked"
@@ -810,7 +826,7 @@ def test_fill_evidence_drives_completion(tmp_path):
 def test_rejected_risk_is_durable_and_never_submitted(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
 
     result = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id, False))
@@ -821,7 +837,7 @@ def test_rejected_risk_is_durable_and_never_submitted(tmp_path):
 def test_only_filled_intent_can_be_completed(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     with pytest.raises(OMSExecutionError):
@@ -840,7 +856,7 @@ def test_only_filled_intent_can_be_completed(tmp_path):
 def test_recovery_status_rejects_every_noncanonical_account_component(tmp_path, variant):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
 
@@ -858,10 +874,67 @@ def test_recovery_status_rejects_every_noncanonical_account_component(tmp_path, 
     assert adapter.submit_calls
 
 
+def test_recovery_status_is_not_safe_with_fresh_foreign_nonzero_position(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository, reject_call=1)
+    oms = make_oms(repository, adapter)
+    order_intent = make_intent(1)
+
+    submitted = oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
+    assert submitted["status"] == IntentStatus.REJECTED.value
+
+    adapter.positions = [
+        PositionSnapshot(
+            id="foreign-position",
+            broker_snapshot_id="foreign-snapshot",
+            account_id=account().id,
+            instrument_id="instrument-0",
+            signed_quantity=Decimal("1"),
+            average_price=Decimal("100"),
+            captured_at=NOW,
+        )
+    ]
+
+    status = oms.recovery_status(order_intent.id, account=account())
+
+    assert status["fresh_authoritative_facts_valid"] is False
+    assert status["fresh_exposure_agrees"] is False
+    assert status["fresh_broker_positions"] == {"instrument-0": "1"}
+    assert status["durable_managed_exposure"] == {}
+    assert "do not match durable managed exposure" in status["fresh_exposure_error"]
+    assert status["safe_to_submit"] is False
+
+
+def test_recovery_status_is_not_safe_without_verified_cumulative_baseline(tmp_path):
+    repository = ready_repository(tmp_path, 1)
+    adapter = FakeAdapter(repository)
+    oms = make_oms(repository, adapter)
+    order_intent = make_intent(1)
+    oms.submit_intent(
+        order_intent,
+        account=account(),
+        risk_decision=decision(order_intent.id, False),
+    )
+
+    adapter.get_authoritative_account_facts = lambda account_value: BrokerFactSnapshot(  # type: ignore[method-assign]
+        account_id=account_value.id,
+        captured_at=NOW,
+        complete=True,
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+    )
+
+    status = oms.recovery_status(order_intent.id, account=account())
+
+    assert status["fresh_authoritative_facts_valid"] is False
+    assert status["fresh_execution_evidence_ready"] is False
+    assert "verified cumulative-order baseline" in status["fresh_execution_evidence_error"]
+    assert status["safe_to_submit"] is False
+
+
 def test_new_submit_rejects_noncanonical_account_before_persisting_or_calling_adapter(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
 
     with pytest.raises(OMSExecutionError, match="canonical account"):
@@ -878,7 +951,7 @@ def test_new_submit_rejects_noncanonical_account_before_persisting_or_calling_ad
 def test_persisted_disabled_account_blocks_accountless_status(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     with repository.transaction() as conn:
@@ -896,7 +969,7 @@ def test_persisted_disabled_account_blocks_accountless_status(tmp_path):
 def test_accountless_recovery_status_loads_canonical_account_and_quarantines_multiple_attempts(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     order_intent = make_intent(1)
     oms.submit_intent(order_intent, account=account(), risk_decision=decision(order_intent.id))
     first = repository.broker_orders_for_leg(order_intent.legs[0].id)[0]
@@ -923,7 +996,7 @@ def test_accountless_recovery_status_loads_canonical_account_and_quarantines_mul
 def test_open_action_on_other_intent_blocks_completion_account_wide(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     first = make_intent(1, key="first-key")
     oms.submit_intent(first, account=account(), risk_decision=decision(first.id))
 
@@ -968,7 +1041,7 @@ def test_open_action_on_other_intent_blocks_completion_account_wide(tmp_path):
 def test_sibling_multi_attempt_leg_blocks_new_account_submit(tmp_path):
     repository = ready_repository(tmp_path, 1)
     adapter = FakeAdapter(repository)
-    oms = GenericOMS(repository, adapter)
+    oms = make_oms(repository, adapter)
     first = make_intent(1, key="multi-sibling-source")
     oms.submit_intent(first, account=account(), risk_decision=decision(first.id))
     repository.create_broker_order(

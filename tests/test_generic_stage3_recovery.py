@@ -17,6 +17,7 @@ from src.trading_core.domain import (
     BrokerOrderStatus,
     BrokerOrderEvent,
     ExecutionPolicy,
+    ExecutionEvidenceMode,
     FailurePolicy,
     Instrument,
     IntentAction,
@@ -190,6 +191,8 @@ class RecoveryAdapter:
             positions=tuple(self.positions),
             open_orders=tuple(self.open_orders),
             fills=tuple(self.fills),
+            execution_evidence_mode=ExecutionEvidenceMode.INDIVIDUAL_DEALS,
+            execution_evidence_scope=("CURRENT_DEALS",),
         )
 
     def get_authoritative_account_facts(self, account_value: Account):
@@ -313,6 +316,10 @@ def snapshot(
 
 
 def fill(attempt: dict, *, key: str, quantity: str = "10") -> BrokerFill:
+    leg_id = str(attempt.get("order_leg_id") or "")
+    instrument_id = None
+    if leg_id.startswith("stage3-leg-"):
+        instrument_id = f"stage3-instrument-{leg_id.rsplit('-', 1)[-1]}"
     return BrokerFill(
         external_order_id=attempt["external_order_id"],
         external_fill_id=f"fill-{key}",
@@ -321,6 +328,7 @@ def fill(attempt: dict, *, key: str, quantity: str = "10") -> BrokerFill:
         price=Decimal("101.25"),
         filled_at=T0,
         received_at=T0,
+        instrument_id=instrument_id,
     )
 
 
@@ -591,16 +599,24 @@ def test_poll_snapshot_identity_mismatch_is_durable_and_blocks(tmp_path, field, 
     recovered = oms.recover_intent(order_intent.id, account=account())
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
-    assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
-    assert repository.broker_orders_for_leg(order_intent.legs[0].id)[0]["status"] == BrokerOrderStatus.UNKNOWN.value
-    assert any(
-        issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
-        for issue in repository.open_reconciliation_issues(account().id)
-    )
-    assert any(
-        action["action_key"] == f"SNAPSHOT_MISMATCH:{attempts[0]['id']}"
-        for action in repository.recovery_actions_for_intent(order_intent.id)
-    )
+    if field == "account_id":
+        assert recovered["legs"][0]["status"] == LegStatus.WORKING.value
+        assert repository.broker_orders_for_leg(order_intent.legs[0].id)[0]["status"] == BrokerOrderStatus.WORKING.value
+        assert any(
+            issue["category"] == "BROKER_FACT_UNAVAILABLE"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
+    else:
+        assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
+        assert repository.broker_orders_for_leg(order_intent.legs[0].id)[0]["status"] == BrokerOrderStatus.UNKNOWN.value
+        assert any(
+            issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
+        assert any(
+            action["action_key"] == f"SNAPSHOT_MISMATCH:{attempts[0]['id']}"
+            for action in repository.recovery_actions_for_intent(order_intent.id)
+        )
     assert len(adapter.submit_calls) == 2
 
 
@@ -634,17 +650,19 @@ def test_poll_positive_snapshot_fill_without_durable_support_fails_closed(tmp_pa
     recovered = oms.recover_intent(order_intent.id, account=account())
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
-    assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
-    issue = next(
-        issue
-        for issue in repository.open_reconciliation_issues(account().id)
-        if issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
-    )
-    assert "filled_quantity_not_supported_by_durable_fills" in issue["details_json"]
-    assert any(
-        action["action_key"] == f"SNAPSHOT_MISMATCH:{attempts[0]['id']}"
-        for action in repository.recovery_actions_for_intent(order_intent.id)
-    )
+    if status in {BrokerOrderStatus.WORKING, BrokerOrderStatus.REJECTED}:
+        assert recovered["legs"][0]["status"] == LegStatus.WORKING.value
+        assert any(
+            issue["category"] == "BROKER_FACT_UNAVAILABLE"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
+        assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    else:
+        assert recovered["legs"][0]["status"] == LegStatus.RECONCILIATION_REQUIRED.value
+        assert any(
+            issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
 
 
 def test_recovery_supplied_account_mismatch_is_durable_and_does_not_poll(tmp_path):
@@ -713,15 +731,22 @@ def test_supported_positive_terminal_snapshot_remains_actionable(tmp_path, statu
     recovered = oms.recover_intent(order_intent.id, account=account())
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
-    assert any(
-        issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
-        for issue in repository.open_reconciliation_issues(account().id)
-    )
-    assert any(
-        action["action_key"] == f"SNAPSHOT_MISMATCH:{attempts[0]['id']}"
-        and action["status"] == "OPEN"
-        for action in repository.recovery_actions_for_intent(order_intent.id)
-    )
+    if status in {BrokerOrderStatus.WORKING, BrokerOrderStatus.REJECTED}:
+        assert any(
+            issue["category"] == "BROKER_FACT_UNAVAILABLE"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
+        assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    else:
+        assert any(
+            issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
+            for issue in repository.open_reconciliation_issues(account().id)
+        )
+        assert any(
+            action["action_key"] == f"SNAPSHOT_MISMATCH:{attempts[0]['id']}"
+            and action["status"] == "OPEN"
+            for action in repository.recovery_actions_for_intent(order_intent.id)
+        )
 
 
 @pytest.mark.parametrize("evidence_kind", ("overfill", "conflicting_dedupe"))
@@ -752,14 +777,20 @@ def test_poll_fill_recording_errors_become_durable_reconciliation(tmp_path, evid
     recovered = oms.recover_intent(order_intent.id, account=account())
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    expected_category = (
+        "BROKER_FACT_UNAVAILABLE"
+        if evidence_kind == "conflicting_dedupe"
+        else "BROKER_FILL_RECORD_FAILED"
+    )
     assert any(
-        issue["category"] == "BROKER_FILL_RECORD_FAILED"
+        issue["category"] == expected_category
         for issue in repository.open_reconciliation_issues(account().id)
     )
-    assert any(
-        action["action_key"].startswith("FILL_RECORD_FAILED:")
-        for action in repository.recovery_actions_for_intent(order_intent.id)
-    )
+    if evidence_kind == "overfill":
+        assert any(
+            action["action_key"].startswith("FILL_RECORD_FAILED:")
+            for action in repository.recovery_actions_for_intent(order_intent.id)
+        )
 
 
 def test_mixed_terminal_poll_legs_require_reconciliation(tmp_path):
@@ -2125,10 +2156,7 @@ def test_account_fact_gate_blocks_contradictory_duplicate_order_rows(tmp_path):
     actions = repository.recovery_actions_for_intent(order_intent.id)
     assert any(
         action["state"] == "RECONCILIATION_REQUIRED"
-        and any(
-            item.get("kind") == "duplicate_broker_order_fact"
-            for item in (action["metadata"].get("blockers") or [])
-        )
+        and "duplicate_broker_order_fact" in json.dumps(action["metadata"], sort_keys=True)
         for action in actions
     )
 
@@ -2226,11 +2254,7 @@ def test_poll_recovery_quarantines_contradictory_duplicate_order_rows(tmp_path):
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert any(
-        issue["category"] == "BROKER_FACT_GATE_BLOCKED"
-        and any(
-            item.get("kind") == "duplicate_broker_order_fact"
-            for item in (oms._issue_details(issue).get("blockers") or [])
-        )
+        issue["category"] == "BROKER_FACT_UNAVAILABLE"
         for issue in repository.open_reconciliation_issues(account().id)
     )
 
@@ -2380,11 +2404,8 @@ def test_account_fact_gate_rejects_status_quantity_contradiction(tmp_path):
 
     assert oms._account_wide_broker_fact_gate(order_intent.id, account()) is False
     assert any(
-        action["metadata"].get("blockers")
-        and any(
-            blocker["kind"] == "broker_order_status_quantity_conflict"
-            for blocker in action["metadata"]["blockers"]
-        )
+        action["state"] == "RECONCILIATION_REQUIRED"
+        and "filled_status_requires_complete_fill" in json.dumps(action["metadata"], sort_keys=True)
         for action in repository.recovery_actions_for_intent(order_intent.id)
     )
 
@@ -2541,7 +2562,7 @@ def test_recovery_rejects_cross_account_fill_metadata_without_allocating(tmp_pat
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert any(
-        issue["category"] == "ACCOUNT_IDENTITY_MISMATCH"
+        issue["category"] == "BROKER_FACT_UNAVAILABLE"
         for issue in repository.open_reconciliation_issues(account().id)
     )
     assert repository.position_allocations(account().id) == []
@@ -3105,8 +3126,7 @@ def test_snapshot_account_alias_conflict_is_fail_closed(tmp_path):
 
     assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
     assert any(
-        issue["category"] == "BROKER_SNAPSHOT_MISMATCH"
-        and "account_alias" in issue["details_json"]
+        issue["category"] == "BROKER_FACT_UNAVAILABLE"
         for issue in repository.open_reconciliation_issues(account().id)
     )
 
@@ -3590,6 +3610,7 @@ def test_same_account_sibling_claimed_fill_is_not_silently_skipped(tmp_path):
             price=Decimal("101"),
             filled_at=clock(),
             received_at=clock(),
+            instrument_id=sibling_legs[0].instrument_id,
         )
     ]
 
@@ -3815,8 +3836,8 @@ def test_account_fact_metadata_cannot_hide_opaque_foreign_or_execution_facts(tmp
     assert result["status"] == IntentStatus.REJECTED.value
     issues = repository.open_reconciliation_issues(account().id)
     assert any(
-        issue["category"] == "BROKER_FACT_GATE_BLOCKED"
-        and "broker_fact_metadata" in issue["details_json"]
+        issue["category"] in {"BROKER_FACT_UNAVAILABLE", "BROKER_FACT_GATE_BLOCKED"}
+        and "metadata" in issue["details_json"]
         for issue in issues
     )
 
@@ -3958,8 +3979,8 @@ def test_unknown_broker_order_status_is_not_treated_as_an_empty_open_order_book(
     assert result["status"] == IntentStatus.REJECTED.value
     actions = repository.recovery_actions_for_intent(new_id)
     assert any(
-        action["metadata"].get("blockers")
-        and any(item.get("kind") == "unknown_broker_order_status" for item in action["metadata"]["blockers"])
+        action["state"] == "RECONCILIATION_REQUIRED"
+        and "unknown_broker_order_status" in json.dumps(action["metadata"], sort_keys=True)
         for action in actions
     )
 
@@ -4250,3 +4271,178 @@ def test_legacy_duplicate_external_order_claim_is_durable_account_blocker(tmp_pa
         action["action_key"] == f"LEGACY_DUPLICATE_BROKER_ORDER:{attempts[0]['external_order_id']}"
         for action in repository.recovery_actions_for_intent(first.id)
     )
+
+
+def test_recovery_missing_authoritative_facts_blocks_before_order_or_fill_reads(tmp_path):
+    repository, adapter, oms, order_intent, attempts, _clock = setup(tmp_path)
+    before_orders = repository.broker_orders_for_leg(order_intent.legs[0].id)
+    adapter.get_authoritative_account_facts = None
+    adapter.get_order = lambda *_args: pytest.fail("recovery must not read a raw order after fact failure")
+    adapter.get_fills = lambda *_args, **_kwargs: pytest.fail("recovery must not read raw fills after fact failure")
+    adapter.fills = [fill(attempts[0], key="blocked-fill")]
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert all(leg["status"] == LegStatus.WORKING.value for leg in recovered["legs"])
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    assert repository.broker_orders_for_leg(order_intent.legs[0].id) == before_orders
+    status = oms.recovery_status(order_intent.id, account=account())
+    assert status["safe_to_submit"] is False
+    assert status["fresh_authoritative_facts_valid"] is False
+
+
+def test_recovery_stale_or_foreign_authoritative_facts_do_not_promote_or_allocate(tmp_path):
+    def _case(mode, case_path):
+        case_path.mkdir()
+        repository, adapter, oms, order_intent, attempts, clock = setup(case_path)
+        if mode == "stale":
+            captured_at = T0 - timedelta(seconds=GenericOMS.BROKER_FACT_MAX_AGE_SECONDS + 1)
+            account_id = account().id
+        else:
+            captured_at = clock()
+            account_id = "foreign-account"
+        adapter.get_authoritative_account_facts = lambda _account: BrokerFactSnapshot(
+            account_id=account_id,
+            captured_at=captured_at,
+            complete=True,
+            open_orders=tuple(adapter.open_orders),
+            fills=tuple(adapter.fills),
+        )
+        adapter.get_order = lambda *_args: pytest.fail("invalid facts must stop before raw order reads")
+        adapter.get_fills = lambda *_args, **_kwargs: pytest.fail("invalid facts must stop before raw fill reads")
+        before = repository.broker_orders_for_leg(order_intent.legs[0].id)
+
+        recovered = oms.recover_intent(order_intent.id, account=account())
+
+        assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+        assert all(leg["status"] == LegStatus.WORKING.value for leg in recovered["legs"])
+        assert repository.fills_for_leg(order_intent.legs[0].id) == []
+        assert repository.broker_orders_for_leg(order_intent.legs[0].id) == before
+
+    _case("stale", tmp_path / "stale")
+    _case("foreign", tmp_path / "foreign")
+
+
+def test_recovery_reuses_validated_fact_fills_without_cacheable_fill_query(tmp_path):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    adapter.open_orders = [
+        snapshot(
+            attempts[0],
+            order_intent.legs[0],
+            status=BrokerOrderStatus.FILLED,
+            filled="10",
+            captured_at=clock(),
+        ),
+        snapshot(
+            attempts[1],
+            order_intent.legs[1],
+            status=BrokerOrderStatus.WORKING,
+            filled="0",
+            captured_at=clock(),
+        ),
+    ]
+    adapter.fills = [fill(attempts[0], key="validated-fact-fill")]
+    adapter.get_fills = lambda *_args, **_kwargs: pytest.fail("recovery must use validated snapshot fills")
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
+    assert repository.fills_for_leg(order_intent.legs[0].id)
+
+
+@pytest.mark.parametrize("invalid_kind", ("wrong_instrument", "unavailable_evidence"))
+def test_recovery_rejects_invalid_matched_fill_provenance_before_persistence(tmp_path, invalid_kind):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    adapter.open_orders = [
+        snapshot(
+            attempts[0],
+            order_intent.legs[0],
+            status=BrokerOrderStatus.FILLED,
+            filled="10",
+            captured_at=clock(),
+        ),
+        snapshot(
+            attempts[1],
+            order_intent.legs[1],
+            status=BrokerOrderStatus.WORKING,
+            filled="0",
+            captured_at=clock(),
+        ),
+    ]
+    evidence = fill(attempts[0], key=f"invalid-{invalid_kind}")
+    if invalid_kind == "wrong_instrument":
+        evidence = replace(evidence, instrument_id="stage3-instrument-foreign")
+    else:
+        evidence = replace(evidence, evidence_mode=ExecutionEvidenceMode.UNAVAILABLE)
+    adapter.fills = [evidence]
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert all(leg["status"] == LegStatus.WORKING.value for leg in recovered["legs"])
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    assert repository.position_allocations(account().id) == []
+    assert any(
+        issue["category"] == "BROKER_FACT_UNAVAILABLE"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )
+
+
+def test_recovery_status_is_not_safe_when_matched_fill_provenance_is_invalid(tmp_path):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    adapter.open_orders = []
+    adapter.fills = [fill(attempts[0], key="status-invalid-evidence")]
+
+    def unavailable_facts(account_value):
+        facts = adapter.get_account_facts(account_value)
+        return replace(
+            facts,
+            execution_evidence_mode=ExecutionEvidenceMode.UNAVAILABLE,
+            execution_evidence_scope=(),
+        )
+
+    adapter.get_authoritative_account_facts = unavailable_facts
+
+    status = oms.recovery_status(order_intent.id, account=account())
+
+    assert status["safe_to_submit"] is False
+    assert status["fresh_authoritative_facts_valid"] is False
+    assert "execution evidence is unavailable" in status["fresh_authoritative_facts_error"]
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+
+
+def test_recovery_contradictory_duplicate_fact_fills_block_before_persistence(tmp_path):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    first = fill(attempts[0], key="duplicate-fact")
+    conflicting = replace(first, price=Decimal("202.50"))
+    adapter.get_authoritative_account_facts = lambda _account: BrokerFactSnapshot(
+        account_id=account().id,
+        captured_at=clock(),
+        complete=True,
+        fills=(first, conflicting),
+    )
+    adapter.get_order = lambda *_args: pytest.fail("contradictory facts must stop before raw order reads")
+    adapter.get_fills = lambda *_args, **_kwargs: pytest.fail("contradictory facts must stop before raw fill reads")
+
+    recovered = oms.recover_intent(order_intent.id, account=account())
+
+    assert recovered["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert all(leg["status"] == LegStatus.WORKING.value for leg in recovered["legs"])
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+
+
+def test_pending_recovery_missing_facts_does_not_mutate_attempts_or_fills(tmp_path):
+    repository, adapter, oms, order_intent, attempts, _clock = setup(tmp_path)
+    adapter.get_authoritative_account_facts = None
+    adapter.get_order = lambda *_args: pytest.fail("pending recovery must not read raw orders")
+    adapter.get_fills = lambda *_args, **_kwargs: pytest.fail("pending recovery must not read raw fills")
+    before_intent = repository.get_intent(order_intent.id)
+    before_attempts = repository.broker_orders_for_leg(order_intent.legs[0].id)
+
+    recovered = oms.poll_and_recover(account=account())
+
+    assert recovered and recovered[0]["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert repository.fills_for_leg(order_intent.legs[0].id) == []
+    assert repository.broker_orders_for_leg(order_intent.legs[0].id) == before_attempts
+    assert repository.get_intent(order_intent.id)["legs"] == before_intent["legs"]

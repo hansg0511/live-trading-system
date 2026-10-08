@@ -11,8 +11,22 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner, Stage6RunMode
-from src.trading_core.domain import ExecutionEvidenceMode, PositionSnapshot
-from src.trading_core.ports import BrokerFactSnapshot, BrokerHistoricalOrderFacts
+from src.trading_core.domain import (
+    Book,
+    BrokerOrderSnapshot,
+    BrokerOrderStatus,
+    ExecutionEvidenceMode,
+    IntentAction,
+    IntentStatus,
+    PositionSnapshot,
+    Side,
+)
+from src.trading_core.ports import (
+    BrokerFactSnapshot,
+    BrokerFill,
+    BrokerHistoricalOrderFacts,
+    BrokerSubmissionResult,
+)
 from src.trading_core.oms import GenericOMS
 
 from scripts.generic_stage6_pilot import main
@@ -40,6 +54,7 @@ from tests.test_generic_stage6_pilot import (
     make_retired_baseline_runner,
     seed_verified_book_exposure,
 )
+import tests.test_generic_stage6_residual_exit as residual_fixtures
 
 
 class CliWorkflowAdapter(DelayedPilotAdapter):
@@ -99,6 +114,13 @@ class CliWorkflowAdapter(DelayedPilotAdapter):
 class HistoricalCliWorkflowAdapter(CliWorkflowAdapter):
     """The same fake, with bounded history for round-trip proof."""
 
+    def __init__(self, *, release_after_order_reads: int = 1) -> None:
+        super().__init__(release_after_order_reads=release_after_order_reads)
+        self.facts = replace(
+            self.facts,
+            execution_evidence_scope=frozenset({"CURRENT_DEALS"}),
+        )
+
     def get_historical_order_facts(self, account, requested_start, requested_end):  # type: ignore[no-untyped-def]
         orders = tuple(
             snapshot
@@ -121,6 +143,177 @@ class HistoricalCliWorkflowAdapter(CliWorkflowAdapter):
             execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
             execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
         )
+
+
+class CliPartialWorkflowAdapter(HistoricalCliWorkflowAdapter):
+    """CLI fake that exposes one exact cancel/requery race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls: list[str] = []
+        self._cancelled: dict[str, BrokerOrderSnapshot] = {}
+
+    def cancel_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
+        external_order_id = str(external_order_id)
+        self.cancel_calls.append(external_order_id)
+        current = next(
+            item for item in self.facts.open_orders
+            if item.external_order_id == external_order_id
+        )
+        cancelled = replace(current, status=BrokerOrderStatus.CANCELLED)
+        self._cancelled[external_order_id] = cancelled
+        self.facts = replace(self.facts, open_orders=())
+        return BrokerSubmissionResult(
+            broker_order_id="cli-cancel-partial-order",
+            accepted=True,
+            status=BrokerOrderStatus.CANCELLED,
+            external_order_id=external_order_id,
+            cumulative_filled_quantity=current.filled_quantity,
+            submitted_quantity=current.quantity,
+            instrument_id=current.instrument_id,
+        )
+
+    def get_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
+        return self._cancelled.get(str(external_order_id)) or super().get_order(account, external_order_id)
+
+
+class CliLateFillCancelAdapter(CliPartialWorkflowAdapter):
+    """Cancellation fake that reports a bounded late fill on re-query."""
+
+    def cancel_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
+        external_order_id = str(external_order_id)
+        self.cancel_calls.append(external_order_id)
+        current = next(
+            item for item in self.facts.open_orders
+            if item.external_order_id == external_order_id
+        )
+        late_quantity = current.filled_quantity + Decimal("0.2")
+        cancelled = replace(
+            current,
+            status=BrokerOrderStatus.CANCELLED,
+            filled_quantity=late_quantity,
+        )
+        self._cancelled[external_order_id] = cancelled
+        self.facts = replace(
+            self.facts,
+            positions=tuple(
+                replace(position, signed_quantity=late_quantity)
+                if position.instrument_id == current.instrument_id
+                else position
+                for position in self.facts.positions
+            ),
+            open_orders=(),
+            fills=tuple(self.facts.fills) + (
+                BrokerFill(
+                    external_order_id=external_order_id,
+                    dedupe_key=f"{external_order_id}-late-fill",
+                    quantity=Decimal("0.2"),
+                    price=Decimal("100"),
+                    filled_at=current.captured_at,
+                    received_at=current.captured_at,
+                    account_id=account.id,
+                    instrument_id=current.instrument_id,
+                ),
+            ),
+        )
+        return BrokerSubmissionResult(
+            broker_order_id="cli-late-fill-cancel-order",
+            accepted=True,
+            status=BrokerOrderStatus.CANCELLED,
+            external_order_id=external_order_id,
+            cumulative_filled_quantity=late_quantity,
+            submitted_quantity=current.quantity,
+            instrument_id=current.instrument_id,
+        )
+
+
+class CliPartialPairWorkflowAdapter(HistoricalCliWorkflowAdapter):
+    """Fake pair provider for the full partial-enter recovery workflow.
+
+    The source pair is seeded with one FILLED leg and one positive partial
+    leg.  The latter remains open until the explicit cancel command.  The
+    adapter retains each terminal order snapshot in bounded history, then
+    releases residual exits through the normal delayed-provider contract.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(release_after_order_reads=1)
+        self.cancel_calls: list[str] = []
+        self._cancelled: dict[str, BrokerOrderSnapshot] = {}
+        self._history_orders: dict[str, BrokerOrderSnapshot] = {}
+
+    def cancel_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
+        external_order_id = str(external_order_id)
+        self.cancel_calls.append(external_order_id)
+        current = next(
+            item for item in self.facts.open_orders
+            if item.external_order_id == external_order_id
+        )
+        cancelled = replace(current, status=BrokerOrderStatus.CANCELLED)
+        self._cancelled[external_order_id] = cancelled
+        self._history_orders[external_order_id] = cancelled
+        self.facts = replace(
+            self.facts,
+            open_orders=tuple(
+                item for item in self.facts.open_orders
+                if item.external_order_id != external_order_id
+            ),
+        )
+        return BrokerSubmissionResult(
+            broker_order_id="cli-cancel-partial-pair-order",
+            accepted=True,
+            status=BrokerOrderStatus.CANCELLED,
+            external_order_id=external_order_id,
+            cumulative_filled_quantity=current.filled_quantity,
+            submitted_quantity=current.quantity,
+            instrument_id=current.instrument_id,
+        )
+
+    def get_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
+        return self._cancelled.get(str(external_order_id)) or super().get_order(account, external_order_id)
+
+    def get_historical_order_facts(self, account, requested_start, requested_end):  # type: ignore[no-untyped-def]
+        orders_by_external = {
+            str(snapshot.external_order_id): snapshot
+            for snapshot in self._filled_orders.values()
+            if snapshot.account_id == account.id
+        }
+        orders_by_external.update(self._history_orders)
+        fills = tuple(
+            fill for fill in self.facts.fills
+            if fill.account_id in (None, account.id)
+        )
+        return BrokerHistoricalOrderFacts(
+            account_id=account.id,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            captured_at=self.facts.captured_at,
+            complete=True,
+            orders=tuple(orders_by_external.values()),
+            fills=fills,
+            execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
+        )
+
+
+class MidCompensationRthAdapter(CliWorkflowAdapter):
+    """Close RTH only after the first compensating leg's admission gate."""
+
+    def __init__(self) -> None:
+        super().__init__(release_after_order_reads=1)
+        self.market_reads = 0
+        self.close_after: int | None = None
+
+    def get_authoritative_market_state(self, symbols):  # type: ignore[no-untyped-def]
+        self.market_reads += 1
+        is_rth = self.close_after is None or self.market_reads <= self.close_after
+        state = "RTH" if is_rth else "CLOSED"
+        return {
+            "market": "US",
+            "captured_at": self.facts.captured_at.isoformat(),
+            "complete": True,
+            "rows": [{"symbol": str(symbol), "market_state": state} for symbol in symbols],
+        }
 
 
 def _install_cli_fake(
@@ -273,6 +466,35 @@ def test_compensating_exit_fresh_rth_gate_passes_without_mutation(tmp_path):
 
     assert gate["preflight_passed"] is True
     assert gate["market_state"]["rth"]["observed"] is True
+    assert adapter.submit_calls == []
+
+
+@pytest.mark.parametrize("unsafe_fact", ("metadata", "fill_identity"))
+def test_compensating_exit_preflight_uses_shared_strict_fact_validation(tmp_path, unsafe_fact):
+    account, sleeves, _repository, adapter, runner = make_runner(tmp_path / unsafe_fact)
+    if unsafe_fact == "metadata":
+        adapter.facts = replace(adapter.facts, metadata={"raw": {"dealt_qty": "1"}})
+    else:
+        first = BrokerFill(
+            external_order_id="provider-order",
+            external_fill_id="provider-fill",
+            dedupe_key="provider-fill",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            filled_at=NOW,
+            received_at=NOW,
+            account_id=account.id,
+        )
+        conflicting = replace(first, price=Decimal("101"))
+        adapter.facts = replace(adapter.facts, fills=(first, conflicting))
+
+    gate = runner.compensating_exit_preflight(make_spec(account, sleeves))
+
+    assert gate["preflight_passed"] is False
+    assert any(
+        ("metadata" in reason or "contradictory duplicate fill identity" in reason)
+        for reason in gate["stop_reasons"]
+    )
     assert adapter.submit_calls == []
 
 
@@ -473,6 +695,837 @@ def test_compensating_duplicate_attempt_flag_is_per_leg():
 
     assert _has_duplicate_attempts_per_leg(normal_pair) is False
     assert _has_duplicate_attempts_per_leg(repeated_attempt) is True
+
+
+@pytest.mark.parametrize("status", ("SUBMITTING", "WORKING", "PARTIALLY_FILLED"))
+def test_cli_order_status_matrix_returns_nonzero_for_nonterminal_attempts(status):
+    """Every order-bearing CLI path reports an unfinished attempt as exit 2."""
+
+    assert stage6_cli._order_submission_exit_code({"statuses": [status]}) == 2
+    assert stage6_cli._order_submission_exit_code({"statuses": [status.lower()]}) == 2
+    assert stage6_cli._order_submission_exit_code({"statuses": ["FILLED", status]}) == 2
+    assert stage6_cli._order_submission_exit_code({"statuses": ["FILLED"]}) == 0
+
+
+def test_cli_partial_enter_residual_exit_recovery_and_resolution(tmp_path, monkeypatch, capsys):
+    """Exercise the residual CLI path with a small fully verified leg.
+
+    The source is a two-leg ENTER: the A leg is the approved 0.4 exposure,
+    while the B leg is durably known never to have been submitted.  The
+    residual exit is submitted once, reports non-terminal WORKING (exit 2),
+    then the normal read-only recovery and compensated-partial resolver close
+    it.  Attempted terminal-zero provider evidence is covered separately by
+    the residual proof test; it is not interchangeable with this resolver
+    shape.
+    """
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "partial-entry.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = HistoricalCliWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    # Keep a non-empty historical proof window while the fake's fresh facts
+    # remain captured at the current runtime instant.
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now - timedelta(seconds=1))
+    source_id, first_instrument, _second_instrument, first_external, _second_external = (
+        residual_fixtures._seed_partial_enter_with_terminal_zero_sibling(
+            repository,
+            config.account,
+            make_sleeves(config.account.id),
+            terminal_zero_proof=True,
+            first_quantity="0.4",
+            first_filled_quantity="0.4",
+            include_terminal_zero_attempt=False,
+        )
+    )
+    residual_fixtures._install_partial_facts(
+        adapter,
+        config.account,
+        first_instrument,
+        first_external,
+        quantity="0.4",
+        dedupe_key=f"{source_id}-deal-a",
+    )
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+    adapter._filled_orders[first_external] = BrokerOrderSnapshot(
+        id="cli-source-filled-snapshot",
+        broker_snapshot_id="cli-source-filled-snapshot",
+        account_id=config.account.id,
+        instrument_id=first_instrument,
+        external_order_id=first_external,
+        side=Side.BUY,
+        quantity=Decimal("0.4"),
+        filled_quantity=Decimal("0.4"),
+        status=BrokerOrderStatus.FILLED,
+        captured_at=runtime_now,
+        order_time=runtime_now,
+    )
+    # Model the source as having passed through the normal Stage 6 admission
+    # boundary before this fixture hands control to the residual CLI.  The
+    # recovery command must not infer provenance for a hand-built intent.
+    fixture_runner = config.build_runner(repository, adapter=adapter, clock=lambda: runtime_now)
+    fixture_runner._record_submission_process_identity(
+        intent_id=source_id,
+        account_id=config.account.id,
+        run_id=config.spec().run_id,
+        mode=Stage6RunMode.SIM_SUBMIT.value,
+    )
+
+    residual_code, residual = _run_cli(
+        capsys,
+        [
+            "residual-exit", "--config", str(config_path),
+            "--source-intent-id", source_id, "--arm-sim",
+            "--external-order", f"{first_instrument}={first_external}",
+            "--confirm", f"ARM STAGE6 SIM RESIDUAL EXIT {source_id}", "--json",
+        ],
+    )
+    assert residual_code == 2, json.dumps(residual, indent=2, sort_keys=True)
+    assert residual.get("broker_contacted") is True, json.dumps(residual, indent=2, sort_keys=True)
+    assert residual["statuses"] == ["WORKING"]
+    residual_id = residual["residual_exit_intent_id"]
+    assert len(adapter.submit_calls) == 1
+
+    original_getpid = stage6_cli.os.getpid
+    monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "partial-residual-recovery-process")
+    recovery_code, recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    monkeypatch.setattr(stage6_cli.os, "getpid", original_getpid)
+    # The source intentionally retains a mixed FILLED/CANCELLED lifecycle
+    # blocker until the explicit proof-backed resolver runs.  Recovery must
+    # not erase that incident merely because the account is already flat.
+    assert recovery_code == 2, json.dumps(recovery, indent=2, sort_keys=True)
+    assert recovery["restart_recovery"]["result"] == "BLOCKED"
+    assert len(adapter.submit_calls) == 1
+    # The source's unresolved mixed-terminal blocker is account-wide, so the
+    # linked residual may remain RECONCILIATION_REQUIRED even after its own
+    # broker leg is observed.  A second read-only recovery releases the fake
+    # broker's delayed fill; it must not submit a duplicate.
+    second_recovery_code, second_recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    assert second_recovery_code == 2, json.dumps(second_recovery, indent=2, sort_keys=True)
+    assert len(adapter.submit_calls) == 1
+    residual_snapshot = repository.get_intent(residual_id)
+    assert residual_snapshot["status"] == "RECONCILIATION_REQUIRED"
+    assert {leg["status"] for leg in residual_snapshot["legs"]} == {"FILLED"}
+
+    resolve_code, resolved = _run_cli(
+        capsys,
+        [
+            "resolve-compensated-partial", "--config", str(config_path),
+            "--intent-id", source_id, "--json",
+        ],
+    )
+    assert resolve_code == 0, json.dumps(
+        {
+            "resolved": resolved,
+            "issues": repository.open_reconciliation_issues(config.account.id),
+            "actions": repository.open_recovery_actions(config.account.id),
+        },
+        indent=2,
+        sort_keys=True,
+        default=str,
+    )
+    assert resolved["status"] == "CANCELLED"
+
+    final_code, final = _run_cli(
+        capsys, ["final-state", "--config", str(config_path), "--json"]
+    )
+    assert final_code == 0, json.dumps(final, indent=2, sort_keys=True)
+    assert final["final"]["flat"] is True
+    assert final["final"]["no_open_orders"] is True
+
+
+def test_cli_partial_enter_cancel_recover_residual_and_resolve(tmp_path, monkeypatch, capsys):
+    """Run the complete supported partial ENTER lifecycle through the CLI.
+
+    The source pair has A fully filled and B filled 0.4 while still working.
+    Only the explicit cancel command may terminate B; the residual command
+    then submits SELL 1 / BUY 0.4, and the normal read-only recovery plus
+    proof-backed resolver closes the source lifecycle without a second
+    attempt on either source leg.
+    """
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "partial-enter-cancel-residual.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliPartialPairWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    sleeves = make_sleeves(config.account.id)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now - timedelta(seconds=1))
+    source_id, first_instrument, second_instrument, first_external, second_external = (
+        residual_fixtures._seed_partial_enter_with_partial_sibling(
+            repository,
+            config.account,
+            sleeves,
+        )
+    )
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+    source_fill_time = runtime_now - timedelta(seconds=1)
+    first_snapshot = BrokerOrderSnapshot(
+        id="cli-partial-pair-filled",
+        broker_snapshot_id="cli-partial-pair-filled",
+        account_id=config.account.id,
+        instrument_id=first_instrument,
+        external_order_id=first_external,
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("1"),
+        status=BrokerOrderStatus.FILLED,
+        captured_at=runtime_now,
+        order_time=runtime_now,
+    )
+    second_snapshot = BrokerOrderSnapshot(
+        id="cli-partial-pair-working",
+        broker_snapshot_id="cli-partial-pair-working",
+        account_id=config.account.id,
+        instrument_id=second_instrument,
+        external_order_id=second_external,
+        side=Side.SELL,
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("0.4"),
+        status=BrokerOrderStatus.PARTIALLY_FILLED,
+        captured_at=runtime_now,
+        order_time=runtime_now,
+    )
+    adapter._filled_orders[first_external] = first_snapshot
+    adapter._history_orders[second_external] = second_snapshot
+    adapter.facts = replace(
+        adapter.facts,
+        captured_at=runtime_now,
+        positions=(
+            PositionSnapshot(
+                id="cli-partial-a-position",
+                broker_snapshot_id="cli-partial-a-facts",
+                account_id=config.account.id,
+                instrument_id=first_instrument,
+                signed_quantity=Decimal("1"),
+                average_price=Decimal("100"),
+                captured_at=runtime_now,
+            ),
+            PositionSnapshot(
+                id="cli-partial-b-position",
+                broker_snapshot_id="cli-partial-b-facts",
+                account_id=config.account.id,
+                instrument_id=second_instrument,
+                signed_quantity=Decimal("-0.4"),
+                average_price=Decimal("100"),
+                captured_at=runtime_now,
+            ),
+        ),
+        open_orders=(second_snapshot,),
+        fills=(
+            BrokerFill(
+                external_order_id=first_external,
+                dedupe_key=f"{source_id}-deal-a",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                filled_at=source_fill_time,
+                received_at=source_fill_time,
+                account_id=config.account.id,
+                evidence_reference=f"{first_external}:{source_id}-deal-a",
+                instrument_id=first_instrument,
+            ),
+            BrokerFill(
+                external_order_id=second_external,
+                dedupe_key=f"{source_id}-deal-b",
+                quantity=Decimal("0.4"),
+                price=Decimal("100"),
+                filled_at=source_fill_time,
+                received_at=source_fill_time,
+                account_id=config.account.id,
+                evidence_reference=f"{second_external}:{source_id}-deal-b",
+                instrument_id=second_instrument,
+            ),
+        ),
+    )
+    # Model a normal Stage 6 source admission so recovery can prove the
+    # separate process identity; no status or fill rows are edited here.
+    fixture_runner = config.build_runner(repository, adapter=adapter, clock=lambda: runtime_now)
+    fixture_runner._record_submission_process_identity(
+        intent_id=source_id,
+        account_id=config.account.id,
+        run_id=config.spec().run_id,
+        mode=Stage6RunMode.SIM_SUBMIT.value,
+    )
+
+    cancel_code, cancel = _run_cli(
+        capsys,
+        [
+            "cancel-known-partial", "--config", str(config_path),
+            "--intent-id", source_id, "--external-order-id", second_external,
+            "--arm-sim", "--confirm",
+            f"ARM STAGE6 SIM CANCEL PARTIAL {source_id} {second_external}", "--json",
+        ],
+    )
+    # Accepted cancellation is not terminal while the known partial remains
+    # in reconciliation; the operator must continue with residual proof.
+    assert cancel_code == 2, json.dumps(cancel, indent=2, sort_keys=True)
+    assert cancel["cancel_status"] == BrokerOrderStatus.CANCELLED.value
+    assert cancel["cancel_count"] == 1
+    assert adapter.cancel_calls == [second_external]
+    assert adapter.submit_calls == []
+    assert adapter.facts.open_orders == ()
+    assert all(
+        isinstance(position.signed_quantity, Decimal)
+        and position.signed_quantity.is_finite()
+        for position in adapter.facts.positions
+    ), repr(adapter.facts.positions)
+
+    residual_code, residual = _run_cli(
+        capsys,
+        [
+            "residual-exit", "--config", str(config_path),
+            "--source-intent-id", source_id, "--arm-sim",
+            "--external-order", f"{first_instrument}={first_external}",
+            "--external-order", f"{second_instrument}={second_external}",
+            "--confirm", f"ARM STAGE6 SIM RESIDUAL EXIT {source_id}", "--json",
+        ],
+    )
+    assert residual_code == 2, json.dumps(residual, indent=2, sort_keys=True)
+    assert residual.get("broker_contacted") is True, json.dumps(residual, indent=2, sort_keys=True)
+    assert residual["statuses"] == ["WORKING", "WORKING"]
+    assert residual["duplicate_attempt"] is False
+    assert len(adapter.submit_calls) == 2
+    residual_id = str(residual["residual_exit_intent_id"])
+    residual_snapshot = repository.get_intent(residual_id)
+    assert residual_snapshot is not None
+    residual_legs = {
+        str(leg["instrument_id"]): (str(leg["side"]), Decimal(str(leg["quantity"])))
+        for leg in residual_snapshot["legs"]
+    }
+    assert residual_legs == {
+        first_instrument: (Side.SELL.value, Decimal("1")),
+        second_instrument: (Side.BUY.value, Decimal("0.4")),
+    }
+
+    original_getpid = stage6_cli.os.getpid
+    monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "partial-pair-recovery-process")
+    recovery_code, recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    monkeypatch.setattr(stage6_cli.os, "getpid", original_getpid)
+    assert recovery_code == 2, json.dumps(recovery, indent=2, sort_keys=True)
+    assert recovery["restart_recovery"]["result"] == "BLOCKED"
+    assert recovery["restart_recovery"]["no_resubmission"] is True
+    assert len(adapter.submit_calls) == 2
+    recovered_residual = repository.get_intent(residual_id)
+    assert recovered_residual["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert {leg["status"] for leg in recovered_residual["legs"]} == {IntentStatus.FILLED.value}
+    assert not adapter.facts.open_orders
+
+    final_code, final = _run_cli(
+        capsys, ["final-state", "--config", str(config_path), "--json"]
+    )
+    assert final_code == 2, json.dumps(final, indent=2, sort_keys=True)
+    assert final["final"]["flat"] is True
+    assert final["final"]["no_open_orders"] is True
+
+    resolve_code, resolved = _run_cli(
+        capsys,
+        [
+            "resolve-compensated-partial", "--config", str(config_path),
+            "--intent-id", source_id, "--json",
+        ],
+    )
+    assert resolve_code == 0, json.dumps(
+        {
+            "resolved": resolved,
+            "issues": repository.open_reconciliation_issues(config.account.id),
+            "actions": repository.open_recovery_actions(config.account.id),
+        },
+        indent=2,
+        sort_keys=True,
+        default=str,
+    )
+    assert resolved["status"] == IntentStatus.CANCELLED.value
+    assert len(adapter.submit_calls) == 2
+
+    final_code, final = _run_cli(
+        capsys, ["final-state", "--config", str(config_path), "--json"]
+    )
+    assert final_code == 0, json.dumps(final, indent=2, sort_keys=True)
+    assert final["final"]["flat"] is True
+    assert final["final"]["no_open_orders"] is True
+
+
+def test_cli_partial_exit_rejected_zero_fill_residual_and_resolution(
+    tmp_path, monkeypatch, capsys
+):
+    """Close one EXIT leg, prove the rejected sibling had no fill, then close only its residual."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "partial-exit-residual.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliPartialPairWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now - timedelta(seconds=1))
+
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    sleeves = make_sleeves(config.account.id)
+    seeded = residual_fixtures._seed_partial_exit_with_terminal_zero_sibling(
+        repository,
+        config.account,
+        sleeves,
+    )
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+
+    def snapshot(external_order_id, instrument_id, side, status, quantity="1", filled_quantity="1"):
+        return BrokerOrderSnapshot(
+            id=f"snapshot-{external_order_id}",
+            broker_snapshot_id=f"snapshot-{external_order_id}",
+            account_id=config.account.id,
+            instrument_id=instrument_id,
+            external_order_id=external_order_id,
+            side=side,
+            quantity=Decimal(quantity),
+            filled_quantity=Decimal(filled_quantity),
+            status=status,
+            captured_at=runtime_now,
+            order_time=runtime_now - timedelta(seconds=1),
+        )
+
+    entry_a, entry_b = seeded["entry_external_ids"]
+    adapter._filled_orders.update({
+        entry_a: snapshot(entry_a, seeded["first_instrument"], Side.BUY, BrokerOrderStatus.FILLED),
+        entry_b: snapshot(entry_b, seeded["second_instrument"], Side.SELL, BrokerOrderStatus.FILLED),
+        seeded["first_external"]: snapshot(
+            seeded["first_external"],
+            seeded["first_instrument"],
+            Side.SELL,
+            BrokerOrderStatus.FILLED,
+        ),
+    })
+    adapter._history_orders[seeded["second_external"]] = snapshot(
+        seeded["second_external"],
+        seeded["second_instrument"],
+        Side.BUY,
+        BrokerOrderStatus.REJECTED,
+        filled_quantity="0",
+    )
+    adapter.facts = replace(
+        adapter.facts,
+        captured_at=runtime_now,
+        positions=(
+            PositionSnapshot(
+                id="partial-exit-msft-position",
+                broker_snapshot_id="partial-exit-facts",
+                account_id=config.account.id,
+                instrument_id=seeded["second_instrument"],
+                signed_quantity=Decimal("-1"),
+                average_price=Decimal("100"),
+                captured_at=runtime_now,
+            ),
+        ),
+        open_orders=(),
+        fills=(
+            BrokerFill(
+                external_order_id=seeded["first_external"],
+                dedupe_key=f"{seeded['source_id']}-deal-a",
+                quantity=Decimal("1"),
+                price=Decimal("101"),
+                filled_at=runtime_now - timedelta(seconds=1),
+                received_at=runtime_now - timedelta(seconds=1),
+                account_id=config.account.id,
+                instrument_id=seeded["first_instrument"],
+            ),
+        ),
+    )
+    # These are normal Stage 6 source attempts; the resolver must not treat the
+    # fixture as a handwritten intent and must retain both source order graphs.
+    fixture_runner = config.build_runner(repository, adapter=adapter, clock=lambda: runtime_now)
+    for intent_id in (seeded["entry_id"], seeded["source_id"]):
+        fixture_runner._record_submission_process_identity(
+            intent_id=intent_id,
+            account_id=config.account.id,
+            run_id=config.spec().run_id,
+            mode=Stage6RunMode.SIM_SUBMIT.value,
+        )
+
+    residual_code, residual = _run_cli(
+        capsys,
+        [
+            "residual-exit", "--config", str(config_path),
+            "--source-intent-id", seeded["source_id"], "--arm-sim",
+            "--confirm", f"ARM STAGE6 SIM RESIDUAL EXIT {seeded['source_id']}", "--json",
+        ],
+    )
+    assert residual_code == 2, json.dumps(residual, indent=2, sort_keys=True)
+    assert residual.get("broker_contacted") is True
+    assert residual["statuses"] == ["WORKING"]
+    residual_id = str(residual["residual_exit_intent_id"])
+    residual_snapshot = repository.get_intent(residual_id)
+    assert residual_snapshot is not None
+    assert [
+        (leg["instrument_id"], leg["side"], Decimal(str(leg["quantity"])))
+        for leg in residual_snapshot["legs"]
+    ] == [(seeded["second_instrument"], Side.BUY.value, Decimal("1"))]
+    assert len(adapter.submit_calls) == 1
+
+    recovery_code, recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    assert recovery_code == 2, json.dumps(recovery, indent=2, sort_keys=True)
+    assert recovery["restart_recovery"]["no_resubmission"] is True
+    assert len(adapter.submit_calls) == 1
+    assert not adapter.facts.open_orders
+
+    resolve_code, resolved = _run_cli(
+        capsys,
+        [
+            "resolve-compensated-partial", "--config", str(config_path),
+            "--intent-id", seeded["source_id"], "--json",
+        ],
+    )
+    assert resolve_code == 0, json.dumps(resolved, indent=2, sort_keys=True)
+    assert resolved["status"] == IntentStatus.CANCELLED.value
+    assert repository.get_intent(seeded["entry_id"])["status"] == IntentStatus.COMPLETED.value
+
+    final_code, final = _run_cli(
+        capsys, ["final-state", "--config", str(config_path), "--json"]
+    )
+    assert final_code == 0, json.dumps(final, indent=2, sort_keys=True)
+    assert final["final"]["flat"] is True
+    assert final["final"]["no_open_orders"] is True
+    assert len(adapter.submit_calls) == 1
+
+
+def test_cli_compensation_rth_closes_after_first_leg_and_remains_recoverable(
+    tmp_path, monkeypatch, capsys
+):
+    """A mid-batch RTH close preserves leg one and never attempts leg two."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "mid-compensation-rth.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    config = Stage6PilotConfig.load(config_path)
+    adapter = MidCompensationRthAdapter()
+    # Let the normal runner stop after Book A, then recover that book fully;
+    # this keeps the account exposure exactly equal to the two-leg source used
+    # by the compensating-exit primitive.
+    adapter.release_after_order_reads = 100
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    entry_code, entry = _run_cli(
+        capsys,
+        [
+            "sim-submit", "--config", str(config_path), "--arm-sim", "--confirm",
+            config.confirmation_phrase(), "--json",
+        ],
+    )
+    assert entry_code == 2, json.dumps(entry, indent=2, sort_keys=True)
+    assert len(adapter.submit_calls) == 2
+
+    adapter.release_after_order_reads = 1
+    original_getpid = stage6_cli.os.getpid
+    monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "mid-comp-entry-recovery-process")
+    entry_recovery_code, entry_recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    monkeypatch.setattr(stage6_cli.os, "getpid", original_getpid)
+    assert entry_recovery_code == 0, json.dumps(entry_recovery, indent=2, sort_keys=True)
+    assert entry_recovery["restart_recovery"]["no_resubmission"] is True
+    assert len(adapter.submit_calls) == 2
+
+    repository = SQLiteTradingRepository(config.state_db)
+    source_intent_id = str(entry["intent_results"][0]["intent_id"])
+    source = repository.get_intent(source_intent_id)
+    assert source is not None
+    assert source["status"] in {IntentStatus.FILLED.value, IntentStatus.COMPLETED.value}
+    expected_external_order_ids = {
+        str(leg["instrument_id"]): str(
+            repository.broker_orders_for_leg(str(leg["id"]))[0]["external_order_id"]
+        )
+        for leg in source["legs"]
+    }
+
+    # The CLI preflight consumes one RTH observation; the first OMS leg gate
+    # consumes the second.  The third observation closes RTH before leg two.
+    adapter.market_reads = 0
+    adapter.close_after = 2
+    comp_args = [
+        "compensating-exit", "--config", str(config_path),
+        "--source-intent-id", source_intent_id, "--arm-sim",
+        "--confirm", f"ARM STAGE6 SIM COMPENSATING EXIT {source_intent_id}",
+    ]
+    for instrument_id, external_id in expected_external_order_ids.items():
+        comp_args.extend(["--external-order", f"{instrument_id}={external_id}"])
+    comp_args.append("--json")
+    comp_code, comp = _run_cli(capsys, comp_args)
+    assert comp_code == 2, json.dumps(comp, indent=2, sort_keys=True)
+    assert adapter.market_reads >= 3
+    assert comp["broker_contacted"] is True
+    assert len(adapter.submit_calls) == 3
+
+    exit_intent_id = str(comp["compensating_exit_intent_id"])
+    exit_snapshot = repository.get_intent(exit_intent_id)
+    assert exit_snapshot is not None
+    attempts_by_leg = [
+        repository.broker_orders_for_leg(str(leg["id"]))
+        for leg in exit_snapshot["legs"]
+    ]
+    assert sorted(len(attempts) for attempts in attempts_by_leg) == [0, 1]
+    assert any(str(status).upper() in {"WORKING", "RECONCILIATION_REQUIRED"} for status in comp["statuses"])
+
+    original_getpid = stage6_cli.os.getpid
+    monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "mid-comp-recovery-process")
+    recovery_code, recovery = _run_cli(
+        capsys, ["recover", "--config", str(config_path), "--json"]
+    )
+    monkeypatch.setattr(stage6_cli.os, "getpid", original_getpid)
+    assert recovery_code == 2, json.dumps(recovery, indent=2, sort_keys=True)
+    assert recovery["restart_recovery"]["no_resubmission"] is True
+    recovered_exit = repository.get_intent(exit_intent_id)
+    assert recovered_exit is not None
+    assert sorted(
+        len(repository.broker_orders_for_leg(str(leg["id"])))
+        for leg in recovered_exit["legs"]
+    ) == [0, 1]
+    assert len(adapter.submit_calls) == 3
+
+def test_cli_cancel_known_partial_is_scoped_and_never_submits_residual_duplicate(
+    tmp_path, monkeypatch, capsys
+):
+    """The explicit cancel command performs one cancel, then leaves residual proof to its own CLI."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "cancel-partial-entry.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliPartialWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    source, _first_leg_id, first_external = (
+        residual_fixtures._seed_partial_source(
+            repository,
+            config.account,
+            action=IntentAction.ENTER,
+            source_id="cli-cancel-partial",
+            instrument_id="pilot-a-1",
+            quantity="1",
+            filled_quantity="0.4",
+        )
+    )
+    source_id = source.id
+    first_instrument = "pilot-a-1"
+    adapter.facts = replace(
+        adapter.facts,
+        positions=(
+            PositionSnapshot(
+                id="cli-cancel-position",
+                broker_snapshot_id="cli-cancel-snapshot",
+                account_id=config.account.id,
+                instrument_id=first_instrument,
+                signed_quantity=Decimal("0.4"),
+                average_price=Decimal("100"),
+                captured_at=runtime_now,
+            ),
+        ),
+        open_orders=(
+            BrokerOrderSnapshot(
+                id="cli-cancel-open-snapshot",
+                broker_snapshot_id="cli-cancel-open-snapshot",
+                account_id=config.account.id,
+                instrument_id=first_instrument,
+                external_order_id=first_external,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0.4"),
+                status=BrokerOrderStatus.PARTIALLY_FILLED,
+                captured_at=runtime_now,
+                order_time=runtime_now,
+            ),
+        ),
+        fills=(
+            BrokerFill(
+                external_order_id=first_external,
+                dedupe_key="cli-cancel-fill",
+                quantity=Decimal("0.4"),
+                price=Decimal("100"),
+                filled_at=runtime_now,
+                received_at=runtime_now,
+                account_id=config.account.id,
+                instrument_id=first_instrument,
+            ),
+        ),
+    )
+    code, payload = _run_cli(
+        capsys,
+        [
+            "cancel-known-partial", "--config", str(config_path),
+            "--intent-id", source_id, "--external-order-id", first_external,
+            "--arm-sim", "--confirm",
+            f"ARM STAGE6 SIM CANCEL PARTIAL {source_id} {first_external}", "--json",
+        ],
+    )
+    # A positive partial fill remains unresolved after cancellation.
+    assert code == 2, json.dumps(payload, indent=2, sort_keys=True)
+    assert payload["cancel_count"] == 1
+    assert adapter.cancel_calls == [first_external]
+    assert adapter.submit_calls == []
+    assert repository.get_intent(source_id)["status"] == "RECONCILIATION_REQUIRED"
+
+
+def test_cli_cancel_known_partial_late_fill_returns_reconciliation_code(
+    tmp_path, monkeypatch, capsys
+):
+    """An accepted cancel followed by a provider late fill is not success."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "cancel-late-fill.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliLateFillCancelAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    source, _leg_id, external_id = residual_fixtures._seed_partial_source(
+        repository,
+        config.account,
+        action=IntentAction.ENTER,
+        source_id="cli-cancel-late-fill",
+        instrument_id="pilot-a-1",
+        quantity="1",
+        filled_quantity="0.4",
+    )
+    adapter.facts = replace(
+        adapter.facts,
+        captured_at=runtime_now,
+        positions=(
+            PositionSnapshot(
+                id="cli-late-fill-position",
+                broker_snapshot_id="cli-late-fill-snapshot",
+                account_id=config.account.id,
+                instrument_id="pilot-a-1",
+                signed_quantity=Decimal("0.4"),
+                average_price=Decimal("100"),
+                captured_at=runtime_now,
+            ),
+        ),
+        open_orders=(
+            BrokerOrderSnapshot(
+                id="cli-late-fill-open-snapshot",
+                broker_snapshot_id="cli-late-fill-open-snapshot",
+                account_id=config.account.id,
+                instrument_id="pilot-a-1",
+                external_order_id=external_id,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0.4"),
+                status=BrokerOrderStatus.PARTIALLY_FILLED,
+                captured_at=runtime_now,
+                order_time=runtime_now,
+            ),
+        ),
+        fills=(
+            BrokerFill(
+                external_order_id=external_id,
+                dedupe_key="cli-late-fill-initial",
+                quantity=Decimal("0.4"),
+                price=Decimal("100"),
+                filled_at=runtime_now,
+                received_at=runtime_now,
+                account_id=config.account.id,
+                instrument_id="pilot-a-1",
+            ),
+        ),
+    )
+
+    code, payload = _run_cli(
+        capsys,
+        [
+            "cancel-known-partial", "--config", str(config_path),
+            "--intent-id", source.id, "--external-order-id", external_id,
+            "--arm-sim", "--confirm",
+            f"ARM STAGE6 SIM CANCEL PARTIAL {source.id} {external_id}", "--json",
+        ],
+    )
+
+    assert code == 2, json.dumps(payload, indent=2, sort_keys=True)
+    assert payload["cancel_status"] == BrokerOrderStatus.CANCELLED.value
+    assert payload["cancel_count"] == 1
+    assert payload["terminal_success"] is False
+    assert payload["recovered"]["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert adapter.cancel_calls == [external_id]
+    assert adapter.submit_calls == []
+
+
+@pytest.mark.parametrize("command", ("resolve-compensated-partial", "resolve-roundtrip", "compensating-exit", "residual-exit", "cancel-known-partial"))
+def test_cli_recovery_scope_rejects_foreign_intent_before_adapter_connect(
+    tmp_path, monkeypatch, capsys, command
+):
+    """Foreign same-account rows are rejected before any connected path."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / f"foreign-scope-{command}.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliPartialWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    source, _leg_id, external_id = residual_fixtures._seed_partial_source(
+        repository,
+        config.account,
+        action=IntentAction.ENTER,
+        source_id=f"foreign-scope-{command}",
+        instrument_id="pilot-a-1",
+        quantity="1",
+        filled_quantity="0.4",
+    )
+    repository.save_book(Book(id="foreign-scope-book", name="Foreign", created_at=runtime_now, updated_at=runtime_now))
+    with repository.transaction() as connection:
+        connection.execute(
+            "UPDATE core_order_intents SET book_id = ? WHERE id = ?",
+            ("foreign-scope-book", source.id),
+        )
+
+    args = [command, "--config", str(config_path)]
+    if command == "resolve-compensated-partial":
+        args += ["--intent-id", source.id]
+    elif command == "resolve-roundtrip":
+        args += ["--entry-intent-id", source.id, "--exit-intent-id", source.id]
+    elif command in {"compensating-exit", "residual-exit"}:
+        kind = "COMPENSATING" if command == "compensating-exit" else "RESIDUAL"
+        args += [
+            "--source-intent-id", source.id,
+            "--external-order", f"pilot-a-1={external_id}",
+            "--arm-sim", "--confirm", f"ARM STAGE6 SIM {kind} EXIT {source.id}",
+        ]
+    else:
+        args += [
+            "--intent-id", source.id, "--external-order-id", external_id,
+            "--arm-sim", "--confirm",
+            f"ARM STAGE6 SIM CANCEL PARTIAL {source.id} {external_id}",
+        ]
+    args.append("--json")
+
+    code, payload = _run_cli(capsys, args)
+
+    assert code == 2, json.dumps(payload, indent=2, sort_keys=True)
+    assert "another book" in str(payload.get("error", ""))
+    assert adapter.connected == 0
+    assert adapter.cancel_calls == []
+    assert adapter.submit_calls == []
 
 
 @pytest.mark.parametrize("variant", ("mismatch", "unknown", "net_zero", "missing"))
@@ -1003,8 +2056,12 @@ def test_cli_delayed_first_book_never_dispatches_second_and_cannot_finalize(
             "--confirm", f"ARM STAGE6 SIM COMPENSATING EXIT {source_intent_id}", "--json",
         ],
     )
-    assert compensating_code == 0, json.dumps(compensating, indent=2, sort_keys=True)
+    # Submission is durable, but the fake broker keeps both legs WORKING
+    # until the separate recovery read.  The CLI must therefore report a
+    # non-terminal result (exit 2), not claim compensating success.
+    assert compensating_code == 2, json.dumps(compensating, indent=2, sort_keys=True)
     assert compensating["broker_contacted"] is True
+    assert set(compensating["statuses"]) == {"WORKING"}
     exit_intent_id = compensating["compensating_exit_intent_id"]
     assert exit_intent_id
     assert compensating["broker_submission_count"] == 2

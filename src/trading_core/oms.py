@@ -113,6 +113,11 @@ class GenericOMS:
         # trigger a second position query merely to populate an error action.
         self._last_observed_positions: dict[str, str] = {}
         self._last_broker_read_retryable = False
+        # A recovery cycle may only use the one strict, fresh account-fact
+        # snapshot validated at its boundary.  Keep it private and scoped to
+        # the current call so nested recovery helpers cannot fall back to a
+        # cacheable position/fill view after the safety gate has passed.
+        self._recovery_fact_context: dict[str, object] | None = None
 
     def _now(self) -> datetime:
         now = self.clock()
@@ -1046,27 +1051,23 @@ class GenericOMS:
                     "price": fill_price,
                     "side": side,
                     "order": order,
+                    "attempt": order,
+                    "fill": fill,
                 }
             )
         if set(expected_by_instrument) != {str(row["instrument_id"]) for row in verified_rows}:
             raise OMSExecutionError("external-order mapping contains an unrelated instrument")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise OMSExecutionError("adapter lacks authoritative account facts for compensation")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError("fresh broker facts failed before compensating exit") from exc
-        if facts.account_id != account.id or not facts.complete or facts.error:
-            raise OMSExecutionError("fresh broker facts are incomplete or account-mismatched")
-        if facts.open_orders:
-            raise OMSExecutionError("compensating exit requires no broker open orders")
-        normalized_positions, position_blockers = self._dedupe_account_position_facts(
-            facts.positions
+        facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            require_no_open_orders=True,
         )
-        if position_blockers:
-            raise OMSExecutionError("fresh broker positions contain contradictory duplicate rows")
+        self._require_usable_execution_evidence(
+            account,
+            facts,
+            source="compensating exit",
+        )
         observed: dict[str, Decimal] = {}
         for position in normalized_positions:
             quantity = Decimal(str(position.signed_quantity))
@@ -1078,19 +1079,12 @@ class GenericOMS:
             raise OMSExecutionError(
                 f"broker positions do not exactly match verified source exposure: {observed!r}"
             )
-        fact_fills = {str(fill.external_order_id): fill for fill in facts.fills}
-        for row in verified_rows:
-            fact_fill = fact_fills.get(str(row["external_order_id"]))
-            if fact_fill is None:
-                raise OMSExecutionError(
-                    f"fresh broker facts lack source fill {row['external_order_id']}"
-                )
-            if (
-                fact_fill.account_id not in {None, account.id}
-                or fact_fill.instrument_id not in {None, str(row["instrument_id"])}
-                or Decimal(str(fact_fill.quantity)) != row["quantity"]
-            ):
-                raise OMSExecutionError("fresh broker fill provenance differs from source evidence")
+        self._validate_exact_selected_fill_facts(
+            account=account,
+            facts=facts,
+            expected_rows=verified_rows,
+            source="compensating exit",
+        )
         now = self._now()
         digest_material = "|".join(
             [account.id, source_id]
@@ -1313,16 +1307,33 @@ class GenericOMS:
             requested_signed[instrument_id] = signed_factor * quantity
             attempts = self.repository.broker_orders_for_leg(str(leg.get("id")))
             if cumulative == 0:
-                # A planned sibling is acceptable for a partial source.  Any
-                # attempted zero-fill row is ambiguous and cannot be netted.
-                if attempts or str(leg.get("status")) not in {
+                # A planned sibling is acceptable for a partial source.  An
+                # attempted sibling is also acceptable only when its durable
+                # broker evidence proves a terminal zero-fill outcome.  A
+                # merely terminal local row is not enough: a late fill can
+                # otherwise be hidden by the residual proof.
+                if str(leg.get("status")) not in {
                     LegStatus.PLANNED.value,
                     LegStatus.REJECTED.value,
                     LegStatus.CANCELLED.value,
+                    LegStatus.FAILED.value,
+                    LegStatus.RECONCILIATION_REQUIRED.value,
                 }:
                     raise OMSExecutionError(
                         f"source leg {leg.get('id')} has no-fill or ambiguous submission evidence"
                     )
+                if len(attempts) > 1:
+                    raise OMSExecutionError(
+                        f"source leg {leg.get('id')} has unsupported attempt count {len(attempts)}"
+                    )
+                if attempts:
+                    attempt = attempts[0]
+                    no_submit = self._is_durable_no_submit_rejection(attempt, leg, ())
+                    terminal_zero = self._attempt_has_terminal_zero_fill_evidence(attempt, leg)
+                    if not (no_submit or terminal_zero):
+                        raise OMSExecutionError(
+                            f"source leg {leg.get('id')} has no-fill or ambiguous submission evidence"
+                        )
                 continue
             if str(leg.get("status")) not in {
                 LegStatus.PARTIALLY_FILLED.value,
@@ -1387,6 +1398,7 @@ class GenericOMS:
                         "fill_identity": fill_identity,
                         "side": side,
                         "attempt": order,
+                        "fill": fill,
                     }
                 )
             if fill_total != cumulative:
@@ -1429,36 +1441,29 @@ class GenericOMS:
         if not expected_positions:
             raise OMSExecutionError("source does not leave a residual exposure")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise OMSExecutionError("adapter lacks authoritative account facts for residual compensation")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError("fresh broker facts failed before residual exit") from exc
-        if not isinstance(facts, BrokerFactSnapshot):
-            raise OMSExecutionError("authoritative account facts have invalid type")
-        if facts.account_id != account.id or not facts.complete or facts.error:
-            raise OMSExecutionError("fresh broker facts are incomplete or account-mismatched")
-        captured_at = self._parse_timestamp(facts.captured_at)
-        now = self._now()
-        if captured_at is None or captured_at > now + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
-            raise OMSExecutionError("fresh broker facts timestamp is invalid or in the future")
-        if (now - captured_at).total_seconds() > self.BROKER_FACT_MAX_AGE_SECONDS:
-            raise OMSExecutionError("fresh broker facts are stale")
-        if facts.open_orders:
-            raise OMSExecutionError("residual exit requires no broker open orders")
-        _, duplicate_order_blockers = self._dedupe_account_broker_order_facts(facts.open_orders)
-        if duplicate_order_blockers:
-            raise OMSExecutionError("fresh broker orders contain contradictory duplicate rows")
-        normalized_positions, duplicate_position_blockers = self._dedupe_account_position_facts(facts.positions)
-        if duplicate_position_blockers:
-            raise OMSExecutionError("fresh broker positions contain contradictory duplicate rows")
+        facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            require_no_open_orders=True,
+        )
+        self._require_usable_execution_evidence(
+            account,
+            facts,
+            source="residual exit",
+        )
         observed: dict[str, Decimal] = {}
         for position in normalized_positions:
             if position.account_id != account.id or self._account_alias_mismatches(account, metadata=position.metadata):
                 raise OMSExecutionError("fresh broker position account provenance mismatch")
-            quantity = decimal(position.signed_quantity, "fresh broker position quantity")
+            # Account positions are signed: a source SELL leg is a negative
+            # quantity.  Use the strict finite-number contract here without
+            # applying the positive-only order/fill quantity rule.
+            try:
+                quantity = Decimal(str(position.signed_quantity))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError("fresh broker position quantity is invalid") from exc
+            if not quantity.is_finite():
+                raise OMSExecutionError("fresh broker position quantity is invalid")
             if quantity != 0:
                 observed[position.instrument_id] = observed.get(position.instrument_id, Decimal("0")) + quantity
         if observed != expected_positions:
@@ -1471,41 +1476,98 @@ class GenericOMS:
         # Fresh fills must prove every durable source fill and may not contain
         # an account fill with no durable owner.  Duplicate identity is never
         # netted, even when quantities happen to sum to the expected amount.
-        fresh_by_external: dict[str, list[BrokerFill]] = {}
-        seen_fresh_fill_ids: set[tuple[str, str]] = set()
-        for broker_fill in facts.fills:
-            if broker_fill.account_id not in (None, account.id):
-                raise OMSExecutionError("fresh broker facts contain a foreign-account fill")
-            aliases = self._account_alias_mismatches(account, metadata=broker_fill.metadata)
-            if aliases:
-                raise OMSExecutionError("fresh broker facts contain foreign fill aliases")
-            identity = (
-                str(broker_fill.external_order_id),
-                str(broker_fill.external_fill_id or broker_fill.dedupe_key),
+        # A source leg that was attempted and durably proven terminal with
+        # zero fill is still an execution claim.  A later provider fill for
+        # that exact external order is therefore contradictory even when the
+        # current position snapshot has not reflected it yet.  Do not let a
+        # delayed/history-only fill disappear behind the zero-fill residual
+        # proof.
+        terminal_zero_proofs: dict[str, tuple[Mapping[str, object], Mapping[str, object]]] = {}
+        for leg in source.get("legs", ()):
+            for attempt in self.repository.broker_orders_for_leg(str(leg.get("id"))):
+                external_id = str(attempt.get("external_order_id") or "").strip()
+                if (
+                    external_id
+                    and Decimal(str(leg.get("cumulative_filled_quantity", "0"))) == 0
+                    and self._attempt_has_terminal_zero_fill_evidence(attempt, leg)
+                ):
+                    terminal_zero_proofs[external_id] = (leg, attempt)
+        terminal_zero_external_ids = set(terminal_zero_proofs)
+        if terminal_zero_proofs:
+            source_created_at = self._parse_timestamp(source.get("created_at"))
+            if source_created_at is None:
+                raise OMSExecutionError("residual source has no valid creation timestamp for history proof")
+            history_end = self._now()
+            if history_end <= source_created_at:
+                history_end = source_created_at + timedelta(microseconds=1)
+            history = self._strict_historical_order_facts(
+                account,
+                requested_start=source_created_at,
+                requested_end=history_end,
             )
-            if identity in seen_fresh_fill_ids:
-                raise OMSExecutionError("fresh broker facts contain duplicate fill identity")
-            seen_fresh_fill_ids.add(identity)
-            if broker_fill.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not broker_fill.evidence_reference:
-                raise OMSExecutionError("fresh broker fill lacks execution provenance")
-            if not self.repository.broker_orders_for_external_order_id(broker_fill.external_order_id):
-                raise OMSExecutionError("fresh broker facts contain an unattributed fill")
-            if broker_fill.instrument_id is not None:
-                durable_instrument = next(
-                    (str(row["instrument_id"]) for row in verified_rows if str(row["external_order_id"]) == broker_fill.external_order_id),
-                    None,
+            history_by_external: dict[str, BrokerOrderSnapshot] = {}
+            for snapshot in history.orders:
+                if snapshot.account_id != account.id:
+                    raise OMSExecutionError("historical order facts contain a foreign account row")
+                aliases = self._account_alias_mismatches(
+                    account,
+                    account_id=snapshot.account_id,
+                    metadata=snapshot.metadata,
                 )
-                if durable_instrument is not None and broker_fill.instrument_id != durable_instrument:
-                    raise OMSExecutionError("fresh broker fill instrument provenance mismatch")
-            fresh_by_external.setdefault(str(broker_fill.external_order_id), []).append(broker_fill)
-        for instrument_id in filled_instruments:
-            external_order_id = expected_by_instrument[instrument_id]
-            durable_rows = [row for row in verified_rows if row["external_order_id"] == external_order_id]
-            fresh_rows = fresh_by_external.get(external_order_id, [])
-            if not fresh_rows:
-                raise OMSExecutionError(f"fresh broker facts lack source fill {external_order_id}")
-            if sum((row.quantity for row in fresh_rows), Decimal("0")) != sum((row["quantity"] for row in durable_rows), Decimal("0")):
-                raise OMSExecutionError(f"fresh broker fill quantity differs for {external_order_id}")
+                if aliases:
+                    raise OMSExecutionError(
+                        f"historical order {snapshot.external_order_id} has foreign account aliases: {aliases}"
+                    )
+                external_id = str(snapshot.external_order_id)
+                if external_id in history_by_external:
+                    raise OMSExecutionError("historical order facts contain duplicate order identities")
+                history_by_external[external_id] = snapshot
+            for external_id, (zero_leg, zero_attempt) in terminal_zero_proofs.items():
+                snapshot = history_by_external.get(external_id)
+                if snapshot is None:
+                    raise OMSExecutionError(
+                        f"historical order facts lack terminal zero-fill proof for {external_id}"
+                    )
+                submitted = Decimal(str(zero_attempt.get("submitted_quantity")))
+                if (
+                    snapshot.account_id != account.id
+                    or snapshot.instrument_id != str(zero_leg.get("instrument_id"))
+                    or snapshot.side.value != str(zero_leg.get("side"))
+                    or snapshot.quantity != submitted
+                    or snapshot.filled_quantity != 0
+                    or snapshot.status
+                    not in {
+                        BrokerOrderStatus.CANCELLED,
+                        BrokerOrderStatus.REJECTED,
+                        BrokerOrderStatus.FAILED,
+                    }
+                ):
+                    raise OMSExecutionError(
+                        f"historical order {external_id} contradicts terminal zero-fill proof"
+                    )
+                submitted_at = self._parse_timestamp(zero_attempt.get("submitted_at"))
+                observed_at = snapshot.order_time or snapshot.captured_at
+                if submitted_at is not None and observed_at < submitted_at - timedelta(
+                    seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS
+                ):
+                    raise OMSExecutionError(
+                        f"historical order {external_id} predates durable submission"
+                    )
+                late_fills = [
+                    fill
+                    for fill in history.fills
+                    if str(fill.external_order_id) == external_id
+                ]
+                if late_fills:
+                    raise OMSExecutionError(
+                        f"historical order facts contain a late fill for a durably proven zero-fill order {external_id}"
+                    )
+        self._validate_exact_selected_fill_facts(
+            account=account,
+            facts=facts,
+            expected_rows=verified_rows,
+            source="residual exit",
+        )
 
         digest_material = [account.id, str(source.get("book_id")), str(source.get("strategy_id")), source_id]
         digest_material.extend(
@@ -1702,60 +1764,21 @@ class GenericOMS:
             if not ((entry_side == Side.BUY.value and exit_side == Side.SELL.value) or (entry_side == Side.SELL.value and exit_side == Side.BUY.value)):
                 raise OMSExecutionError("round-trip exit side does not offset entry side")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        history_getter = getattr(self.adapter, "get_historical_order_facts", None)
-        if not callable(getter) or not callable(history_getter):
-            raise OMSExecutionError("fresh account and historical broker facts are required")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError(f"authoritative account facts unavailable: {exc}") from exc
-        if not isinstance(facts, BrokerFactSnapshot) or facts.account_id != account.id or not facts.complete or facts.error:
-            raise OMSExecutionError("authoritative account facts are incomplete or account-mismatched")
-        observation_time = self._now()
-        captured_at = parse_time(facts.captured_at, "account facts captured_at")
-        if captured_at > observation_time + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS) or (observation_time - captured_at).total_seconds() > 900:
-            raise OMSExecutionError("authoritative account facts are stale")
-        if facts.positions or facts.open_orders:
-            raise OMSExecutionError("round-trip account is not flat or has open orders")
-        expected_external_ids = {
-            str(row["external_order_id"])
-            for row in (*entry_rows, *exit_rows)
-        }
-        fact_fills = {str(fill.external_order_id): fill for fill in facts.fills}
-        for row in (*entry_rows, *exit_rows):
-            fill = fact_fills.get(str(row["external_order_id"]))
-            if fill is None or fill.account_id not in (None, account.id) or fill.instrument_id not in (None, str(row["leg"]["instrument_id"])) or fill.quantity != row["quantity"]:
-                raise OMSExecutionError(f"fresh facts lack exact fill {row['external_order_id']}")
-
         start = min(
             parse_time(entry.get("created_at"), "entry created_at"),
             parse_time(exit_intent.get("created_at"), "exit created_at"),
         )
-        requested_end = self._now()
-        try:
-            history = history_getter(account, start, requested_end)
-        except Exception as exc:
-            raise OMSExecutionError(f"historical order facts unavailable: {exc}") from exc
-        if not isinstance(history, BrokerHistoricalOrderFacts) or history.account_id != account.id or not history.complete or history.error:
-            raise OMSExecutionError("historical order facts are incomplete or account-mismatched")
-        if history.requested_start > start or history.requested_end < requested_end or "HISTORICAL_ORDER_SNAPSHOTS" not in history.execution_evidence_scope or history.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
-            raise OMSExecutionError("historical order facts do not cover the complete round-trip window")
-        history_by_external = {str(order.external_order_id): order for order in history.orders}
-        if set(history_by_external).intersection(expected_external_ids) != expected_external_ids:
-            raise OMSExecutionError("historical facts do not contain every round-trip order")
-        for row in (*entry_rows, *exit_rows):
-            order = history_by_external[str(row["external_order_id"])]
-            leg = row["leg"]
-            if (
-                order.account_id != account.id
-                or order.instrument_id != str(leg["instrument_id"])
-                or order.side.value != str(leg["side"])
-                or order.quantity != row["quantity"]
-                or order.filled_quantity != row["quantity"]
-                or order.status is not BrokerOrderStatus.FILLED
-            ):
-                raise OMSExecutionError(f"historical order {row['external_order_id']} conflicts with durable fill")
+        observation_time = self._now()
+        expected_external_ids = {
+            str(row["external_order_id"])
+            for row in (*entry_rows, *exit_rows)
+        }
+        facts, history = self._strict_roundtrip_broker_evidence(
+            account,
+            expected_rows=(*entry_rows, *exit_rows),
+            requested_start=start,
+            requested_end=observation_time,
+        )
 
         closure = {
             "version": 1,
@@ -1774,22 +1797,19 @@ class GenericOMS:
                 "evidence_mode": history.execution_evidence_mode.value,
             },
         }
-        self.repository.mark_verified_roundtrip_intents(
-            (entry_intent_id, exit_intent_id),
-            closure_metadata=closure,
-            now=observation_time,
-            _resolution_capability=self.repository._resolution_capability(),
-        )
-
         resolved_issue_keys: list[str] = []
+        expected_intent_ids = {str(entry_intent_id), str(exit_intent_id)}
         for issue in self.repository.open_reconciliation_issues(account.id):
             details = self._issue_details(issue)
             category = str(issue.get("category", ""))
             external_id = str(details.get("external_order_id", ""))
+            issue_intent_id = str(issue.get("intent_id") or details.get("intent_id") or "").strip()
+            if issue_intent_id not in expected_intent_ids:
+                continue
             if category == "SIBLING_INTENT_BROKER_FILL_UNMATCHED" and external_id in expected_external_ids:
                 if self._resolve_reconciliation_issue(account.id, str(issue["issue_key"]), resolved_at=observation_time):
                     resolved_issue_keys.append(str(issue["issue_key"]))
-            elif category == "BROKER_QUERY_FAILED" and str(issue.get("entity_key", "")).endswith(":positions"):
+            elif category == "BROKER_QUERY_FAILED" and str(issue.get("entity_key", "")) == f"{account.id}:positions":
                 if self._resolve_reconciliation_issue(account.id, str(issue["issue_key"]), resolved_at=observation_time):
                     resolved_issue_keys.append(str(issue["issue_key"]))
             elif category == "BROKER_FACT_GATE_BLOCKED":
@@ -1865,6 +1885,9 @@ class GenericOMS:
 
         for action in self.repository.open_recovery_actions(account.id):
             action_key = str(action.get("action_key", ""))
+            action_intent_id = str(action.get("intent_id") or "").strip()
+            if action_intent_id not in expected_intent_ids:
+                continue
             if action_key in expected_fill_keys or action_key == f"POLL_ERROR:{account.id}:positions":
                 if self._resolve_recovery_action(account.id, str(action.get("intent_id")), action_key, resolved_at=observation_time):
                     resolved_action_keys.append(action_key)
@@ -1876,6 +1899,14 @@ class GenericOMS:
                     resolved_at=observation_time,
                 ):
                     resolved_action_keys.append(action_key)
+        if self.repository.open_reconciliation_issues(account.id) or self.repository.open_recovery_actions(account.id):
+            raise OMSExecutionError("cannot close round-trip while reconciliation blockers remain open")
+        self.repository.mark_verified_roundtrip_intents(
+            (entry_intent_id, exit_intent_id),
+            closure_metadata=closure,
+            now=observation_time,
+            _resolution_capability=self.repository._resolution_capability(),
+        )
         event_id = f"verified-roundtrip-closure:{entry_intent_id}:{exit_intent_id}"
         if not any(event.get("id") == event_id for event in self.repository.operational_events(account.id, limit=1000)):
             self.repository.record_operational_event(
@@ -2172,147 +2203,14 @@ class GenericOMS:
         if set(entry_totals) != set(exit_rows_by_instrument):
             raise OMSExecutionError("aggregate contains an instrument without both entry and exit evidence")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        history_getter = getattr(self.adapter, "get_historical_order_facts", None)
-        if not callable(getter) or not callable(history_getter):
-            raise OMSExecutionError("fresh account and historical broker facts are required")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError(f"authoritative account facts unavailable: {exc}") from exc
-        if not isinstance(facts, BrokerFactSnapshot) or facts.account_id != account.id or not facts.complete or facts.error:
-            raise OMSExecutionError("authoritative account facts are incomplete or account-mismatched")
         observation_time = self._now()
-        captured_at = parse_time(facts.captured_at, "account facts captured_at")
-        if captured_at > observation_time + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS) or (
-            observation_time - captured_at
-        ).total_seconds() > 900:
-            raise OMSExecutionError("authoritative account facts are stale")
-        if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not (
-            {"CURRENT_ORDER_SNAPSHOTS", "CURRENT_DEALS"} & set(facts.execution_evidence_scope)
-        ):
-            raise OMSExecutionError("authoritative account execution evidence is unavailable")
-        if facts.positions or facts.open_orders:
-            raise OMSExecutionError("aggregate account is not flat or has open orders")
-
-        def grouped_facts(items: Sequence[BrokerFill], label: str) -> dict[str, list[BrokerFill]]:
-            grouped: dict[str, list[BrokerFill]] = {}
-            seen_identity: set[tuple[str, str]] = set()
-            for item in items:
-                if not isinstance(item, BrokerFill):
-                    raise OMSExecutionError(f"{label} contains a non-normalized fill")
-                if item.account_id not in (None, account.id):
-                    raise OMSExecutionError(f"{label} contains a foreign account fill")
-                if item.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not item.evidence_reference:
-                    raise OMSExecutionError(f"{label} contains fill without execution provenance")
-                aliases = self._account_alias_mismatches(account, metadata=item.metadata)
-                if aliases:
-                    raise OMSExecutionError(f"{label} contains foreign account aliases: {aliases}")
-                identity = (item.external_order_id, item.external_fill_id or item.dedupe_key)
-                if identity in seen_identity:
-                    raise OMSExecutionError(f"{label} contains a duplicate fill identity")
-                seen_identity.add(identity)
-                grouped.setdefault(item.external_order_id, []).append(item)
-            return grouped
-
-        current_fills = grouped_facts(facts.fills, "current account facts")
         expected_start = min(parse_time(intent.get("created_at"), "aggregate intent created_at") for intent in intents)
-        requested_end = observation_time
-        try:
-            history = history_getter(account, expected_start, requested_end)
-        except Exception as exc:
-            raise OMSExecutionError(f"historical order facts unavailable: {exc}") from exc
-        if (
-            not isinstance(history, BrokerHistoricalOrderFacts)
-            or history.account_id != account.id
-            or not history.complete
-            or history.error
-        ):
-            raise OMSExecutionError("historical order facts are incomplete or account-mismatched")
-        if (
-            history.requested_start > expected_start
-            or history.requested_end < requested_end
-            or history.captured_at > observation_time + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS)
-            or history.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE
-            or "HISTORICAL_ORDER_SNAPSHOTS" not in set(history.execution_evidence_scope)
-        ):
-            raise OMSExecutionError("historical order facts do not cover the complete aggregate window")
-        history_by_external: dict[str, BrokerOrderSnapshot] = {}
-        for order in history.orders:
-            if order.account_id != account.id:
-                raise OMSExecutionError("historical order facts contain a foreign account row")
-            order_alias_mismatches = self._account_alias_mismatches(account, metadata=order.metadata)
-            if order_alias_mismatches:
-                raise OMSExecutionError(
-                    f"historical order {order.external_order_id} has foreign account aliases: {order_alias_mismatches}"
-                )
-            if order.external_order_id in history_by_external:
-                raise OMSExecutionError("historical order facts contain duplicate order identities")
-            history_by_external[order.external_order_id] = order
-        historical_fills = grouped_facts(history.fills, "historical order facts")
-
-        def verify_fact_fill_group(
-            group: Mapping[str, object],
-            *,
-            expected_quantity: Decimal,
-            expected_price: Decimal,
-            instrument_id: str,
-            attempt: Mapping[str, object],
-            label: str,
-        ) -> None:
-            items = group.get("items")
-            if not isinstance(items, (list, tuple)) or not items:
-                raise OMSExecutionError(f"{label} is missing exact fill evidence")
-            total_quantity = Decimal("0")
-            total_notional = Decimal("0")
-            for item in items:
-                if not isinstance(item, BrokerFill):
-                    raise OMSExecutionError(f"{label} contains malformed fill evidence")
-                if item.instrument_id not in (None, instrument_id):
-                    raise OMSExecutionError(f"{label} instrument provenance mismatch")
-                temporal_mismatches = self._temporal_fill_mismatches(attempt, item)
-                if temporal_mismatches:
-                    raise OMSExecutionError(f"{label} has invalid temporal provenance: {temporal_mismatches}")
-                if item.filled_at < expected_start - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
-                    raise OMSExecutionError(f"{label} predates the aggregate intent window")
-                if item.filled_at > requested_end + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
-                    raise OMSExecutionError(f"{label} is materially newer than the aggregate proof window")
-                total_quantity += item.quantity
-                total_notional += item.quantity * item.price
-            if total_quantity != expected_quantity or total_notional / total_quantity != expected_price:
-                raise OMSExecutionError(f"{label} quantity or price conflicts with durable fill")
-
-        for row in rows:
-            external_id = str(row["external_order_id"])
-            leg = row["leg"]
-            current_group = current_fills.get(external_id)
-            verify_fact_fill_group(
-                {"items": current_group},
-                expected_quantity=row["quantity"],
-                expected_price=row["price"],
-                instrument_id=str(leg["instrument_id"]),
-                attempt=row["attempt"],
-                label=f"current fill {external_id}",
-            )
-            order = history_by_external.get(external_id)
-            if (
-                order is None
-                or order.instrument_id != str(leg["instrument_id"])
-                or order.side.value != str(leg["side"])
-                or order.quantity != row["quantity"]
-                or order.filled_quantity != row["quantity"]
-                or order.status is not BrokerOrderStatus.FILLED
-            ):
-                raise OMSExecutionError(f"historical order {external_id} conflicts with durable fill")
-            historical_group = historical_fills.get(external_id)
-            verify_fact_fill_group(
-                {"items": historical_group},
-                expected_quantity=row["quantity"],
-                expected_price=row["price"],
-                instrument_id=str(leg["instrument_id"]),
-                attempt=row["attempt"],
-                label=f"historical fill {external_id}",
-            )
+        facts, history = self._strict_roundtrip_broker_evidence(
+            account,
+            expected_rows=rows,
+            requested_start=expected_start,
+            requested_end=observation_time,
+        )
 
         open_issues = self.repository.open_reconciliation_issues(account.id)
         open_actions = self.repository.open_recovery_actions(account.id)
@@ -3916,6 +3814,11 @@ class GenericOMS:
             "cumulative_fill_known": result.cumulative_filled_quantity is not None,
             "no_submit_asserted": result.no_submit_asserted,
             "no_fill_asserted": result.no_fill_asserted,
+            "authority": result.authority,
+            "submitted_quantity": (
+                str(result.submitted_quantity) if result.submitted_quantity is not None else None
+            ),
+            "instrument_id": result.instrument_id,
             "raw_payload": GenericOMS._safe_provider_payload(result.raw_payload),
             "definite_no_submit": definite_no_submit,
         }
@@ -4045,8 +3948,10 @@ class GenericOMS:
                             status=BrokerOrderStatus.CANCELLED,
                             external_order_id=result.external_order_id or attempt["external_order_id"],
                             metadata={
+                                **self._submission_metadata(result),
                                 "cancel_requested": True,
                                 "cancel_result": self._safe_provider_payload(result.raw_payload),
+                                "terminal_zero_fill_proof": True,
                             },
                             now=self._now(),
                         )
@@ -4213,6 +4118,182 @@ class GenericOMS:
                     )
         self._finalize_intent_status(intent.id, account)
 
+    def cancel_known_partial_attempt(
+        self,
+        intent_id: str,
+        *,
+        account: Account,
+        external_order_id: str,
+    ) -> dict[str, object]:
+        """Cancel one exact, durably known partial broker attempt.
+
+        This is deliberately narrower than the failure-policy cancellation
+        sweep.  A fresh account-facts snapshot must identify exactly one open
+        order belonging to this intent/leg and agree with durable cumulative
+        fills before the adapter cancellation call is made.  The cancellation
+        response is durably recorded, then ordinary restart recovery re-queries
+        the broker so a late fill cannot be hidden by the command response.
+        """
+        self._startup_safety_audit()
+        account = self._canonical_account_for_boundary(account, source="cancel_known_partial_attempt")
+        intent = self._required_intent(intent_id)
+        if str(intent.get("account_id")) != account.id:
+            raise OMSExecutionError("partial cancellation account does not match persisted intent")
+        external_order_id = str(external_order_id or "").strip()
+        if not external_order_id:
+            raise OMSExecutionError("partial cancellation requires an external broker order identity")
+        matches: list[tuple[dict[str, object], dict[str, object]]] = []
+        for leg in intent.get("legs", ()):
+            attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
+            if len(attempts) > 1:
+                raise OMSExecutionError(f"partial cancellation cannot operate on multiple attempts for leg {leg['id']}")
+            if not attempts:
+                continue
+            attempt = attempts[0]
+            if str(attempt.get("external_order_id") or "") == external_order_id:
+                matches.append((leg, attempt))
+        if len(matches) != 1:
+            raise OMSExecutionError("partial cancellation external order is not uniquely owned by the intent")
+        leg, attempt = matches[0]
+        if str(attempt.get("account_id")) != account.id:
+            raise OMSExecutionError("partial cancellation broker attempt belongs to another account")
+        try:
+            submitted = Decimal(str(attempt["submitted_quantity"]))
+            durable_filled = self._durable_filled_quantity(str(attempt["id"]))
+            local_cumulative = Decimal(str(leg.get("cumulative_filled_quantity", "0")))
+        except (KeyError, InvalidOperation, TypeError, ValueError, sqlite3.Error) as exc:
+            raise OMSExecutionError("partial cancellation durable quantities are invalid") from exc
+        if submitted <= 0 or durable_filled <= 0 or durable_filled >= submitted or local_cumulative != durable_filled:
+            raise OMSExecutionError("partial cancellation requires one exact positive partial fill")
+        if str(attempt.get("status")) not in {
+            BrokerOrderStatus.WORKING.value,
+            BrokerOrderStatus.PARTIALLY_FILLED.value,
+        }:
+            raise OMSExecutionError("partial cancellation requires a working or partially-filled attempt")
+
+        try:
+            _facts, _positions, open_orders = self._strict_authoritative_account_facts(
+                account,
+                max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            )
+        except OMSExecutionError:
+            raise
+        open_matches = [row for row in open_orders if row.external_order_id == external_order_id]
+        if len(open_matches) != 1:
+            raise OMSExecutionError("fresh broker facts do not identify exactly one open partial order")
+        snapshot = open_matches[0]
+        if (
+            snapshot.account_id != account.id
+            or snapshot.instrument_id != str(leg.get("instrument_id"))
+            or snapshot.side.value != str(leg.get("side"))
+            or snapshot.quantity != submitted
+            or snapshot.filled_quantity != durable_filled
+            or snapshot.status not in {BrokerOrderStatus.WORKING, BrokerOrderStatus.PARTIALLY_FILLED}
+        ):
+            raise OMSExecutionError("fresh broker partial order facts conflict with durable attempt evidence")
+        validation = self._validate_poll_snapshot(
+            account=account,
+            attempt=attempt,
+            leg=leg,
+            snapshot=snapshot,
+        )
+        if not validation["valid"]:
+            raise OMSExecutionError(
+                "fresh broker partial order facts failed strict identity validation: "
+                + ", ".join(str(value) for value in validation["mismatches"])
+            )
+
+        try:
+            result = self.adapter.cancel_order(account, external_order_id)
+        except Exception as exc:
+            self.repository.transition_broker_order(str(attempt["id"]), BrokerOrderStatus.UNKNOWN, now=self._now())
+            details = {"broker_order_id": str(attempt["id"]), "external_order_id": external_order_id, "error": str(exc)}
+            self._require_reconciliation(
+                intent_id,
+                account,
+                category="CANCEL_AMBIGUITY",
+                entity_type="BROKER_ORDER",
+                entity_key=str(attempt["id"]),
+                details=details,
+            )
+            self._record_recovery_action(
+                intent=self._required_intent(intent_id),
+                account=account,
+                action_key=f"CANCEL_AMBIGUITY:{attempt['id']}",
+                state="RECONCILIATION_REQUIRED",
+                summary="Partial-order cancellation transport failed; broker exposure is unknown and no retry or hedge is allowed.",
+                observed_positions={"_status": "UNAVAILABLE"},
+                remaining_quantities=self._remaining_quantities(self._required_intent(intent_id)),
+                allowed_next_steps=("refresh_broker_facts", "reconcile_broker_order", "operator_review"),
+                metadata=details,
+            )
+            raise OMSExecutionError("partial cancellation outcome is ambiguous") from exc
+        if not isinstance(result, BrokerSubmissionResult):
+            raise OMSExecutionError("adapter cancel_order() returned an invalid result")
+        accepted_cancel = (
+            result.accepted is True
+            and result.status is BrokerOrderStatus.CANCELLED
+            and result.external_order_id in {None, external_order_id}
+            and result.ambiguous is False
+        )
+        if not accepted_cancel:
+            self.repository.transition_broker_order(str(attempt["id"]), BrokerOrderStatus.UNKNOWN, now=self._now())
+            details = {
+                "broker_order_id": str(attempt["id"]),
+                "external_order_id": external_order_id,
+                "status": result.status.value,
+                "accepted": result.accepted,
+                "ambiguous": result.ambiguous,
+                "raw_payload": self._safe_provider_payload(result.raw_payload),
+            }
+            self._require_reconciliation(
+                intent_id,
+                account,
+                category="CANCEL_AMBIGUITY",
+                entity_type="BROKER_ORDER",
+                entity_key=str(attempt["id"]),
+                details=details,
+            )
+            self._record_recovery_action(
+                intent=self._required_intent(intent_id),
+                account=account,
+                action_key=f"CANCEL_AMBIGUITY:{attempt['id']}",
+                state="RECONCILIATION_REQUIRED",
+                summary="Broker cancellation was not an unambiguous accepted CANCELLED result; no retry or hedge is allowed.",
+                observed_positions={"_status": "UNKNOWN"},
+                remaining_quantities=self._remaining_quantities(self._required_intent(intent_id)),
+                allowed_next_steps=("refresh_broker_facts", "reconcile_broker_order", "operator_review"),
+                metadata=details,
+            )
+            raise OMSExecutionError("partial cancellation outcome is ambiguous")
+        self.repository.record_submission(
+            str(attempt["id"]),
+            status=BrokerOrderStatus.CANCELLED,
+            external_order_id=result.external_order_id or external_order_id,
+            metadata={
+                **self._submission_metadata(result),
+                "cancel_requested": True,
+                "known_partial_cancel": True,
+                "terminal_zero_fill_proof": bool(
+                    result.no_fill_asserted and result.cumulative_filled_quantity == 0
+                ),
+            },
+            now=self._now(),
+            submitted_at=self._parse_timestamp(attempt.get("submitted_at")),
+        )
+        recovered = self.recover_intent(intent_id, account=account)
+        return {
+            "intent_id": intent_id,
+            "leg_id": str(leg["id"]),
+            "broker_order_id": str(attempt["id"]),
+            "external_order_id": external_order_id,
+            "cancel_status": result.status.value,
+            "recovered": recovered,
+            "broker_contacted": True,
+            "cancel_count": 1,
+            "submission_count": 0,
+        }
+
     @staticmethod
     def _parse_timestamp(value: object) -> datetime | None:
         if isinstance(value, datetime):
@@ -4340,6 +4421,12 @@ class GenericOMS:
 
     def _observe_positions(self, account: Account) -> tuple[dict[str, str], str | None]:
         """Read optional position truth for operator output without guessing flatness."""
+        context = self._recovery_fact_context
+        if isinstance(context, Mapping) and context.get("account_id") == account.id:
+            observed = dict(context["observed_positions"])
+            self._last_broker_read_retryable = False
+            self._last_observed_positions = observed
+            return observed, None
         self._last_broker_read_retryable = False
         getter = getattr(self.adapter, "get_positions", None)
         if not callable(getter):
@@ -5226,6 +5313,52 @@ class GenericOMS:
                 and self._expired_attempt_is_durable_no_submit(row, account)
             )
         ]
+        fresh_authoritative_facts_valid = False
+        fresh_authoritative_facts_error: str | None = None
+        fresh_execution_evidence_ready = False
+        fresh_execution_evidence_error: str | None = None
+        fresh_broker_positions: dict[str, str] = {}
+        durable_managed_exposure: dict[str, str] = {}
+        fresh_exposure_agrees = False
+        fresh_exposure_error: str | None = None
+        if canonical is not None:
+            try:
+                facts, positions, _open_orders = self._strict_authoritative_account_facts(
+                    canonical,
+                    max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+                    require_no_open_orders=True,
+                )
+                self._require_usable_execution_evidence(
+                    canonical,
+                    facts,
+                    source="recovery status",
+                )
+                fresh_execution_evidence_ready = True
+                self._validate_recovery_fact_fill_provenance(canonical, facts.fills)
+                observed_exposure = {
+                    instrument_id: Decimal(quantity)
+                    for instrument_id, quantity in self._recovery_observed_positions(positions).items()
+                }
+                durable_exposure = self._strict_durable_managed_account_exposure(canonical)
+                fresh_broker_positions = {
+                    instrument_id: str(quantity)
+                    for instrument_id, quantity in sorted(observed_exposure.items())
+                }
+                durable_managed_exposure = {
+                    instrument_id: str(quantity)
+                    for instrument_id, quantity in sorted(durable_exposure.items())
+                }
+                if observed_exposure != durable_exposure:
+                    raise OMSExecutionError(
+                        "fresh broker positions do not match durable managed exposure"
+                    )
+                fresh_exposure_agrees = True
+            except Exception as exc:
+                fresh_authoritative_facts_error = str(exc)
+                fresh_execution_evidence_error = str(exc)
+                fresh_exposure_error = str(exc)
+            else:
+                fresh_authoritative_facts_valid = True
         active_statuses = {
             IntentStatus.SUBMITTING.value,
             IntentStatus.WORKING.value,
@@ -5239,17 +5372,73 @@ class GenericOMS:
             "legs": legs,
             "operator_actions": self.repository.recovery_actions_for_intent(intent_id),
             "open_reconciliation_issues": self.repository.open_reconciliation_issues(account_id),
+            "fresh_authoritative_facts_valid": fresh_authoritative_facts_valid,
+            "fresh_authoritative_facts_error": fresh_authoritative_facts_error,
+            "fresh_execution_evidence_ready": fresh_execution_evidence_ready,
+            "fresh_execution_evidence_error": fresh_execution_evidence_error,
+            "fresh_broker_positions": fresh_broker_positions,
+            "durable_managed_exposure": durable_managed_exposure,
+            "fresh_exposure_agrees": fresh_exposure_agrees,
+            "fresh_exposure_error": fresh_exposure_error,
             "safe_to_submit": not bool(
                 self.repository.open_reconciliation_issues(account_id)
                 or account_open_actions
                 or canonical is None
+                or not fresh_authoritative_facts_valid
+                or not fresh_execution_evidence_ready
                 or intent["status"] in active_statuses
                 or unresolved_expired_history
             ),
         }
 
     def recover_pending_intents(self, *, account: Account) -> list[dict]:
-        """Poll every durable active intent after process start; never resubmit."""
+        """Poll every durable active intent only from one fresh fact snapshot."""
+        account = self._canonical_account_for_boundary(account, source="recover_pending_intents")
+        recoverable_ids = self.repository.recoverable_intent_ids(
+            account.id,
+            now=self._now(),
+            terminal_window_seconds=self.TERMINAL_RECOVERY_WINDOW_SECONDS,
+        )
+        if not recoverable_ids:
+            return []
+        # Proof-backed retired/round-trip closures are already durable
+        # terminal evidence.  Do not require a fresh provider snapshot merely
+        # to return those rows: a transient read failure must not create a new
+        # account blocker or demote a closed lifecycle.  Active rows still
+        # require the one strict account-fact context below.
+        proof_closed = self._closed_historical_intent_ids(account)
+        active_ids = [intent_id for intent_id in recoverable_ids if intent_id not in proof_closed]
+        if not active_ids:
+            return [
+                intent
+                for intent_id in recoverable_ids
+                if (intent := self.repository.get_intent(intent_id)) is not None
+            ]
+        try:
+            context = self._validated_recovery_fact_context(account)
+        except Exception as exc:
+            blocked_by_id: dict[str, dict] = {}
+            for intent_id in active_ids:
+                intent = self.repository.get_intent(intent_id)
+                if intent is None:
+                    continue
+                self._record_recovery_fact_failure(intent, account, exc)
+                blocked_by_id[intent_id] = self._required_intent(intent_id)
+            return [
+                row
+                for intent_id in recoverable_ids
+                if (row := self.repository.get_intent(intent_id)) is not None
+                and (intent_id in proof_closed or intent_id in blocked_by_id)
+            ]
+        previous_context = self._recovery_fact_context
+        self._recovery_fact_context = context
+        try:
+            return self._recover_pending_intents_with_facts(account=account)
+        finally:
+            self._recovery_fact_context = previous_context
+
+    def _recover_pending_intents_with_facts(self, *, account: Account) -> list[dict]:
+        """Internal pending recovery body with a validated context installed."""
         account = self._canonical_account_for_boundary(account, source="recover_pending_intents")
         self._ensure_terminal_history_safety(account)
         self._quarantine_multiple_attempts_for_account(account)
@@ -5289,7 +5478,7 @@ class GenericOMS:
                 if intent is not None:
                     recovered.append(intent)
                 continue
-            recovered.append(self.recover_intent(intent_id, account=account))
+            recovered.append(self._recover_intent_with_facts(intent_id, account=account))
         return recovered
 
     # Short alias for callers that describe the operation as a polling cycle.
@@ -5751,6 +5940,695 @@ class GenericOMS:
             deduped.append(first)
         return tuple(deduped), blockers
 
+    @staticmethod
+    def _recovery_observed_positions(
+        positions: Sequence[PositionSnapshot],
+    ) -> dict[str, str]:
+        """Render already-validated position facts for recovery diagnostics."""
+        totals: dict[str, Decimal] = {}
+        for position in positions:
+            instrument_id = str(position.instrument_id)
+            quantity = Decimal(str(position.signed_quantity))
+            totals[instrument_id] = totals.get(instrument_id, Decimal("0")) + quantity
+        return {
+            instrument_id: str(quantity)
+            for instrument_id, quantity in sorted(totals.items())
+            if quantity != 0
+        }
+
+    @staticmethod
+    def _recovery_context_fill_quantity(
+        context: Mapping[str, object],
+        external_order_id: object,
+    ) -> Decimal:
+        """Return the cumulative fill quantity authenticated by a context."""
+        total = Decimal("0")
+        for broker_fill in context.get("fills", ()):
+            if str(getattr(broker_fill, "external_order_id", "")) != str(external_order_id):
+                continue
+            total += Decimal(str(getattr(broker_fill, "quantity", "0")))
+        return total
+
+    def _validate_recovery_fill_provenance(
+        self,
+        account: Account,
+        broker_fill: BrokerFill,
+        *,
+        attempt: Mapping[str, object],
+        leg: Mapping[str, object],
+    ) -> None:
+        """Require a matched recovery fill to carry complete broker evidence."""
+        if broker_fill.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
+            raise ValueError("authoritative recovery fill has unavailable execution evidence")
+        if not str(broker_fill.evidence_reference or "").strip():
+            raise ValueError("authoritative recovery fill has no evidence reference")
+        expected_instrument_id = str(leg.get("instrument_id") or "").strip()
+        if not expected_instrument_id:
+            raise ValueError("matched recovery leg has no canonical instrument identity")
+        if broker_fill.instrument_id != expected_instrument_id:
+            raise ValueError("authoritative recovery fill instrument does not match durable broker order")
+        self._validate_broker_fill_provenance(
+            attempt,
+            broker_fill,
+            expected_instrument_id=expected_instrument_id,
+        )
+
+    def _validate_recovery_fact_fill_provenance(
+        self,
+        account: Account,
+        broker_fills: Sequence[BrokerFill],
+    ) -> None:
+        """Authenticate current-snapshot fills before recovery writes state."""
+        for broker_fill in broker_fills:
+            claims = self.repository.broker_orders_for_external_order_id(
+                broker_fill.external_order_id
+            )
+            if len(claims) != 1:
+                if self.is_proof_backed_closed_broker_fill(
+                    account=account,
+                    broker_fill=broker_fill,
+                ):
+                    continue
+                raise OMSExecutionError(
+                    "authoritative recovery fill is not uniquely owned by one durable broker order"
+                )
+            attempt = claims[0]
+            if str(attempt.get("account_id")) != account.id:
+                raise OMSExecutionError(
+                    "authoritative recovery fill belongs to a different account"
+                )
+            intent_id = self.repository.intent_id_for_broker_order(str(attempt.get("id")))
+            if intent_id is None:
+                raise OMSExecutionError(
+                    "authoritative recovery fill has no durable owning intent"
+                )
+            if intent_id in self._closed_historical_intent_ids(account) and self.is_proof_backed_closed_broker_fill(
+                account=account,
+                broker_fill=broker_fill,
+            ):
+                continue
+            owner = self.repository.get_intent(str(intent_id))
+            if owner is None:
+                raise OMSExecutionError(
+                    "authoritative recovery fill has no durable owning intent"
+                )
+            leg = next(
+                (
+                    item
+                    for item in owner.get("legs", ())
+                    if str(item.get("id")) == str(attempt.get("order_leg_id"))
+                ),
+                None,
+            )
+            if not isinstance(leg, Mapping):
+                raise OMSExecutionError(
+                    "authoritative recovery fill has no durable owning leg"
+                )
+            try:
+                self._validate_recovery_fill_provenance(
+                    account,
+                    broker_fill,
+                    attempt=attempt,
+                    leg=leg,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OMSExecutionError(str(exc)) from exc
+
+    def _validated_recovery_fact_context(self, account: Account) -> dict[str, object]:
+        """Validate the sole broker snapshot allowed to drive recovery.
+
+        Recovery is allowed to ingest terminal order/fill evidence only after
+        this account-scoped snapshot has passed the same completeness,
+        identity, freshness, duplicate, and quantity checks used by order
+        safety gates.  The context is then reused by the recovery helpers so
+        a missing position reader or a cacheable fill reader cannot silently
+        replace the validated account view.
+        """
+        facts, positions, open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+        )
+        # The strict fact boundary has already rejected conflicting identity
+        # rows and collapses exact provider replays for every downstream
+        # consumer.  Do not re-run that validation in recovery.
+        fills = facts.fills
+        # Recovery may persist a newly observed fill or advance a leg/intent
+        # lifecycle only from the same evidence contract that authorizes an
+        # order decision.  In particular, a cumulative snapshot without a
+        # verified flat baseline is not enough merely because its rows look
+        # internally consistent; reject before any recovery mutation.
+        self._require_usable_execution_evidence(
+            account,
+            facts,
+            source="recovery",
+        )
+        if fills:
+            if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
+                raise OMSExecutionError(
+                    "authoritative recovery facts contain fills but execution evidence is unavailable"
+                )
+            self._validate_recovery_fact_fill_provenance(
+                account,
+                fills,
+            )
+        return {
+            "account_id": account.id,
+            "facts": facts,
+            "positions": positions,
+            "open_orders": open_orders,
+            "fills": fills,
+            "observed_positions": self._recovery_observed_positions(positions),
+        }
+
+    def _execution_evidence_readiness(
+        self,
+        account: Account,
+        facts: BrokerFactSnapshot,
+    ) -> tuple[bool, str | None]:
+        """Return whether one validated snapshot can support an order decision.
+
+        Individual-deal evidence is self-authenticating after the strict fact
+        validator has checked its identities.  Cumulative order snapshots have
+        a narrower contract: the account must have a persisted, matching,
+        verified-flat baseline before the snapshot can be used to authorize an
+        order or to claim a clean recovery state.  Keep this decision shared by
+        direct proof-gated OMS routes and status/reporting callers so the
+        private compensating capability cannot bypass the same baseline rule.
+        """
+        if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
+            return False, "execution evidence is unavailable"
+        if facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
+            baseline = self.repository.latest_execution_evidence_baseline(account.id)
+            if not (
+                baseline is not None
+                and baseline.account_id == account.id
+                and baseline.evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
+                and baseline.verified_flat
+                and baseline.status == "VERIFIED"
+            ):
+                return (
+                    False,
+                    "verified cumulative-order baseline requires matching account, "
+                    "mode, VERIFIED status, and flat proof",
+                )
+        return True, None
+
+    def _require_usable_execution_evidence(
+        self,
+        account: Account,
+        facts: BrokerFactSnapshot,
+        *,
+        source: str,
+    ) -> None:
+        ready, reason = self._execution_evidence_readiness(account, facts)
+        if not ready:
+            raise OMSExecutionError(f"{source} requires usable execution evidence: {reason}")
+
+    @staticmethod
+    def _validate_authoritative_fill_identities(
+        facts: BrokerFactSnapshot,
+    ) -> tuple[BrokerFill, ...]:
+        """Reject contradictory provider fill identities before any proof path.
+
+        Exact replay rows are collapsed for recovery consumers.  A changed
+        row sharing either the provider fill identity or its order/dedupe key
+        is ambiguous and must block every safety boundary, including Stage 6
+        preflight and proof-gated compensation/residual submission.
+        """
+        fills_by_identity: dict[tuple[str, str], BrokerFill] = {}
+        fills_by_dedupe: dict[tuple[str, str], BrokerFill] = {}
+        for broker_fill in facts.fills:
+            identity = (
+                str(broker_fill.external_order_id),
+                str(broker_fill.external_fill_id or broker_fill.dedupe_key),
+            )
+            prior_identity = fills_by_identity.get(identity)
+            if prior_identity is not None:
+                if prior_identity != broker_fill:
+                    raise OMSExecutionError(
+                        "authoritative account facts contain contradictory duplicate fill identity"
+                    )
+                continue
+            dedupe_identity = (str(broker_fill.external_order_id), str(broker_fill.dedupe_key))
+            prior_dedupe = fills_by_dedupe.get(dedupe_identity)
+            if prior_dedupe is not None and prior_dedupe != broker_fill:
+                raise OMSExecutionError(
+                    "authoritative account facts contain contradictory duplicate fill dedupe key"
+                )
+            fills_by_identity[identity] = broker_fill
+            fills_by_dedupe[dedupe_identity] = broker_fill
+        return tuple(fills_by_identity.values())
+
+    def strict_authoritative_account_facts(
+        self,
+        account: Account,
+        *,
+        max_age_seconds: int | float | None = None,
+        require_no_open_orders: bool = False,
+    ) -> tuple[BrokerFactSnapshot, tuple[PositionSnapshot, ...], tuple[BrokerOrderSnapshot, ...]]:
+        """Expose the canonical read-only account-fact safety boundary.
+
+        Stage 6 orchestration and CLI recovery paths must use the same strict
+        validator as order-bearing OMS paths.  This public wrapper does not
+        add a new broker capability or mutate the ledger; it only prevents
+        callers from bypassing account identity, alias, freshness, duplicate,
+        quantity, and completeness checks by reading the adapter directly.
+        """
+
+        return self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=max_age_seconds,
+            require_no_open_orders=require_no_open_orders,
+        )
+
+    def _strict_authoritative_account_facts(
+        self,
+        account: Account,
+        *,
+        max_age_seconds: int | float | None = None,
+        require_no_open_orders: bool = False,
+    ) -> tuple[BrokerFactSnapshot, tuple[PositionSnapshot, ...], tuple[BrokerOrderSnapshot, ...]]:
+        """Read and validate one account-fact snapshot for a safety decision.
+
+        All order-bearing proof paths must use this boundary.  In particular,
+        an empty positions/open-orders collection is meaningful only after the
+        adapter has returned a complete, account-scoped, fresh snapshot.  The
+        duplicate and alias checks live here so individual proof routes cannot
+        accidentally accept a weaker variant of the same broker facts.
+        """
+        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
+        if not callable(getter):
+            raise OMSExecutionError(
+                "adapter does not expose required get_authoritative_account_facts(account)"
+            )
+        try:
+            facts = getter(account)
+        except Exception as exc:
+            raise OMSExecutionError(f"authoritative account facts unavailable: {exc}") from exc
+        if not isinstance(facts, BrokerFactSnapshot):
+            raise OMSExecutionError(
+                "adapter get_authoritative_account_facts() must return BrokerFactSnapshot"
+            )
+        if facts.account_id != account.id:
+            raise OMSExecutionError(
+                "authoritative account facts belong to a different account "
+                f"(got {facts.account_id!r}, expected {account.id!r})"
+            )
+        fact_aliases = self._account_alias_mismatches(
+            account,
+            account_id=facts.account_id,
+            metadata=facts.metadata,
+        )
+        if fact_aliases:
+            raise OMSExecutionError(
+                "authoritative account fact identity mismatch: " + ", ".join(fact_aliases)
+            )
+        if not facts.complete:
+            raise OMSExecutionError(
+                "authoritative account facts are incomplete: "
+                + (facts.error or "unspecified")
+            )
+        if facts.error not in (None, ""):
+            raise OMSExecutionError(f"authoritative account facts report an error: {facts.error}")
+        observed_at = self._parse_timestamp(facts.captured_at)
+        if observed_at is None:
+            raise OMSExecutionError("authoritative account facts have no valid captured_at")
+        now = self._now()
+        if observed_at > now + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
+            raise OMSExecutionError("authoritative account facts are stale (captured_at is in the future)")
+        if max_age_seconds is not None and (now - observed_at).total_seconds() > float(max_age_seconds):
+            raise OMSExecutionError("authoritative account facts are stale")
+
+        metadata_mismatches = self._broker_fact_metadata_blockers(
+            account,
+            facts.metadata,
+            # The adapter's documented cumulative fallback reports this one
+            # diagnostic marker.  The account-wide and Stage 6 gates still
+            # require a verified baseline before accepting that mode.
+            allow_cumulative_order_evidence=(
+                facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
+            ),
+        )
+        if metadata_mismatches:
+            raise OMSExecutionError(
+                "authoritative account fact metadata is unsafe: "
+                + ", ".join(metadata_mismatches)
+            )
+
+        positions, duplicate_position_blockers = self._dedupe_account_position_facts(facts.positions)
+        if duplicate_position_blockers:
+            raise OMSExecutionError(
+                "authoritative account facts contain contradictory duplicate rows (positions): "
+                + json.dumps(duplicate_position_blockers, sort_keys=True, default=str)
+            )
+        for position in positions:
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=getattr(position, "account_id", None),
+                external_account_id=getattr(position, "external_account_id", None),
+                metadata=getattr(position, "metadata", None),
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"authoritative position {position.instrument_id} has account mismatch: {aliases}"
+                )
+            quantity = Decimal(str(position.signed_quantity))
+            if not quantity.is_finite():
+                raise OMSExecutionError(
+                    f"authoritative position {position.instrument_id} has a non-finite quantity"
+                )
+
+        open_orders, duplicate_order_blockers = self._dedupe_account_broker_order_facts(facts.open_orders)
+        if duplicate_order_blockers:
+            raise OMSExecutionError(
+                "authoritative account facts contain contradictory duplicate orders: "
+                + json.dumps(duplicate_order_blockers, sort_keys=True, default=str)
+            )
+        for snapshot in open_orders:
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=snapshot.account_id,
+                external_account_id=snapshot.external_account_id,
+                metadata=snapshot.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"authoritative order {snapshot.external_order_id} has account mismatch: {aliases}"
+                )
+            quantity_mismatches = self._broker_order_quantity_mismatches(
+                snapshot.status,
+                snapshot.quantity,
+                snapshot.filled_quantity,
+            )
+            if quantity_mismatches:
+                raise OMSExecutionError(
+                    f"authoritative order {snapshot.external_order_id} has contradictory status/quantity facts: "
+                    + ", ".join(quantity_mismatches)
+                )
+        if require_no_open_orders and open_orders:
+            raise OMSExecutionError("broker account is not freshly flat: authoritative open orders are present")
+
+        for broker_fill in facts.fills:
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=broker_fill.account_id,
+                metadata=broker_fill.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"authoritative fill {broker_fill.dedupe_key} has account mismatch: {aliases}"
+                )
+            if not broker_fill.quantity.is_finite() or broker_fill.quantity <= 0:
+                raise OMSExecutionError(
+                    f"authoritative fill {broker_fill.dedupe_key} has an invalid quantity"
+                )
+        validated_fills = self._validate_authoritative_fill_identities(facts)
+        if validated_fills != facts.fills:
+            facts = replace(facts, fills=validated_fills)
+        return facts, positions, open_orders
+
+    def strict_historical_order_facts(
+        self,
+        account: Account,
+        *,
+        requested_start: datetime,
+        requested_end: datetime,
+    ) -> BrokerHistoricalOrderFacts:
+        """Expose the canonical bounded historical-facts safety boundary."""
+
+        return self._strict_historical_order_facts(
+            account,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
+
+    def _strict_historical_order_facts(
+        self,
+        account: Account,
+        *,
+        requested_start: datetime,
+        requested_end: datetime,
+    ) -> BrokerHistoricalOrderFacts:
+        """Read one complete, fresh, account-scoped bounded history window.
+
+        Residual proof uses this boundary for attempted terminal-zero orders.
+        A current account snapshot can be flat while a late fill remains only
+        in the provider's historical order endpoint; treating that omission as
+        no-fill would make the residual order unsafe.  Keep this validator
+        independent from the fresh account-facts helper because historical
+        coverage is an additional proof obligation, not a replacement for it.
+        """
+        start = self._parse_timestamp(requested_start)
+        end = self._parse_timestamp(requested_end)
+        if start is None or end is None or end <= start:
+            raise OMSExecutionError("historical order proof window is invalid")
+        getter = getattr(self.adapter, "get_historical_order_facts", None)
+        if not callable(getter):
+            raise OMSExecutionError("bounded historical order facts are required")
+        try:
+            history = getter(account, start, end)
+        except Exception as exc:
+            raise OMSExecutionError(f"historical order facts unavailable: {exc}") from exc
+        if not isinstance(history, BrokerHistoricalOrderFacts):
+            raise OMSExecutionError("historical order provider returned an invalid result")
+        if history.account_id != account.id:
+            raise OMSExecutionError("historical order facts belong to a different account")
+        aliases = self._account_alias_mismatches(
+            account,
+            account_id=history.account_id,
+            metadata=history.metadata,
+        )
+        if aliases:
+            raise OMSExecutionError("historical order fact identity mismatch: " + ", ".join(aliases))
+        if not history.complete or history.error:
+            raise OMSExecutionError(
+                f"bounded historical order facts are incomplete: {history.error or 'unspecified'}"
+            )
+        if (
+            history.requested_start > start
+            or history.requested_end < end
+            or history.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE
+            or "HISTORICAL_ORDER_SNAPSHOTS" not in history.execution_evidence_scope
+        ):
+            raise OMSExecutionError("historical order facts do not cover the complete proof window")
+        captured_at = self._parse_timestamp(history.captured_at)
+        now = self._now()
+        if captured_at is None:
+            raise OMSExecutionError("historical order facts have no valid captured_at")
+        if captured_at > now + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
+            raise OMSExecutionError("historical order facts are from the future")
+        if (now - captured_at).total_seconds() > self.TERMINAL_RECOVERY_WINDOW_SECONDS:
+            raise OMSExecutionError("historical order facts are stale")
+        return history
+
+    def _strict_roundtrip_broker_evidence(
+        self,
+        account: Account,
+        *,
+        expected_rows: Sequence[Mapping[str, object]],
+        requested_start: datetime,
+        requested_end: datetime,
+    ) -> tuple[BrokerFactSnapshot, BrokerHistoricalOrderFacts]:
+        """Validate the complete broker evidence set used by round-trip closure.
+
+        The two verified round-trip resolvers must not each implement a weaker
+        variant of the account/fill/history contract.  This boundary reuses the
+        strict account and bounded-history readers, then authenticates every
+        current and historical fill against the explicitly named durable rows.
+        Unknown fills, duplicate evidence identities, stale history, and
+        contradictory order/fill facts therefore fail closed before any local
+        terminal promotion.
+        """
+        start = self._parse_timestamp(requested_start)
+        end = self._parse_timestamp(requested_end)
+        if start is None or end is None or end <= start:
+            raise OMSExecutionError("round-trip broker evidence window is invalid")
+
+        expected: dict[str, Mapping[str, object]] = {}
+        for row in expected_rows:
+            external_id = str(row.get("external_order_id") or "").strip()
+            if not external_id or external_id in expected:
+                raise OMSExecutionError("round-trip broker evidence has ambiguous durable order identities")
+            leg = row.get("leg")
+            attempt = row.get("attempt")
+            if not isinstance(leg, Mapping) or not isinstance(attempt, Mapping):
+                raise OMSExecutionError("round-trip broker evidence lacks durable leg/attempt context")
+            expected[external_id] = row
+
+        if not expected:
+            raise OMSExecutionError("round-trip broker evidence has no expected orders")
+
+        facts, positions, _open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.TERMINAL_RECOVERY_WINDOW_SECONDS,
+            require_no_open_orders=True,
+        )
+        if positions:
+            raise OMSExecutionError("round-trip account is not flat")
+        if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
+            raise OMSExecutionError("authoritative account execution evidence is unavailable")
+        if not ({"CURRENT_DEALS", "CURRENT_ORDER_SNAPSHOTS"} & set(facts.execution_evidence_scope)):
+            raise OMSExecutionError("authoritative account facts lack current execution evidence scope")
+
+        def parse_decimal(value: object, label: str) -> Decimal:
+            try:
+                result = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError(f"{label} is not numeric") from exc
+            if not result.is_finite() or result <= 0:
+                raise OMSExecutionError(f"{label} is invalid")
+            return result
+
+        def validate_fill_groups(
+            items: Sequence[BrokerFill],
+            *,
+            label: str,
+        ) -> dict[str, tuple[BrokerFill, ...]]:
+            grouped: dict[str, list[BrokerFill]] = {}
+            seen_identity: set[tuple[str, str]] = set()
+            for item in items:
+                if not isinstance(item, BrokerFill):
+                    raise OMSExecutionError(f"{label} contains a non-normalized fill")
+                external_id = str(item.external_order_id).strip()
+                row = expected.get(external_id)
+                if row is None:
+                    raise OMSExecutionError(f"{label} contains unexpected fill {external_id}")
+                identity = (external_id, str(item.external_fill_id or item.dedupe_key).strip())
+                if not identity[1] or identity in seen_identity:
+                    raise OMSExecutionError(f"{label} contains a duplicate fill identity")
+                seen_identity.add(identity)
+                if item.account_id not in (None, account.id):
+                    raise OMSExecutionError(f"{label} contains a foreign account fill")
+                aliases = self._account_alias_mismatches(
+                    account,
+                    account_id=item.account_id,
+                    metadata=item.metadata,
+                )
+                if aliases:
+                    raise OMSExecutionError(f"{label} contains foreign account aliases: {aliases}")
+                if item.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not item.evidence_reference:
+                    raise OMSExecutionError(f"{label} contains fill without execution provenance")
+                leg = row["leg"]
+                attempt = row["attempt"]
+                instrument_id = str(leg.get("instrument_id") or "")
+                if item.instrument_id not in (None, instrument_id):
+                    raise OMSExecutionError(f"{label} fill {external_id} instrument provenance mismatch")
+                if item.quantity <= 0 or not item.quantity.is_finite():
+                    raise OMSExecutionError(f"{label} fill {external_id} quantity is invalid")
+                temporal_mismatches = self._temporal_fill_mismatches(attempt, item)
+                if temporal_mismatches:
+                    raise OMSExecutionError(
+                        f"{label} fill {external_id} has invalid temporal provenance: {temporal_mismatches}"
+                    )
+                if item.filled_at < start - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                    raise OMSExecutionError(f"{label} fill {external_id} predates the proof window")
+                if item.filled_at > end + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
+                    raise OMSExecutionError(f"{label} fill {external_id} is newer than the proof window")
+                grouped.setdefault(external_id, []).append(item)
+
+            if set(grouped) != set(expected):
+                missing = sorted(set(expected) - set(grouped))
+                extra = sorted(set(grouped) - set(expected))
+                raise OMSExecutionError(
+                    f"{label} does not exactly cover durable fills; missing={missing}, extra={extra}"
+                )
+            for external_id, row in expected.items():
+                leg = row["leg"]
+                expected_quantity = parse_decimal(row.get("quantity"), f"{label} durable quantity")
+                expected_price = parse_decimal(row["fill"].get("price"), f"{label} durable price")
+                total_quantity = sum((item.quantity for item in grouped[external_id]), Decimal("0"))
+                total_notional = sum((item.quantity * item.price for item in grouped[external_id]), Decimal("0"))
+                if total_quantity != expected_quantity or total_notional / total_quantity != expected_price:
+                    raise OMSExecutionError(
+                        f"{label} fill {external_id} quantity or economics conflict with durable evidence"
+                    )
+                instrument_id = str(leg.get("instrument_id") or "")
+                if any(item.instrument_id not in (None, instrument_id) for item in grouped[external_id]):
+                    raise OMSExecutionError(f"{label} fill {external_id} instrument mismatch")
+            return {key: tuple(value) for key, value in grouped.items()}
+
+        validate_fill_groups(facts.fills, label="current account facts")
+        history = self._strict_historical_order_facts(
+            account,
+            requested_start=start,
+            requested_end=end,
+        )
+
+        history_by_external: dict[str, BrokerOrderSnapshot] = {}
+        for order in history.orders:
+            external_id = str(order.external_order_id).strip()
+            if external_id in history_by_external:
+                raise OMSExecutionError("historical order facts contain duplicate order identities")
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=order.account_id,
+                external_account_id=order.external_account_id,
+                metadata=order.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"historical order {external_id} has foreign account aliases: {aliases}"
+                )
+            mismatches = self._broker_order_quantity_mismatches(
+                order.status,
+                order.quantity,
+                order.filled_quantity,
+            )
+            if mismatches:
+                raise OMSExecutionError(
+                    f"historical order {external_id} has contradictory status/quantity facts: {mismatches}"
+                )
+            history_by_external[external_id] = order
+
+        if not set(expected).issubset(history_by_external):
+            missing = sorted(set(expected) - set(history_by_external))
+            raise OMSExecutionError(f"historical order facts do not contain every round-trip order: {missing}")
+        for external_id, row in expected.items():
+            order = history_by_external[external_id]
+            leg = row["leg"]
+            expected_quantity = parse_decimal(row.get("quantity"), "historical durable quantity")
+            if (
+                order.account_id != account.id
+                or order.instrument_id != str(leg.get("instrument_id"))
+                or order.side.value != str(leg.get("side"))
+                or order.quantity != expected_quantity
+                or order.filled_quantity != expected_quantity
+                or order.status is not BrokerOrderStatus.FILLED
+            ):
+                raise OMSExecutionError(f"historical order {external_id} conflicts with durable fill")
+        validate_fill_groups(history.fills, label="historical order facts")
+        return facts, history
+
+    def _strict_durable_managed_account_exposure(self, account: Account) -> dict[str, Decimal]:
+        """Return the account-wide managed position implied by allocations.
+
+        This is used only by proof-gated partial EXIT recovery.  Unlike a
+        book-local net, it cannot silently treat another managed book as flat;
+        unknown/unowned non-zero rows are rejected rather than netted away.
+        """
+        closed_historical = self._closed_historical_intent_ids(account)
+        totals: dict[str, Decimal] = {}
+        for row in self.repository.position_allocations(account.id):
+            source_id = str(row.get("source_intent_id") or "").strip()
+            if source_id in closed_historical:
+                continue
+            try:
+                quantity = Decimal(str(row.get("signed_quantity", "0")))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError("durable account allocation quantity is invalid") from exc
+            if not quantity.is_finite():
+                raise OMSExecutionError("durable account allocation quantity is not finite")
+            ownership = str(row.get("ownership_class") or "").upper()
+            if quantity != 0 and ownership != OwnershipClass.MANAGED.value:
+                raise OMSExecutionError("durable account exposure contains unknown or unowned allocation")
+            if quantity == 0:
+                continue
+            instrument_id = str(row.get("instrument_id") or "").strip()
+            if not instrument_id or not source_id or str(row.get("account_id")) != account.id:
+                raise OMSExecutionError("durable account allocation lacks canonical ownership")
+            totals[instrument_id] = totals.get(instrument_id, Decimal("0")) + quantity
+        return {key: value for key, value in totals.items() if value != 0}
+
     def _account_wide_broker_fact_gate(self, intent_id: str, account: Account) -> bool:
         """Block a new submit when account-wide broker facts are unsafe.
 
@@ -5761,33 +6639,17 @@ class GenericOMS:
         """
         intent = self._required_intent(intent_id)
         try:
-            # Account-wide facts have an explicit completeness contract.  Do
-            # not fall back to individual readers or infer that missing
-            # methods/empty collections mean a flat account.  The submit
-            # safety gate requires the dedicated fresh-facts capability;
-            # get_account_facts() alone is not sufficient because it may be a
-            # bounded display/cache reader on an older adapter.
-            getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-            if not callable(getter):
-                raise RuntimeError(
-                    "adapter does not expose required get_authoritative_account_facts(account)"
-                )
-            facts = getter(account)
-            if not isinstance(facts, BrokerFactSnapshot):
-                raise TypeError(
-                    "adapter get_authoritative_account_facts() must return BrokerFactSnapshot"
-                )
-            if facts.account_id != account.id:
-                raise ValueError(
-                    f"account-wide broker facts belong to {facts.account_id!r}, expected {account.id!r}"
-                )
-            if not facts.complete:
-                raise RuntimeError(facts.error or "broker account facts are incomplete")
-            positions, duplicate_position_blockers = self._dedupe_account_position_facts(
-                facts.positions
+            # Account-wide facts have an explicit completeness, identity,
+            # freshness, duplicate, and status/quantity contract.  Do not fall
+            # back to individual readers or infer that missing methods/empty
+            # collections mean a flat account.
+            facts, positions, open_orders = self._strict_authoritative_account_facts(
+                account,
+                max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
             )
-            open_orders, duplicate_order_blockers = self._dedupe_account_broker_order_facts(facts.open_orders)
             fills = facts.fills
+            duplicate_position_blockers = []
+            duplicate_order_blockers = []
         except Exception as exc:
             details = {
                 "intent_id": intent_id,
@@ -5827,39 +6689,22 @@ class GenericOMS:
                     "error": str(facts.error),
                 }
             )
-        baseline = self.repository.latest_execution_evidence_baseline(account.id)
-        cumulative_baseline_verified = (
-            facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
-            and baseline is not None
-            and baseline.account_id == account.id
-            and baseline.evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
-            and baseline.verified_flat
-            and baseline.status == "VERIFIED"
+        execution_evidence_ready, execution_evidence_reason = self._execution_evidence_readiness(
+            account,
+            facts,
         )
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
             blockers.append(
                 {
                     "kind": "execution_evidence_unavailable",
-                    "reason": "adapter did not provide individual deals or a verified cumulative-order baseline",
+                    "reason": execution_evidence_reason,
                 }
             )
-        elif facts.execution_evidence_mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS and not cumulative_baseline_verified:
+        elif not execution_evidence_ready:
             blockers.append(
                 {
                     "kind": "cumulative_execution_evidence_baseline_required",
-                    "reason": "fresh SIM order snapshots require an explicit verified flat baseline before submission",
-                }
-            )
-        metadata_mismatches = self._broker_fact_metadata_blockers(
-            account,
-            facts.metadata,
-            allow_cumulative_order_evidence=cumulative_baseline_verified,
-        )
-        if metadata_mismatches:
-            blockers.append(
-                {
-                    "kind": "broker_fact_metadata",
-                    "mismatches": metadata_mismatches,
+                    "reason": execution_evidence_reason,
                 }
             )
         allocations: dict[str, Decimal] = {}
@@ -6713,21 +7558,11 @@ class GenericOMS:
                 "pending account reconciliation or recovery blockers prevent never-submitted recovery"
             )
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise OMSExecutionError("fresh authoritative account facts are required for never-submitted recovery")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError(f"authoritative account facts unavailable: {exc}") from exc
-        if not isinstance(facts, BrokerFactSnapshot):
-            raise OMSExecutionError("authoritative account facts returned an invalid snapshot")
-        if facts.account_id != account.id:
-            raise OMSExecutionError("authoritative account facts belong to a different account")
-        if not facts.complete or facts.error:
-            raise OMSExecutionError(
-                f"authoritative account facts are incomplete: {facts.error or 'unspecified'}"
-            )
+        facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            require_no_open_orders=True,
+        )
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
             raise OMSExecutionError("execution evidence is unavailable for never-submitted recovery")
         if (
@@ -6737,13 +7572,11 @@ class GenericOMS:
             raise OMSExecutionError("verified cumulative-order baseline is required for never-submitted recovery")
         nonzero_positions = [
             position
-            for position in facts.positions
+            for position in normalized_positions
             if position.signed_quantity != 0
         ]
         if nonzero_positions:
             raise OMSExecutionError("broker account has non-zero position exposure")
-        if facts.open_orders:
-            raise OMSExecutionError("broker account has open orders")
 
         # A cumulative-order provider's verified baseline is not, by itself,
         # proof that this intent was never submitted after the baseline was
@@ -6751,11 +7584,6 @@ class GenericOMS:
         # the persisted intent creation through this proof operation.  This
         # remains fail-closed when the optional history capability is absent,
         # unsupported, malformed, or does not cover the requested interval.
-        history_getter = getattr(self.adapter, "get_historical_order_facts", None)
-        if not callable(history_getter):
-            raise OMSExecutionError(
-                "bounded historical order facts are required for never-submitted recovery"
-            )
         try:
             window_start = datetime.fromisoformat(str(intent["created_at"]).replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError) as exc:
@@ -6766,25 +7594,11 @@ class GenericOMS:
         window_end = self._now()
         if window_end <= window_start:
             window_end = window_start + timedelta(microseconds=1)
-        try:
-            historical = history_getter(account, window_start, window_end)
-        except Exception as exc:
-            raise OMSExecutionError(f"bounded historical order facts unavailable: {exc}") from exc
-        if not isinstance(historical, BrokerHistoricalOrderFacts):
-            raise OMSExecutionError("historical order provider returned an invalid result")
-        if historical.account_id != account.id:
-            raise OMSExecutionError("historical order facts belong to a different account")
-        if not historical.complete or historical.error:
-            raise OMSExecutionError(
-                f"bounded historical order facts are incomplete: {historical.error or 'unspecified'}"
-            )
-        if (
-            historical.requested_start > window_start
-            or historical.requested_end < window_end
-            or "HISTORICAL_ORDER_SNAPSHOTS" not in historical.execution_evidence_scope
-            or historical.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE
-        ):
-            raise OMSExecutionError("historical order facts do not cover the complete intent proof window")
+        historical = self._strict_historical_order_facts(
+            account,
+            requested_start=window_start,
+            requested_end=window_end,
+        )
 
         # A never-submitted intent has no durable broker/client identifier to
         # match.  Reject only history rows whose provider evidence explicitly
@@ -6925,15 +7739,12 @@ class GenericOMS:
         if self.repository.open_reconciliation_issues(account.id) or self.repository.open_recovery_actions(account.id):
             raise OMSExecutionError("pending reconciliation or recovery blockers prevent aborted-intent cleanup")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise OMSExecutionError("fresh authoritative account facts are required for aborted-intent cleanup")
-        facts = getter(account)
-        if not isinstance(facts, BrokerFactSnapshot) or facts.account_id != account.id:
-            raise OMSExecutionError("authoritative account facts are invalid for aborted-intent cleanup")
-        if not facts.complete or facts.error:
-            raise OMSExecutionError(f"authoritative account facts are incomplete: {facts.error or 'unspecified'}")
-        if facts.open_orders or any(position.signed_quantity != 0 for position in facts.positions):
+        facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            require_no_open_orders=True,
+        )
+        if any(position.signed_quantity != 0 for position in normalized_positions):
             raise OMSExecutionError("broker account is not flat for aborted-intent cleanup")
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
             raise OMSExecutionError("execution evidence is unavailable for aborted-intent cleanup")
@@ -6980,8 +7791,8 @@ class GenericOMS:
                 "book_id": intent.get("book_id"),
                 "cancelled_leg_ids": cancelable,
                 "intent_status_preserved": IntentStatus.RECONCILIATION_REQUIRED.value,
-                "broker_position_count": len(facts.positions),
-                "broker_open_order_count": len(facts.open_orders),
+                "broker_position_count": len(normalized_positions),
+                "broker_open_order_count": len(normalized_open_orders),
                 "broker_fill_count": len(facts.fills),
                 "execution_evidence_mode": facts.execution_evidence_mode.value,
             },
@@ -6999,12 +7810,13 @@ class GenericOMS:
         *,
         account: Account,
     ) -> dict[str, object]:
-        """Close one compensated partial entry after fresh broker proof.
+        """Close one compensated partial ENTER/EXIT after fresh broker proof.
 
         This is an explicit recovery operation for a multi-leg entry where a
         submitted leg filled, a linked exit flattened that exact quantity,
-        and another leg was never submitted.  It does not infer flatness from
-        the local ledger or from a stale baseline: both a fresh complete
+        and another leg was either never submitted or has a provider-proven
+        terminal zero-fill attempt.  It does not infer flatness from the local
+        ledger or from a stale baseline: both a fresh complete
         account snapshot and a complete historical-order window covering the
         intent through ``now`` are mandatory.  Only the exact intent's
         terminal-history blockers are eligible for resolution; unrelated
@@ -7026,8 +7838,33 @@ class GenericOMS:
             raise OMSExecutionError("cannot resolve compensated intent with an invalid persisted policy")
         if str(intent.get("status")) != IntentStatus.RECONCILIATION_REQUIRED.value:
             raise OMSExecutionError("only a reconciliation-required intent can be compensated")
-        if str(intent.get("action")) != IntentAction.ENTER.value:
-            raise OMSExecutionError("compensated partial recovery is restricted to entry intents")
+        source_action = str(intent.get("action"))
+        if source_action not in {IntentAction.ENTER.value, IntentAction.EXIT.value}:
+            raise OMSExecutionError("compensated partial recovery supports only ENTER or EXIT intents")
+
+        # A partial EXIT may be completed by the explicit residual route when
+        # one sibling exited and another sibling was durably rejected/cancelled
+        # with authenticated zero-fill evidence.  Discover only an exact
+        # source-linked residual here; all of its legs are revalidated below.
+        residual_candidate_ids: set[str] = set()
+        if source_action == IntentAction.EXIT.value:
+            for candidate_row in self.repository.book_intents(
+                account.id, book_id=str(intent.get("book_id") or "")
+            ):
+                candidate_id = str(candidate_row.get("id") or "")
+                if not candidate_id or candidate_id == intent_id:
+                    continue
+                candidate = self.repository.get_intent(candidate_id)
+                metadata = candidate.get("metadata") if candidate is not None else None
+                if (
+                    candidate is not None
+                    and str(candidate.get("account_id")) == account.id
+                    and str(candidate.get("book_id") or "") == str(intent.get("book_id") or "")
+                    and isinstance(metadata, Mapping)
+                    and metadata.get("verified_residual_exit") is True
+                    and str(metadata.get("source_intent_id")) == intent_id
+                ):
+                    residual_candidate_ids.add(candidate_id)
 
         # This scan may create the normal aged-terminal blocker.  The proof
         # below may resolve only the exact aged attempts it covers.
@@ -7063,16 +7900,26 @@ class GenericOMS:
                 )
             return False
 
-        def exact_source_entry(value: object, source_id: str) -> bool:
+        def exact_source_entry(value: object, source_id: str, *, allow_canonical: bool = False) -> bool:
             if isinstance(value, Mapping):
+                canonical_compensation = allow_canonical or (
+                    value.get("verified_compensating_exit") is True
+                    or value.get("verified_residual_exit") is True
+                    or value.get("verified_partial_compensation") is True
+                )
                 for key, item in value.items():
                     key_text = normalize_provider_key(key)
                     if key_text in {"source_entry_intent", "source_entry_intent_id"} and str(item) == source_id:
                         return True
-                    if exact_source_entry(item, source_id):
+                    if canonical_compensation and key_text == "source_intent_id" and str(item) == source_id:
+                        return True
+                    if exact_source_entry(item, source_id, allow_canonical=canonical_compensation):
                         return True
             elif isinstance(value, (list, tuple, set, frozenset)):
-                return any(exact_source_entry(item, source_id) for item in value)
+                return any(
+                    exact_source_entry(item, source_id, allow_canonical=allow_canonical)
+                    for item in value
+                )
             return False
 
         def validate_local_fill_leg(leg: Mapping[str, object]) -> tuple[dict[str, object], Decimal]:
@@ -7118,10 +7965,125 @@ class GenericOMS:
                     raise OMSExecutionError(f"fill {fill.get('id')} has a foreign account identity")
             if total != requested:
                 raise OMSExecutionError(f"leg {leg_id} durable fills do not equal requested quantity")
-            return {"leg": leg, "attempt": attempt, "fills": fills}, requested
+            return {"leg": leg, "attempt": attempt, "fills": fills, "verified_quantity": requested}, requested
+
+        def validate_local_source_partial_leg(
+            leg: Mapping[str, object],
+        ) -> tuple[dict[str, object], Decimal]:
+            """Validate one durably partial source leg without treating it as complete.
+
+            A cancelled/failed leg with positive, exact durable fills is a
+            legitimate residual source.  It still needs one immutable broker
+            attempt, strict fill provenance, and a terminal provider state;
+            active or ambiguous attempts never enter this path.
+            """
+            leg_id = str(leg["id"])
+            attempts = self.repository.broker_orders_for_leg(leg_id)
+            requested = parse_decimal(leg.get("quantity"), f"leg {leg_id} quantity")
+            cumulative = parse_decimal(
+                leg.get("cumulative_filled_quantity"), f"leg {leg_id} cumulative quantity"
+            )
+            if requested <= 0 or cumulative <= 0 or cumulative >= requested:
+                raise OMSExecutionError(f"leg {leg_id} is not strictly partial")
+            if len(attempts) != 1:
+                raise OMSExecutionError(f"partial leg {leg_id} does not have exactly one broker attempt")
+            if str(leg.get("status")) not in {
+                LegStatus.PARTIALLY_FILLED.value,
+                LegStatus.CANCELLED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                raise OMSExecutionError(f"partial leg {leg_id} is not durably terminal/partial")
+            attempt = attempts[0]
+            if str(attempt.get("account_id")) != account.id:
+                raise OMSExecutionError(f"partial leg {leg_id} broker attempt belongs to another account")
+            if str(attempt.get("status")) not in {
+                BrokerOrderStatus.PARTIALLY_FILLED.value,
+                BrokerOrderStatus.CANCELLED.value,
+            }:
+                raise OMSExecutionError(f"partial leg {leg_id} broker attempt is active or unknown")
+            external_id = str(attempt.get("external_order_id") or "").strip()
+            if not external_id:
+                raise OMSExecutionError(f"partial leg {leg_id} has no external broker order identity")
+            submitted = parse_decimal(
+                attempt.get("submitted_quantity"), f"partial leg {leg_id} submitted quantity"
+            )
+            if submitted != requested:
+                raise OMSExecutionError(f"partial leg {leg_id} submitted quantity does not match requested quantity")
+            fills = self.repository.fills_for_broker_order(str(attempt["id"]))
+            if not fills:
+                raise OMSExecutionError(f"partial leg {leg_id} has no durable fills")
+            total = Decimal("0")
+            identities: set[str] = set()
+            submitted_at = parse_time(
+                attempt.get("submitted_at") or attempt.get("updated_at"),
+                f"partial attempt {external_id} submitted_at",
+            )
+            for fill in fills:
+                quantity = parse_decimal(fill.get("quantity"), f"fill {fill.get('id')} quantity")
+                price = parse_decimal(fill.get("price"), f"fill {fill.get('id')} price")
+                if quantity <= 0 or price <= 0:
+                    raise OMSExecutionError(f"fill {fill.get('id')} has invalid economics")
+                identity = str(fill.get("external_fill_id") or fill.get("dedupe_key") or "").strip()
+                if not identity or identity in identities:
+                    raise OMSExecutionError(f"partial leg {leg_id} has duplicate/unknown fill identity")
+                identities.add(identity)
+                metadata = fill.get("metadata")
+                if not isinstance(metadata, Mapping):
+                    raise OMSExecutionError(f"fill {fill.get('id')} has no durable provenance")
+                if str(fill.get("external_order_id") or external_id) != external_id:
+                    raise OMSExecutionError(f"fill {fill.get('id')} has a foreign order identity")
+                if str(fill.get("account_id") or account.id) != account.id:
+                    raise OMSExecutionError(f"fill {fill.get('id')} has a foreign account identity")
+                filled_at = parse_time(fill.get("filled_at"), f"fill {fill.get('id')} filled_at")
+                received_at = parse_time(fill.get("received_at"), f"fill {fill.get('id')} received_at")
+                if filled_at < submitted_at - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                    raise OMSExecutionError(f"fill {fill.get('id')} predates durable submission")
+                if received_at < filled_at - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                    raise OMSExecutionError(f"fill {fill.get('id')} receipt predates fill")
+                total += quantity
+            if total != cumulative:
+                raise OMSExecutionError(f"partial leg {leg_id} durable fills do not equal cumulative quantity")
+            return {
+                "leg": leg,
+                "attempt": attempt,
+                "fills": fills,
+                "verified_quantity": cumulative,
+                "partial_source": True,
+            }, cumulative
+
+        def validate_terminal_zero_leg(leg: Mapping[str, object]) -> dict[str, object]:
+            """Validate one attempted sibling with an authenticated zero fill."""
+            leg_id = str(leg["id"])
+            attempts = self.repository.broker_orders_for_leg(leg_id)
+            if len(attempts) != 1:
+                raise OMSExecutionError(
+                    f"zero-fill leg {leg_id} does not have exactly one broker attempt"
+                )
+            if self.repository.fills_for_leg(leg_id):
+                raise OMSExecutionError(f"zero-fill leg {leg_id} has durable fills")
+            try:
+                cumulative = Decimal(str(leg.get("cumulative_filled_quantity", "0")))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError(f"zero-fill leg {leg_id} has malformed cumulative quantity") from exc
+            if cumulative != 0:
+                raise OMSExecutionError(f"zero-fill leg {leg_id} is not actually zero-filled")
+            if str(leg.get("status")) not in {
+                LegStatus.CANCELLED.value,
+                LegStatus.REJECTED.value,
+                LegStatus.FAILED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                raise OMSExecutionError(f"zero-fill leg {leg_id} is not terminal")
+            attempt = attempts[0]
+            if not self._attempt_has_terminal_zero_fill_evidence(attempt, leg):
+                raise OMSExecutionError(
+                    f"zero-fill leg {leg_id} lacks strict terminal provider evidence"
+                )
+            return {"leg": leg, "attempt": attempt}
 
         submitted_legs: list[dict[str, object]] = []
         unsent_legs: list[str] = []
+        terminal_zero_legs: dict[str, dict[str, object]] = {}
         entry_by_instrument: dict[str, Decimal] = {}
         expected_external_ids: dict[str, dict[str, object]] = {}
         for leg in intent["legs"]:
@@ -7138,7 +8100,17 @@ class GenericOMS:
                     raise OMSExecutionError(f"leg {leg['id']} has ambiguous unsent evidence")
                 unsent_legs.append(str(leg["id"]))
                 continue
-            proof, quantity = validate_local_fill_leg(leg)
+            if cumulative == 0:
+                zero_proof = validate_terminal_zero_leg(leg)
+                unsent_legs.append(str(leg["id"]))
+                terminal_zero_legs[str(zero_proof["attempt"].get("external_order_id"))] = zero_proof
+                continue
+            requested = parse_decimal(leg.get("quantity"), f"leg {leg['id']} quantity")
+            if cumulative < requested:
+                proof, quantity = validate_local_source_partial_leg(leg)
+                unsent_legs.append(str(leg["id"]))
+            else:
+                proof, quantity = validate_local_fill_leg(leg)
             submitted_legs.append(proof)
             external_id = str(proof["attempt"].get("external_order_id"))
             expected_external_ids[external_id] = proof
@@ -7147,29 +8119,45 @@ class GenericOMS:
             entry_by_instrument[instrument] = entry_by_instrument.get(instrument, Decimal("0")) + signed
 
         if not submitted_legs or not unsent_legs:
-            raise OMSExecutionError("intent is not a partial entry with both filled and unsent legs")
+            raise OMSExecutionError("intent is not a partial ENTER/EXIT with both filled and unsent legs")
 
-        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
-        if not callable(getter):
-            raise OMSExecutionError("fresh authoritative account facts are required")
-        try:
-            facts = getter(account)
-        except Exception as exc:
-            raise OMSExecutionError(f"authoritative account facts unavailable: {exc}") from exc
-        if not isinstance(facts, BrokerFactSnapshot):
-            raise OMSExecutionError("authoritative account facts are invalid")
-        if facts.account_id != account.id or not facts.complete or facts.error:
-            raise OMSExecutionError("authoritative account facts are incomplete or for another account")
-        # Observe the clock after the provider query.  Comparing against the
-        # pre-query clock would reject a valid capture made milliseconds after
-        # the query began as an impossible future fact.
+        facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
+            account,
+            max_age_seconds=self.BROKER_FACT_MAX_AGE_SECONDS,
+            require_no_open_orders=True,
+        )
+        # ENTER compensation proves a flat account.  EXIT compensation restores
+        # the account-wide managed allocation that existed before the partial
+        # exit; it must not be mistaken for a flat account.  The shared fact
+        # helper has already rejected incomplete, stale, contradictory, or
+        # foreign-account rows.
         now = self._now()
-        captured_at = parse_time(facts.captured_at, "account facts captured_at")
         future_tolerance = timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS)
-        if captured_at > now + future_tolerance or (now - captured_at).total_seconds() > 900:
-            raise OMSExecutionError("authoritative account facts are stale")
-        if facts.open_orders or any(position.signed_quantity != 0 for position in facts.positions):
-            raise OMSExecutionError("broker account is not freshly flat")
+        if source_action == IntentAction.ENTER.value:
+            expected_account_positions: dict[str, Decimal] = {}
+            if any(position.signed_quantity != 0 for position in normalized_positions):
+                raise OMSExecutionError("broker account is not freshly flat")
+        else:
+            expected_account_positions = self._strict_durable_managed_account_exposure(account)
+            observed_positions = {
+                str(position.instrument_id): Decimal(str(position.signed_quantity))
+                for position in normalized_positions
+                if Decimal(str(position.signed_quantity)) != 0
+            }
+            if residual_candidate_ids:
+                # The explicit residual path may have completed the remaining
+                # EXIT exposure, so the only safe alternative to the original
+                # durable allocation is an actually flat fresh account.  The
+                # exact source/residual quantity proof is checked after both
+                # lifecycles are validated below.
+                if observed_positions:
+                    raise OMSExecutionError(
+                        "partial EXIT residual completion requires a freshly flat broker account"
+                    )
+            elif observed_positions != expected_account_positions:
+                raise OMSExecutionError(
+                    "broker account positions do not equal the durable managed EXIT compensation exposure"
+                )
         if facts.execution_evidence_mode is ExecutionEvidenceMode.UNAVAILABLE:
             raise OMSExecutionError("execution evidence is unavailable")
         for broker_fill in facts.fills:
@@ -7211,20 +8199,32 @@ class GenericOMS:
         history_by_external: dict[str, list[BrokerOrderSnapshot]] = {}
         for snapshot in historical.orders:
             history_by_external.setdefault(str(snapshot.external_order_id), []).append(snapshot)
+        history_fills_by_external: dict[str, list[BrokerFill]] = {}
+        for broker_fill in historical.fills:
+            history_fills_by_external.setdefault(str(broker_fill.external_order_id), []).append(broker_fill)
         for external_id, proof in expected_external_ids.items():
             rows = history_by_external.get(external_id, [])
             if len(rows) != 1:
                 raise OMSExecutionError(f"historical order coverage is missing or contradictory for {external_id}")
             snapshot = rows[0]
             leg = proof["leg"]
-            quantity = parse_decimal(leg.get("quantity"), f"history {external_id} quantity")
+            requested = parse_decimal(leg.get("quantity"), f"history {external_id} quantity")
+            quantity = parse_decimal(
+                proof.get("verified_quantity", requested), f"history {external_id} filled quantity"
+            )
+            partial_source = proof.get("partial_source") is True
             if (
                 snapshot.account_id != account.id
                 or snapshot.instrument_id != str(leg.get("instrument_id"))
                 or snapshot.side.value != str(leg.get("side"))
-                or snapshot.quantity != quantity
+                or snapshot.quantity != requested
                 or snapshot.filled_quantity != quantity
-                or snapshot.status is not BrokerOrderStatus.FILLED
+                or snapshot.status
+                not in (
+                    {BrokerOrderStatus.PARTIALLY_FILLED, BrokerOrderStatus.CANCELLED}
+                    if partial_source
+                    else {BrokerOrderStatus.FILLED}
+                )
             ):
                 raise OMSExecutionError(f"historical order {external_id} conflicts with the durable leg")
             attempt_time = parse_time(proof["attempt"].get("submitted_at"), f"attempt {external_id} submitted_at")
@@ -7232,16 +8232,50 @@ class GenericOMS:
             if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
                 raise OMSExecutionError(f"historical order {external_id} predates durable submission")
 
+        for external_id, proof in terminal_zero_legs.items():
+            rows = history_by_external.get(external_id, [])
+            if len(rows) != 1:
+                raise OMSExecutionError(
+                    f"historical order coverage is missing or contradictory for terminal zero-fill {external_id}"
+                )
+            snapshot = rows[0]
+            leg = proof["leg"]
+            attempt = proof["attempt"]
+            submitted = parse_decimal(attempt.get("submitted_quantity"), f"history {external_id} quantity")
+            if (
+                snapshot.account_id != account.id
+                or snapshot.instrument_id != str(leg.get("instrument_id"))
+                or snapshot.side.value != str(leg.get("side"))
+                or snapshot.quantity != submitted
+                or snapshot.filled_quantity != 0
+                or snapshot.status
+                not in {
+                    BrokerOrderStatus.CANCELLED,
+                    BrokerOrderStatus.REJECTED,
+                    BrokerOrderStatus.FAILED,
+                }
+            ):
+                raise OMSExecutionError(
+                    f"historical order {external_id} contradicts terminal zero-fill proof"
+                )
+            attempt_time = parse_time(attempt.get("submitted_at"), f"attempt {external_id} submitted_at")
+            observed_time = snapshot.order_time or snapshot.captured_at
+            if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                raise OMSExecutionError(f"historical order {external_id} predates durable submission")
+            if history_fills_by_external.get(external_id):
+                raise OMSExecutionError(
+                    f"historical order facts contain a late fill for terminal zero-fill {external_id}"
+                )
+
         # If the provider also exposes deal rows, bind every row to the same
         # expected attempt/account/instrument.  Cumulative-only history is
         # allowed to omit deals, but it may not contain contradictory ones.
-        history_fills_by_external: dict[str, list[BrokerFill]] = {}
-        for broker_fill in historical.fills:
-            history_fills_by_external.setdefault(str(broker_fill.external_order_id), []).append(broker_fill)
         for external_id, proof in expected_external_ids.items():
             history_fills = history_fills_by_external.get(external_id, [])
             leg = proof["leg"]
-            expected_quantity = parse_decimal(leg.get("quantity"), f"history {external_id} quantity")
+            expected_quantity = parse_decimal(
+                proof.get("verified_quantity", leg.get("quantity")), f"history {external_id} quantity"
+            )
             total_history_quantity = Decimal("0")
             for broker_fill in history_fills:
                 if broker_fill.account_id not in (None, account.id):
@@ -7278,7 +8312,19 @@ class GenericOMS:
                 or str(candidate.get("book_id") or "") != str(intent.get("book_id") or "")
             ):
                 raise OMSExecutionError(f"linked compensation {candidate_id} has an account or book mismatch")
-            if str(candidate.get("action")) not in {IntentAction.EXIT.value, IntentAction.FLATTEN.value}:
+            candidate_metadata = candidate.get("metadata")
+            is_residual_completion = (
+                source_action == IntentAction.EXIT.value
+                and isinstance(candidate_metadata, Mapping)
+                and candidate_metadata.get("verified_residual_exit") is True
+                and str(candidate_metadata.get("source_intent_id")) == intent_id
+            )
+            allowed_compensation_actions = (
+                {IntentAction.EXIT.value, IntentAction.FLATTEN.value}
+                if source_action == IntentAction.ENTER.value
+                else ({IntentAction.ENTER.value, IntentAction.EXIT.value} if is_residual_completion else {IntentAction.ENTER.value})
+            )
+            if str(candidate.get("action")) not in allowed_compensation_actions:
                 raise OMSExecutionError(f"linked compensation {candidate_id} has an invalid action")
             positive_legs = []
             unsubmitted_or_definite_rejection = False
@@ -7296,7 +8342,7 @@ class GenericOMS:
                 if (
                     len(attempts) == 1
                     and self._is_durable_no_submit_rejection(
-                        attempts[0], leg, tuple(facts.open_orders)
+                        attempts[0], leg, normalized_open_orders
                     )
                 ):
                     unsubmitted_or_definite_rejection = True
@@ -7329,7 +8375,7 @@ class GenericOMS:
                 linked_exits.extend(positive_legs)
 
         if not linked_exits:
-            raise OMSExecutionError("no linked compensating exit with durable fill evidence")
+            raise OMSExecutionError("no linked compensating intent with durable fill evidence")
 
         # Re-check the complete historical window after discovering linked
         # compensation intents.  Entry claims are checked above, but exit
@@ -7341,14 +8387,23 @@ class GenericOMS:
                 raise OMSExecutionError(f"historical order coverage is missing or contradictory for {external_id}")
             snapshot = rows[0]
             leg = proof["leg"]
-            quantity = parse_decimal(leg.get("quantity"), f"history {external_id} quantity")
+            requested = parse_decimal(leg.get("quantity"), f"history {external_id} quantity")
+            quantity = parse_decimal(
+                proof.get("verified_quantity", requested), f"history {external_id} filled quantity"
+            )
+            partial_source = proof.get("partial_source") is True
             if (
                 snapshot.account_id != account.id
                 or snapshot.instrument_id != str(leg.get("instrument_id"))
                 or snapshot.side.value != str(leg.get("side"))
-                or snapshot.quantity != quantity
+                or snapshot.quantity != requested
                 or snapshot.filled_quantity != quantity
-                or snapshot.status is not BrokerOrderStatus.FILLED
+                or snapshot.status
+                not in (
+                    {BrokerOrderStatus.PARTIALLY_FILLED, BrokerOrderStatus.CANCELLED}
+                    if partial_source
+                    else {BrokerOrderStatus.FILLED}
+                )
             ):
                 raise OMSExecutionError(f"historical order {external_id} conflicts with the durable leg")
             attempt_time = parse_time(proof["attempt"].get("submitted_at"), f"attempt {external_id} submitted_at")
@@ -7371,11 +8426,61 @@ class GenericOMS:
             instrument = str(leg.get("instrument_id"))
             signed = quantity if str(leg.get("side")) == Side.BUY.value else -quantity
             exit_by_instrument[instrument] = exit_by_instrument.get(instrument, Decimal("0")) + signed
-        if set(exit_by_instrument) != set(entry_by_instrument) or any(
+        residual_completion_ids = {
+            str(proof["leg"].get("intent_id"))
+            for proof, _quantity in linked_exits
+            if str(proof["leg"].get("intent_id")) in residual_candidate_ids
+        }
+        if source_action == IntentAction.EXIT.value and residual_completion_ids:
+            # A partial EXIT residual is a different proof shape from a
+            # compensating ENTER: every positive source EXIT fill and every
+            # authenticated zero-fill sibling must be paired with the exact
+            # residual order, and the durable pre-EXIT allocation must then be
+            # fully offset.  No labels or netting are trusted here.
+            zero_by_instrument = {
+                str(proof["leg"].get("instrument_id")): proof["leg"]
+                for proof in terminal_zero_legs.values()
+            }
+            residual_by_instrument: dict[str, Decimal] = {}
+            for proof, quantity in linked_exits:
+                candidate_id = str(proof["leg"].get("intent_id"))
+                if candidate_id not in residual_candidate_ids:
+                    raise OMSExecutionError("partial EXIT residual contains an unrelated linked intent")
+                instrument = str(proof["leg"].get("instrument_id"))
+                source_zero_leg = zero_by_instrument.get(instrument)
+                if source_zero_leg is None:
+                    raise OMSExecutionError("partial EXIT residual does not match a terminal zero-fill sibling")
+                if (
+                    str(proof["leg"].get("side")) != str(source_zero_leg.get("side"))
+                    or quantity != parse_decimal(source_zero_leg.get("quantity"), "terminal zero sibling quantity")
+                ):
+                    raise OMSExecutionError("partial EXIT residual quantity or side differs from zero-fill sibling")
+                if instrument in residual_by_instrument:
+                    raise OMSExecutionError("partial EXIT residual reuses a zero-fill sibling instrument")
+                signed = quantity if str(proof["leg"].get("side")) == Side.BUY.value else -quantity
+                residual_by_instrument[instrument] = signed
+            if set(residual_by_instrument) != set(zero_by_instrument):
+                raise OMSExecutionError("partial EXIT residual does not cover every zero-fill sibling")
+            try:
+                pre_source_basis = self.repository.book_signed_exposure(
+                    account.id,
+                    str(intent.get("book_id") or ""),
+                    exclude_intent_ids={intent_id, *residual_candidate_ids},
+                )
+            except Exception as exc:
+                raise OMSExecutionError("partial EXIT residual durable book basis is unavailable") from exc
+            combined = dict(pre_source_basis)
+            for instrument, quantity in entry_by_instrument.items():
+                combined[instrument] = combined.get(instrument, Decimal("0")) + quantity
+            for instrument, quantity in residual_by_instrument.items():
+                combined[instrument] = combined.get(instrument, Decimal("0")) + quantity
+            if any(quantity != 0 for quantity in combined.values()):
+                raise OMSExecutionError("partial EXIT residual does not flatten the durable managed book")
+        elif set(exit_by_instrument) != set(entry_by_instrument) or any(
             entry_by_instrument[instrument] + exit_by_instrument.get(instrument, Decimal("0")) != 0
             for instrument in entry_by_instrument
         ):
-            raise OMSExecutionError("linked compensation does not exactly offset the filled entry exposure")
+            raise OMSExecutionError("linked compensation does not exactly offset the filled source exposure")
 
         # Require the historical window to contain every submitted claim,
         # including the compensating exit, and reject explicit claims for this
@@ -7387,25 +8492,43 @@ class GenericOMS:
             all_markers.add(str(exit_intent.get("id")))
             all_markers.add(str(exit_intent.get("idempotency_key") or ""))
         all_markers.discard("")
+        proof_external_ids = set(expected_external_ids) | set(terminal_zero_legs)
         for snapshot in historical.orders:
             if marker(snapshot.client_order_id, all_markers) or marker(snapshot.metadata, all_markers):
-                if str(snapshot.external_order_id) not in expected_external_ids:
+                if str(snapshot.external_order_id) not in proof_external_ids:
                     raise OMSExecutionError("historical facts contain an unmatched claim for the recovered intents")
 
         book_id = str(intent.get("book_id") or "")
         local_book_totals: dict[str, Decimal] = {}
         for row in self.repository.book_position_allocations(account.id, book_id=book_id):
             instrument = str(row.get("instrument_id"))
-            if instrument in entry_by_instrument:
-                local_book_totals[instrument] = local_book_totals.get(instrument, Decimal("0")) + parse_decimal(
+            try:
+                allocation_quantity = parse_decimal(
                     row.get("signed_quantity", "0"), f"allocation {row.get('id')} quantity"
                 )
-        if any(local_book_totals.get(instrument, Decimal("0")) != 0 for instrument in entry_by_instrument):
-            raise OMSExecutionError("local book allocations are not flat after compensation")
+            except OMSExecutionError:
+                raise
+            if allocation_quantity != 0 and str(row.get("ownership_class") or "").upper() != OwnershipClass.MANAGED.value:
+                raise OMSExecutionError("local book allocations contain unknown ownership")
+            if instrument in entry_by_instrument:
+                local_book_totals[instrument] = local_book_totals.get(instrument, Decimal("0")) + allocation_quantity
+        if source_action == IntentAction.ENTER.value:
+            if any(local_book_totals.get(instrument, Decimal("0")) != 0 for instrument in entry_by_instrument):
+                raise OMSExecutionError("local book allocations are not flat after compensation")
+        else:
+            if not local_book_totals:
+                raise OMSExecutionError("partial EXIT compensation lacks durable book allocation evidence")
+            if any(
+                expected_account_positions.get(instrument, Decimal("0"))
+                != local_book_totals.get(instrument, Decimal("0"))
+                for instrument in local_book_totals
+            ):
+                raise OMSExecutionError("partial EXIT compensation has cross-book or allocation exposure")
 
+        proof_attempts = tuple(expected_external_ids.values()) + tuple(terminal_zero_legs.values())
         allowed_issue_keys = {
             f"TERMINAL_HISTORY_EXPIRED:BROKER_ORDER:{internal_id}"
-            for proof in expected_external_ids.values()
+            for proof in proof_attempts
             for internal_id in [str(proof["attempt"].get("id"))]
         }
         # A prior recovery poll may have emitted the paired terminal-evidence
@@ -7418,10 +8541,50 @@ class GenericOMS:
         allowed_issue_keys.update(
             {
                 f"BROKER_TERMINAL_EVIDENCE_MISSING:BROKER_ORDER:{internal_id}"
-                for proof in expected_external_ids.values()
+                for proof in proof_attempts
                 for internal_id in [str(proof["attempt"].get("id"))]
             }
         )
+        partial_source_attempts = {
+            str(proof["attempt"].get("id")): proof
+            for proof in expected_external_ids.values()
+            if proof.get("partial_source") is True
+        }
+
+        def proven_partial_source_issue(issue: Mapping[str, object]) -> bool:
+            """Allow only exact recovery rows caused by a proven partial source."""
+            category = str(issue.get("category", ""))
+            if category not in {"FILL_EVIDENCE_REQUIRED", "TERMINAL_FILL_CONTRADICTION"}:
+                return False
+            internal_id = str(issue.get("entity_key", "")).strip()
+            proof = partial_source_attempts.get(internal_id)
+            if proof is None:
+                return False
+            details = self._issue_details(issue)
+            expected_quantity = parse_decimal(
+                proof.get("verified_quantity"), f"partial source {internal_id} quantity"
+            )
+            try:
+                observed_quantity = Decimal(
+                    str(details.get("durable_filled_quantity", details.get("cumulative_filled_quantity")))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if observed_quantity != expected_quantity:
+                return False
+            if category == "FILL_EVIDENCE_REQUIRED":
+                return str(details.get("broker_status", "")) in {
+                    BrokerOrderStatus.PARTIALLY_FILLED.value,
+                    BrokerOrderStatus.CANCELLED.value,
+                }
+            try:
+                incoming_count = int(details.get("incoming_fill_count", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            return (
+                str(details.get("terminal_status", "")) == BrokerOrderStatus.CANCELLED.value
+                and incoming_count > 0
+            )
         retired_book_ids = self._verified_retired_baseline_books(account)
         retired_allocation_ids: set[str] = set()
         if retired_book_ids:
@@ -7473,15 +8636,19 @@ class GenericOMS:
             closure = metadata.get("compensated_partial_closure") if isinstance(metadata, Mapping) else None
             if not isinstance(closure, Mapping):
                 return False
-            if (
-                str(closure.get("reason", ""))
-                != "fresh_broker_and_historical_proof_of_compensated_partial_entry"
-                or str(closure.get("account_id", account.id)) != account.id
-            ):
+            if str(closure.get("reason", "")) not in {
+                "fresh_broker_and_historical_proof_of_compensated_partial_entry",
+                "fresh_broker_and_historical_proof_of_compensated_partial_exit",
+            } or str(closure.get("account_id", account.id)) != account.id:
                 return False
             external_ids = {
                 str(value).strip()
-                for field in ("filled_entry_external_order_ids", "compensating_external_order_ids")
+                for field in (
+                    "filled_entry_external_order_ids",
+                    "filled_source_external_order_ids",
+                    "compensating_external_order_ids",
+                    "terminal_zero_external_order_ids",
+                )
                 for value in (closure.get(field) or ())
                 if str(value).strip()
             }
@@ -7588,7 +8755,7 @@ class GenericOMS:
         for issue in open_issues:
             issue_key = str(issue.get("issue_key"))
             category = str(issue.get("category", ""))
-            if issue_key in allowed_issue_keys:
+            if issue_key in allowed_issue_keys or proven_partial_source_issue(issue):
                 issue_keys_to_resolve.add(issue_key)
                 continue
             if category == "MIXED_TERMINAL_LEGS":
@@ -7613,16 +8780,55 @@ class GenericOMS:
         open_actions = self.repository.open_recovery_actions(account.id)
         allowed_action_keys = {
             f"TERMINAL_HISTORY_EXPIRED:{internal_id}"
-            for proof in expected_external_ids.values()
+            for proof in proof_attempts
             for internal_id in [str(proof["attempt"].get("id"))]
         }
         allowed_action_keys.update(
             {
                 f"TERMINAL_ORDER_EVIDENCE:{internal_id}"
-                for proof in expected_external_ids.values()
+                for proof in proof_attempts
                 for internal_id in [str(proof["attempt"].get("id"))]
             }
         )
+
+        def proven_partial_source_action(action: Mapping[str, object]) -> bool:
+            action_key = str(action.get("action_key", ""))
+            action_intent = str(action.get("intent_id", ""))
+            if action_intent != intent_id:
+                return False
+            if action_key.startswith("TERMINAL_PARTIAL:"):
+                internal_id = action_key.split(":", 1)[1]
+            elif action_key.startswith("TERMINAL_FILL_CONTRADICTION:"):
+                internal_id = action_key.split(":", 2)[1]
+            else:
+                return False
+            proof = partial_source_attempts.get(internal_id)
+            if proof is None:
+                return False
+            metadata = action.get("metadata")
+            if not isinstance(metadata, Mapping):
+                return False
+            expected_quantity = parse_decimal(
+                proof.get("verified_quantity"), f"partial source {internal_id} quantity"
+            )
+            try:
+                observed_quantity = Decimal(
+                    str(metadata.get("durable_filled_quantity", metadata.get("cumulative_filled_quantity")))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if observed_quantity != expected_quantity:
+                return False
+            if action_key.startswith("TERMINAL_PARTIAL:"):
+                return True
+            try:
+                incoming_count = int(metadata.get("incoming_fill_count", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            return (
+                str(metadata.get("terminal_status", "")) == BrokerOrderStatus.CANCELLED.value
+                and incoming_count > 0
+            )
         owned_intent_ids = {intent_id}
         for proof, _quantity in linked_exits:
             owned_intent_ids.add(str(proof["leg"].get("intent_id")))
@@ -7631,6 +8837,9 @@ class GenericOMS:
             action_key = str(action.get("action_key"))
             action_intent = str(action.get("intent_id"))
             if action_intent in owned_intent_ids and action_key in allowed_action_keys:
+                action_keys_to_resolve.add(action_key)
+                continue
+            if proven_partial_source_action(action):
                 action_keys_to_resolve.add(action_key)
                 continue
             if action_key == f"MIXED_TERMINAL_LEGS:{intent_id}":
@@ -7691,8 +8900,14 @@ class GenericOMS:
                     summary="Terminalized a linked exit intent after exact fresh flat-account and historical-order proof.",
                     details={"intent_id": candidate_id, "proof": candidate_metadata},
                 )
+        closure_reason = (
+            "fresh_broker_and_historical_proof_of_compensated_partial_entry"
+            if source_action == IntentAction.ENTER.value
+            else "fresh_broker_and_historical_proof_of_compensated_partial_exit"
+        )
         proof_metadata = {
-            "reason": "fresh_broker_and_historical_proof_of_compensated_partial_entry",
+            "reason": closure_reason,
+            "source_action": source_action,
             "verified_at": now.isoformat(),
             "historical_window": {
                 "requested_start": historical.requested_start.isoformat(),
@@ -7706,9 +8921,23 @@ class GenericOMS:
             "filled_entry_external_order_ids": sorted(
                 str(proof["attempt"].get("external_order_id")) for proof in submitted_legs
             ),
+            "filled_source_external_order_ids": sorted(
+                str(proof["attempt"].get("external_order_id")) for proof in submitted_legs
+            ),
+            "partial_source_leg_ids": sorted(
+                str(proof["leg"].get("id"))
+                for proof in submitted_legs
+                if proof.get("partial_source") is True
+            ),
+            "partial_source_external_order_ids": sorted(
+                str(proof["attempt"].get("external_order_id"))
+                for proof in submitted_legs
+                if proof.get("partial_source") is True
+            ),
             "compensating_external_order_ids": sorted(
                 str(proof["attempt"].get("external_order_id")) for proof, _quantity in linked_exits
             ),
+            "terminal_zero_external_order_ids": sorted(terminal_zero_legs),
             "compensating_intent_ids": sorted(
                 {
                     str(proof["leg"].get("intent_id"))
@@ -7745,6 +8974,7 @@ class GenericOMS:
             "proof": "fresh_flat_account_and_exact_compensating_exit",
             "filled_entry_external_order_ids": proof_metadata["filled_entry_external_order_ids"],
             "compensating_external_order_ids": proof_metadata["compensating_external_order_ids"],
+            "terminal_zero_external_order_ids": proof_metadata["terminal_zero_external_order_ids"],
             "unsent_leg_ids": proof_metadata["unsent_leg_ids"],
         }
 
@@ -7938,6 +9168,80 @@ class GenericOMS:
         # Hard account actions are blockers for lifecycle refresh.  A normal
         # WAIT/WORKING observation remains visible while an order is active,
         # but still blocks ``safe_to_submit`` and completion account-wide.
+        # A terminal intent with complete, own fill evidence is not itself
+        # re-opened merely because a sibling intent has an account-wide
+        # blocker.  The blocker remains durable and continues to fail the
+        # account submission gate; only evidence naming this intent (or one
+        # of its own legs/attempts/fills) may demote its terminal lifecycle.
+        # This matters for a verified partial EXIT: recovery must preserve
+        # the completed entry while the EXIT/residual round-trip is being
+        # reconciled, rather than rewriting historical ownership as if the
+        # entry itself had become ambiguous.
+        if recovered["status"] in {
+            IntentStatus.COMPLETED.value,
+        }:
+            own_leg_ids = {str(leg.get("id")) for leg in recovered["legs"]}
+            own_attempt_ids = {
+                str(attempt.get("id"))
+                for leg_id in own_leg_ids
+                for attempt in self.repository.broker_orders_for_leg(leg_id)
+            }
+            own_external_order_ids = {
+                str(attempt.get("external_order_id"))
+                for leg_id in own_leg_ids
+                for attempt in self.repository.broker_orders_for_leg(leg_id)
+                if str(attempt.get("external_order_id") or "").strip()
+            }
+            own_fill_ids: set[str] = set()
+            for attempt_id in own_attempt_ids:
+                own_fill_ids.update(
+                    str(fill.get("id"))
+                    for fill in self.repository.fills_for_broker_order(attempt_id)
+                )
+
+            def issue_belongs_to_intent(issue: Mapping[str, object]) -> bool:
+                details = self._issue_details(issue)
+                if str(details.get("intent_id", "")) == intent_id:
+                    return True
+                entity_type = str(issue.get("entity_type", ""))
+                entity_key = str(issue.get("entity_key", ""))
+                if entity_type in {"INTENT", "ORDER_INTENT"} and entity_key == intent_id:
+                    return True
+                if entity_type in {"ORDER_LEG", "LEG"} and entity_key in own_leg_ids:
+                    return True
+                if entity_type in {"BROKER_ORDER", "ORDER"} and entity_key in own_attempt_ids:
+                    return True
+                if entity_type == "BROKER_FILL" and entity_key in own_fill_ids:
+                    return True
+                for key in (
+                    "broker_order_id",
+                    "order_leg_id",
+                    "leg_id",
+                    "fill_id",
+                    "external_order_id",
+                ):
+                    value = str(details.get(key, ""))
+                    if value and (
+                        value in own_attempt_ids
+                        or value in own_leg_ids
+                        or value in own_fill_ids
+                        or value in own_external_order_ids
+                    ):
+                        return True
+                return False
+
+            def action_belongs_to_intent(action: Mapping[str, object]) -> bool:
+                if str(action.get("intent_id", "")) == intent_id:
+                    return True
+                metadata = action.get("metadata")
+                if isinstance(metadata, Mapping) and str(metadata.get("intent_id", "")) == intent_id:
+                    return True
+                return False
+
+            if not any(issue_belongs_to_intent(issue) for issue in open_issues) and not any(
+                action_belongs_to_intent(action) for action in open_actions
+            ):
+                return
         blocking_actions = [
             action
             for action in open_actions
@@ -8032,8 +9336,75 @@ class GenericOMS:
             metadata=details,
         )
 
+    def _record_recovery_fact_failure(
+        self,
+        intent: Mapping[str, object],
+        account: Account,
+        error: Exception,
+    ) -> None:
+        """Durably block recovery without accepting any broker evidence."""
+        intent_id = str(intent["id"])
+        details = {
+            "intent_id": intent_id,
+            "account_id": account.id,
+            "reason": "fresh authoritative recovery facts unavailable",
+            "error": str(error),
+        }
+        self._require_reconciliation(
+            intent_id,
+            account,
+            category="BROKER_FACT_UNAVAILABLE",
+            entity_type="ACCOUNT",
+            entity_key=account.id,
+            details=details,
+        )
+        self._record_recovery_action(
+            intent=intent,
+            account=account,
+            action_key=f"BROKER_FACT_UNAVAILABLE:{account.id}:RECOVERY",
+            state="RECONCILIATION_REQUIRED",
+            summary=(
+                "Recovery requires a complete, account-scoped, fresh authoritative broker fact snapshot; "
+                "no fills or lifecycle promotion were applied."
+            ),
+            observed_positions={"_status": "UNAVAILABLE", "_error": str(error)},
+            remaining_quantities=self._remaining_quantities(intent),
+            allowed_next_steps=("refresh_broker_facts", "reconcile_broker_position", "operator_review"),
+            metadata=details,
+        )
+
     def recover_intent(self, intent_id: str, *, account: Account) -> dict:
-        """Poll durable attempts from broker truth without resubmission."""
+        """Recover only after one fresh strict account-fact snapshot."""
+        self._startup_safety_audit()
+        intent = self._required_intent(intent_id)
+        if account.id != str(intent["account_id"]):
+            return self._recover_intent_with_facts(intent_id, account=account)
+        canonical = self._canonical_account_for_intent(
+            intent,
+            supplied=account,
+            source="recover_intent",
+        )
+        if canonical is None:
+            return self._required_intent(intent_id)
+        account = canonical
+        if not self._validate_persisted_execution_policy(intent, account, source="recover_intent"):
+            return self._required_intent(intent_id)
+        if intent_id in self._closed_historical_intent_ids(account):
+            return self._required_intent(intent_id)
+        try:
+            context = self._validated_recovery_fact_context(account)
+        except Exception as exc:
+            self._record_recovery_fact_failure(intent, account, exc)
+            return self._required_intent(intent_id)
+        previous_context = self._recovery_fact_context
+        self._recovery_fact_context = context
+        try:
+            return self._recover_intent_with_facts(intent_id, account=account)
+        finally:
+            self._recovery_fact_context = previous_context
+
+    def _recover_intent_with_facts(self, intent_id: str, *, account: Account) -> dict:
+        """Internal recovery body; caller must install a validated context."""
         self._startup_safety_audit()
         intent = self._required_intent(intent_id)
         if account.id != str(intent["account_id"]):
@@ -8064,61 +9435,14 @@ class GenericOMS:
         self._ensure_terminal_history_safety(account)
         self._quarantine_multiple_attempts(intent_id, account)
         now = self._now()
-        observed_positions, position_error = self._observe_positions(account)
-        if position_error is not None:
-            self._require_reconciliation(
-                intent_id,
-                account,
-                category="BROKER_QUERY_FAILED",
-                entity_type="ACCOUNT",
-                entity_key=f"{account.id}:positions",
-                details={"message": position_error},
-            )
-            self._record_recovery_action(
-                intent=intent,
-                account=account,
-                action_key=f"POLL_ERROR:{account.id}:positions",
-                state="RECONCILIATION_REQUIRED",
-                summary="Broker position polling failed; observed exposure is unavailable and no remediation is allowed.",
-                observed_positions=observed_positions,
-                remaining_quantities=self._remaining_quantities(intent),
-                allowed_next_steps=("refresh_broker_facts", "reconcile_broker_position", "operator_review"),
-                metadata={"error": position_error},
-            )
-            # A failed account read is one retryable recovery outcome.  Do
-            # not immediately issue order/fill reads (or a second position
-            # read for action metadata); that would hammer a rate-limited
-            # provider and create misleading sibling-fill blockers.
+        context = self._recovery_fact_context
+        if not isinstance(context, Mapping) or context.get("account_id") != account.id:
+            error = OMSExecutionError("recovery is missing a validated account-fact context")
+            self._record_recovery_fact_failure(intent, account, error)
             return self._required_intent(intent_id)
-        try:
-            open_orders = tuple(self.adapter.get_open_orders(account))
-            if any(not isinstance(item, BrokerOrderSnapshot) for item in open_orders):
-                raise TypeError("adapter get_open_orders() must return BrokerOrderSnapshot values")
-            open_orders, duplicate_order_blockers = self._dedupe_account_broker_order_facts(open_orders)
-        except Exception as exc:
-            self._require_reconciliation(
-                intent_id,
-                account,
-                category="BROKER_QUERY_FAILED",
-                entity_type="ACCOUNT",
-                entity_key=account.id,
-                details={"message": str(exc)},
-            )
-            self._record_recovery_action(
-                intent=intent,
-                account=account,
-                action_key=f"POLL_ERROR:{account.id}",
-                state="RECONCILIATION_REQUIRED",
-                summary="Broker order polling failed; do not resubmit or remediate until broker truth is available.",
-                observed_positions=observed_positions,
-                remaining_quantities=self._remaining_quantities(intent),
-                allowed_next_steps=("refresh_broker_facts", "reconcile_broker_position", "operator_review"),
-                metadata={
-                    "error": str(exc),
-                    "retryable": bool(getattr(exc, "retryable", False)),
-                },
-            )
-            return self._required_intent(intent_id)
+        observed_positions = dict(context["observed_positions"])
+        open_orders = tuple(context["open_orders"])
+        duplicate_order_blockers: list[dict[str, object]] = []
 
         if duplicate_order_blockers:
             details = {
@@ -8300,6 +9624,27 @@ class GenericOMS:
                     continue
 
                 match = matches[0]
+                # A provider order read can become terminal between the
+                # initial account-fact snapshot and this per-order query.  Do
+                # not let that raw snapshot create fill evidence: refresh the
+                # strict account-fact context first, and continue only if the
+                # refreshed facts authenticate the same cumulative quantity.
+                if match.filled_quantity > 0 and (
+                    self._recovery_context_fill_quantity(context, match.external_order_id)
+                    != match.filled_quantity
+                ):
+                    try:
+                        context = self._validated_recovery_fact_context(account)
+                    except Exception as exc:
+                        self._record_recovery_fact_failure(
+                            self._required_intent(intent_id),
+                            account,
+                            exc,
+                        )
+                        return self._required_intent(intent_id)
+                    self._recovery_fact_context = context
+                    observed_positions = dict(context["observed_positions"])
+                    open_orders = tuple(context["open_orders"])
                 validation = self._validate_poll_snapshot(
                     account=account,
                     attempt=attempt,
@@ -8638,7 +9983,11 @@ class GenericOMS:
         # not ask a broker for account-wide deal history in that case.
         clean_rejection = self._restore_definite_rejection(intent_id, account, open_orders)
         if self._intent_needs_fill_recovery(intent_id, open_orders) and not clean_rejection:
-            self._recover_fills(intent_id, account)
+            self._recover_fills(
+                intent_id,
+                account,
+                broker_fills=tuple(context["fills"]),
+            )
         self._resolve_snapshot_fill_evidence(account, intent_id)
 
         # A persisted definite no-submit rejection may intentionally leave
@@ -8856,6 +10205,87 @@ class GenericOMS:
             return False
         return True
 
+    def _attempt_has_terminal_zero_fill_evidence(
+        self,
+        attempt: Mapping[str, object],
+        leg: Mapping[str, object],
+    ) -> bool:
+        """Prove an attempted terminal leg never filled after a restart.
+
+        A zero cumulative quantity is not evidence by itself.  For an
+        attempted broker order the durable row must carry the adapter's
+        authenticated terminal no-fill envelope that was validated before the
+        cancel/rejection was persisted.  This is intentionally separate from
+        ``_is_durable_no_submit_rejection`` because a provider may have created
+        and then cancelled an order with an external identity.
+        """
+        status = str(attempt.get("status", ""))
+        if status not in {
+            BrokerOrderStatus.CANCELLED.value,
+            BrokerOrderStatus.REJECTED.value,
+            BrokerOrderStatus.FAILED.value,
+        }:
+            return False
+        try:
+            if Decimal(str(leg.get("cumulative_filled_quantity", "0"))) != 0:
+                return False
+            if self._durable_filled_quantity(str(attempt["id"])) != 0:
+                return False
+            submitted_quantity = Decimal(str(attempt["submitted_quantity"]))
+            expected_quantity = Decimal(str(leg["quantity"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError, sqlite3.Error):
+            return False
+        if submitted_quantity <= 0 or submitted_quantity != expected_quantity:
+            return False
+        if not str(attempt.get("external_order_id") or "").strip():
+            return False
+        metadata = self._attempt_metadata(dict(attempt))
+        if metadata.get("terminal_zero_fill_proof") is not True:
+            return False
+        if metadata.get("ambiguous") is True or metadata.get("no_fill_asserted") is not True:
+            return False
+        if metadata.get("cumulative_fill_known") is not True:
+            return False
+        try:
+            if Decimal(str(metadata.get("reported_cumulative_fill"))) != 0:
+                return False
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        if metadata.get("authority") != ADAPTER_ORDER_SNAPSHOT_AUTHORITY:
+            return False
+        instrument_id = str(leg.get("instrument_id") or "").strip()
+        if metadata.get("submitted_quantity") not in (None, ""):
+            try:
+                if Decimal(str(metadata["submitted_quantity"])) != expected_quantity:
+                    return False
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+        if metadata.get("instrument_id") not in (None, instrument_id):
+            return False
+        raw_payload = metadata.get("raw_payload")
+        if not isinstance(raw_payload, Mapping):
+            return False
+        try:
+            result = BrokerSubmissionResult(
+                broker_order_id=str(attempt["id"]),
+                accepted=metadata.get("accepted") if isinstance(metadata.get("accepted"), bool) else None,
+                status=BrokerOrderStatus(status),
+                external_order_id=str(attempt["external_order_id"]),
+                cumulative_filled_quantity=Decimal("0"),
+                raw_payload=raw_payload,
+                no_fill_asserted=True,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                submitted_quantity=expected_quantity,
+                instrument_id=instrument_id,
+            )
+        except (TypeError, ValueError, InvalidOperation):
+            return False
+        return not self._has_cancel_evidence(
+            result,
+            expected_quantity=expected_quantity,
+            expected_instrument_id=instrument_id,
+        )
+
     @staticmethod
     def _attempt_metadata(attempt: dict) -> dict:
         value = attempt.get("metadata_json", {})
@@ -8966,7 +10396,13 @@ class GenericOMS:
                 # to the next recovery/status call.
                 continue
 
-    def _recover_fills(self, intent_id: str, account: Account) -> None:
+    def _recover_fills(
+        self,
+        intent_id: str,
+        account: Account,
+        *,
+        broker_fills: Sequence[BrokerFill],
+    ) -> None:
         """Apply broker deal facts to known attempts; never infer fills from status."""
         intent = self._required_intent(intent_id)
         if account.id != str(intent["account_id"]):
@@ -8989,32 +10425,11 @@ class GenericOMS:
         # supports one attempt per logical leg.
         if self._quarantine_multiple_attempts(intent_id, account):
             return
-        try:
-            broker_fills = tuple(self.adapter.get_fills(account, since=None))
-            if any(not isinstance(item, BrokerFill) for item in broker_fills):
-                raise TypeError("adapter get_fills() must return BrokerFill values")
-        except Exception as exc:
-            self._require_reconciliation(
-                intent_id,
+        if any(not isinstance(item, BrokerFill) for item in broker_fills):
+            self._record_recovery_fact_failure(
+                self._required_intent(intent_id),
                 account,
-                category="BROKER_QUERY_FAILED",
-                entity_type="ACCOUNT",
-                entity_key=f"{account.id}:fills",
-                details={"intent_id": intent_id, "message": str(exc)},
-            )
-            self._record_recovery_action(
-                intent=self._required_intent(intent_id),
-                account=account,
-                action_key=f"POLL_ERROR:{account.id}:fills",
-                state="RECONCILIATION_REQUIRED",
-                summary="Broker fill polling failed; do not infer fills or submit remediation orders.",
-                observed_positions=self._last_observed_positions,
-                remaining_quantities=self._remaining_quantities(self._required_intent(intent_id)),
-                allowed_next_steps=("refresh_broker_fills", "reconcile_broker_position", "operator_review"),
-                metadata={
-                    "error": str(exc),
-                    "retryable": bool(getattr(exc, "retryable", False)),
-                },
+                OMSExecutionError("validated account facts contained a non-normalized fill"),
             )
             return
 
@@ -9343,6 +10758,12 @@ class GenericOMS:
                 )
                 continue
             try:
+                self._validate_recovery_fill_provenance(
+                    account,
+                    broker_fill,
+                    attempt=attempt,
+                    leg=matched_leg,
+                )
                 self.repository.record_fill(
                     Fill(
                         id=str(
@@ -9870,6 +11291,177 @@ class GenericOMS:
             value != broker_fill.instrument_id for value in canonical_instrument_values
         ):
             raise ValueError("broker fill instrument metadata does not match normalized instrument identity")
+
+    def _validate_exact_selected_fill_facts(
+        self,
+        *,
+        account: Account,
+        facts: BrokerFactSnapshot,
+        expected_rows: Sequence[Mapping[str, object]],
+        source: str,
+    ) -> dict[str, list[BrokerFill]]:
+        """Authenticate the complete fresh fill set for one proof claim.
+
+        A proof route must not select one convenient fill from an account-wide
+        snapshot and silently net away another row.  Every selected durable
+        fill is matched by its full immutable identity/economics/timestamps
+        and provenance, and every additional row must be an exact,
+        proof-backed closed-history replay.  Active sibling, foreign,
+        unattributed, changed, or otherwise ambiguous rows fail before an
+        exit intent can be created.
+        """
+        expected_by_external: dict[str, list[Mapping[str, object]]] = {}
+        expected_by_identity: dict[tuple[str, str], Mapping[str, object]] = {}
+        for row in expected_rows:
+            external_order_id = str(row.get("external_order_id") or "").strip()
+            durable_fill = row.get("fill")
+            attempt = row.get("attempt")
+            if not external_order_id or not isinstance(durable_fill, Mapping) or not isinstance(attempt, Mapping):
+                raise OMSExecutionError(f"{source} durable fill claim is incomplete")
+            durable_identity = str(
+                durable_fill.get("external_fill_id") or durable_fill.get("dedupe_key") or ""
+            ).strip()
+            if not durable_identity:
+                raise OMSExecutionError(f"{source} durable fill claim has no immutable identity")
+            identity = (external_order_id, durable_identity)
+            if identity in expected_by_identity:
+                raise OMSExecutionError(f"{source} durable fill claims contain a duplicate identity")
+            expected_by_identity[identity] = row
+            expected_by_external.setdefault(external_order_id, []).append(row)
+
+        matched: dict[str, list[BrokerFill]] = {}
+        matched_identities: set[tuple[str, str]] = set()
+        for broker_fill in facts.fills:
+            external_order_id = str(broker_fill.external_order_id).strip()
+            candidates = expected_by_external.get(external_order_id)
+            if not candidates:
+                if self.is_proof_backed_closed_broker_fill(
+                    account=account,
+                    broker_fill=broker_fill,
+                ):
+                    continue
+                raise OMSExecutionError(
+                    f"{source} fresh broker facts contain an extra unattributed, sibling, or foreign fill "
+                    f"{external_order_id}"
+                )
+
+            matching_row: Mapping[str, object] | None = None
+            mismatch_reasons: list[str] = []
+            for row in candidates:
+                reason = self._selected_fill_fact_mismatch(
+                    account=account,
+                    broker_fill=broker_fill,
+                    row=row,
+                )
+                if reason is None:
+                    matching_row = row
+                    break
+                mismatch_reasons.append(reason)
+            if matching_row is None:
+                raise OMSExecutionError(
+                    f"{source} fresh broker fill {external_order_id} conflicts with durable evidence: "
+                    + "; ".join(sorted(set(mismatch_reasons)))
+                )
+
+            durable_fill = matching_row["fill"]
+            durable_identity = str(
+                durable_fill.get("external_fill_id") or durable_fill.get("dedupe_key") or ""
+            )
+            identity = (external_order_id, durable_identity)
+            if identity in matched_identities:
+                raise OMSExecutionError(
+                    f"{source} fresh broker facts contain a duplicate selected fill identity {identity!r}"
+                )
+            matched_identities.add(identity)
+            matched.setdefault(external_order_id, []).append(broker_fill)
+
+        missing = sorted(set(expected_by_identity) - matched_identities)
+        if missing:
+            raise OMSExecutionError(
+                f"{source} fresh broker facts lack complete selected fill evidence: {missing!r}"
+            )
+        return matched
+
+    def _selected_fill_fact_mismatch(
+        self,
+        *,
+        account: Account,
+        broker_fill: BrokerFill,
+        row: Mapping[str, object],
+    ) -> str | None:
+        """Return one durable-vs-provider mismatch for a selected fill."""
+        instrument_id = str(row.get("instrument_id") or "").strip()
+        external_order_id = str(row.get("external_order_id") or "").strip()
+        attempt = row.get("attempt")
+        durable_fill = row.get("fill")
+        if not isinstance(attempt, Mapping) or not isinstance(durable_fill, Mapping):
+            return "durable fill claim is incomplete"
+        if broker_fill.external_order_id != external_order_id:
+            return "external order identity differs"
+        if broker_fill.external_fill_id != durable_fill.get("external_fill_id"):
+            return "external fill identity differs"
+        if broker_fill.dedupe_key != str(durable_fill.get("dedupe_key") or ""):
+            return "dedupe identity differs"
+        try:
+            if broker_fill.quantity != Decimal(str(durable_fill.get("quantity"))):
+                return "fill quantity differs"
+            if broker_fill.price != Decimal(str(durable_fill.get("price"))):
+                return "fill price differs"
+            durable_fee = durable_fill.get("fee")
+            durable_fee_value = Decimal(str(durable_fee)) if durable_fee is not None else None
+            if broker_fill.fee != durable_fee_value:
+                return "fill fee differs"
+        except (InvalidOperation, TypeError, ValueError):
+            return "fill economics are malformed"
+        if broker_fill.fee_currency != durable_fill.get("fee_currency"):
+            return "fill fee currency differs"
+        durable_filled_at = self._parse_timestamp(durable_fill.get("filled_at"))
+        durable_received_at = self._parse_timestamp(durable_fill.get("received_at"))
+        if durable_filled_at is None or broker_fill.filled_at != durable_filled_at:
+            return "fill timestamp differs"
+        if durable_received_at is None or broker_fill.received_at != durable_received_at:
+            return "fill receipt timestamp differs"
+        durable_mode = str(durable_fill.get("evidence_mode") or "").strip()
+        if durable_mode and broker_fill.evidence_mode.value != durable_mode:
+            return "execution evidence mode differs"
+        stored_metadata = durable_fill.get("metadata")
+        if not isinstance(stored_metadata, Mapping):
+            return "durable fill provenance metadata is missing"
+        stored_external = str(stored_metadata.get("_external_order_id") or "").strip()
+        if stored_external and stored_external != external_order_id:
+            return "durable external-order provenance differs"
+        stored_instrument = str(stored_metadata.get("_instrument_id") or "").strip()
+        if stored_instrument and stored_instrument != instrument_id:
+            return "durable instrument provenance differs"
+        stored_account = str(stored_metadata.get(self._BROKER_FILL_ACCOUNT_ID_KEY) or "").strip()
+        if stored_account and stored_account != account.id:
+            return "durable account provenance differs"
+        stored_reference = str(
+            stored_metadata.get("_evidence_reference")
+            or stored_metadata.get("evidence_reference")
+            or ""
+        ).strip()
+        if stored_reference and broker_fill.evidence_reference not in {
+            stored_reference,
+            broker_fill.dedupe_key,
+            f"{external_order_id}:{broker_fill.dedupe_key}",
+        }:
+            return "execution evidence reference differs"
+        if self._fill_account_id(broker_fill) != account.id:
+            return "provider fill account provenance differs"
+        if broker_fill.instrument_id != instrument_id:
+            return "provider fill instrument provenance differs"
+        if broker_fill.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not broker_fill.evidence_reference:
+            return "provider fill execution provenance is unavailable"
+        try:
+            self._validate_broker_fill_provenance(
+                attempt,
+                broker_fill,
+                expected_instrument_id=instrument_id,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return str(exc)
+        return None
 
     @staticmethod
     def _fill_account_id(broker_fill: BrokerFill) -> str | None:

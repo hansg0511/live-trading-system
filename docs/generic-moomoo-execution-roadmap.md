@@ -712,13 +712,20 @@ market state, and no broker/local blockers immediately before `sim-submit`.
 This is configuration/readiness tooling only and does not constitute Stage 6
 pilot evidence or completion.
 
-Stage 6 execution compatibility is `stage6-execution-v3`.  This version keeps
+Stage 6 execution compatibility is `stage6-execution-v4`.  This version keeps
 GenericOMS broker-neutral while allowing only the reviewed safety seams needed
 by the pilot: a per-leg admission callback for fresh account/RTH facts, the
-strict residual-compensation primitive, contradictory-position quarantine, and
-EXIT-before-ENTER recovery ordering.  The architecture test pins the reviewed
-normalized OMS source blob; any further OMS execution change requires a new
-compatibility review rather than being silently treated as validation-only.
+strict residual-compensation primitive, proof-backed terminal zero-fill
+attempts, exact scoped partial cancellation/requery recovery, contradictory-
+position quarantine, generalized ENTER/EXIT compensation resolution, and the
+public strict account/history fact boundary reused by Stage 6 preflight,
+baseline, and recovery, including strict recovery provenance admission before
+any fill or lifecycle write.  The
+architecture test pins the reviewed V4 normalized OMS source blob
+`d7916936dd9aa29d89376959c611071e5da4b866`; this is the reviewed Stage 6 V4
+safety baseline.  Any further OMS execution change requires a new compatibility
+review rather than being silently treated as validation-only.  Legacy smoke
+tags and hashes remain unchanged and are not reinterpreted by this V4 baseline.
 
 The connected `broker-preflight` command is the read-only checkpoint for this
 checklist.  It reports the exact configured SIM account, complete fresh
@@ -742,13 +749,12 @@ read-only.  Re-running with the same label and exact source claims is intended
 to be idempotent; changed or unmatched source/account/order evidence is
 rejected.
 
-**Known baseline-import limitation (separate from broker-preflight):**
-`import_legacy_order_evidence()` deduplicates by its generated local order ID
-before inserting the source `(account_id, external_order_id)`.  A previously
-imported source order under a different legacy label can therefore hit the
-SQLite account/external-order uniqueness constraint.  The new broker-preflight
-does not invoke this importer; this remains a compatibility defect to repair
-separately.
+The legacy baseline importer now compares and reuses the complete immutable
+`(account_id, external_order_id)` evidence graph before creating any target
+rows.  An exact graph is reusable under a different label; partial overlap,
+changed economics/provenance, ambiguous attempts, and non-legacy ownership
+remain hard failures.  The broker-preflight command does not invoke this
+importer, and no source database is mutated.
 
 After offline review, a separately approved RTH SIM run uses:
 
@@ -964,14 +970,39 @@ create a second submission path:
 The CLI help groups the supported workflow into five operator-facing
 categories: `validate`/`dry-run` for offline preparation; `broker-preflight`,
 `baseline`, `recover`, and `final-state` for connected read-only facts or
-local recovery evidence; `sim-submit`, `compensating-exit`, and `residual-exit`
-for explicitly armed SIM order paths; `resolve-*` for proof-backed local
-resolution; and `session-*`/`stage-status` for durable validation reporting.
+local recovery evidence; `sim-submit`, `compensating-exit`, `residual-exit`,
+and `cancel-known-partial` for explicitly armed SIM order/cancellation paths;
+`resolve-*` for proof-backed local resolution; and `session-*`/`stage-status`
+for durable validation reporting.  A compensating or residual command exits
+with status `2` whenever any attempt remains `WORKING`, `SUBMITTING`, or
+`PARTIALLY_FILLED`; only terminal, proof-backed results return success.
 Every intent-ID command validates account, strategy, book, and configured
 instrument scope before invoking its existing OMS boundary.  Resolution
 commands return a non-zero process status when proof is absent or a lifecycle
 remains active/ambiguous; a successful safe cancellation may intentionally
 retain `RECONCILIATION_REQUIRED` when its durable proof is present.
+
+The offline partial-state matrix is exercised by fake CLI/runner tests.  The
+letters are stable references for operator runbooks; no row authorizes an
+automatic retry or an overnight workaround:
+
+| ID | State | Operator action | Proof/prohibition | Result |
+| --- | --- | --- | --- | --- |
+| A | Fresh, complete, flat SIM preflight in US RTH | `broker-preflight`, then the explicitly armed entry path | Re-read account facts and market state at the submission boundary | Submit only when every gate passes; otherwise no order |
+| B | Stale, incomplete, future, or contradictory account/market facts | Stop and obtain a new authoritative snapshot | No cache fallback, inference, or order probe | Non-zero result and zero new orders |
+| C | Foreign/open broker order or unrelated position | Stop for reconciliation | Do not net, flatten, cancel, or retry unrelated exposure | Local lifecycle remains blocked |
+| D | RTH closes before the first leg | Stop the batch | No first-leg attempt is inferred from absence | `sim-submit` is non-zero; no submission |
+| E | First compensation/residual leg admitted, then RTH closes before leg two | Preserve leg one and use read-only `recover` | Fresh per-leg gate; leg two has no broker attempt | CLI returns `2`; first leg remains auditable/recoverable (`test_cli_compensation_rth_closes_after_first_leg_and_remains_recoverable`) |
+| F | Attempt is `SUBMITTING` | Read-only recovery only | No duplicate attempt or implicit retry | Order-bearing CLI returns `2` |
+| G | Attempt is `WORKING` | `recover` and fresh broker facts | Do not call submit again | Order-bearing CLI returns `2` |
+| H | Attempt is `PARTIALLY_FILLED` with positive residual | Prove/cancel the exact partial order, then use scoped residual proof | No inferred fill or generic flatten | CLI returns `2` until terminal proof and flatness |
+| I | Sibling is terminal `CANCELLED`/`REJECTED` with strict zero-fill proof | Use exact residual/compensation route | Provider terminal status, zero-fill evidence, identity, and history must agree | Residual may proceed; ambiguous evidence blocks |
+| J | Late or historical fill contradicts a zero-fill claim | Keep reconciliation open | Historical facts are authoritative; no residual order is allowed | Non-zero result and no new attempt |
+| K | Cancel race returns positive, conflicting, or ambiguous fill evidence | Preserve the incident and re-query/reconcile | Never treat cancellation as proof of no fill | No residual/cleanup bypass (`CANCEL_AMBIGUITY`) |
+| L | Verified residual/compensation order is submitted | Observe through `recover` and resolve only with durable proof | Idempotency is per leg/source; no automatic retry | Working/partial remains non-zero and cannot count clean |
+| M | Current exposure is fully flat with no open orders/issues/actions/unfinished intents | `final-state`, then proof-backed resolution/finalization | Fresh complete facts and terminal lifecycle are required | Only this state can produce a successful terminal observation |
+| N | Intent ID belongs to another account, strategy, book, or instrument universe | Reject before broker connection/submission | Every intent-ID command enforces configured scope | Non-zero result and no mutation |
+| O | RTH is closed/overnight after an incident | Stop; resume only in a later authorized RTH session with fresh facts | No sleep-through, market-order workaround, or unattended retry | Incident remains durable and unresolved until safely recovered |
 
 ```powershell
 # Record an explicit no-submit preflight observation.
@@ -997,14 +1028,21 @@ python scripts/generic_stage6_pilot.py stage-status `
   --config configs/stage6-pilot-sim-next-entry-20261005.json --json
 ```
 
-These validation commands do not connect to OpenD or submit orders.  When preflight
-evidence is omitted, `session-preflight` invokes the existing runner's
+The `session-*`, `session-evidence`, and `stage-status` commands do not connect to
+OpenD or submit orders.  When preflight evidence is omitted, `session-preflight` invokes the existing runner's
 `DRY_RUN` mode to capture its no-submit report, including any normal
 allocation bookkeeping that mode already performs; it then persists only the
-validation observation.  `broker-preflight` is the only connected read-only
-Stage 6 command; `sim-submit` remains the only broker-order command and still
-dispatches exclusively through `Stage6PilotRunner` →
-`GenericOMS`.
+validation observation.  The connected read-only/fact paths are
+`broker-preflight`, `baseline`, `recover`, `final-state`, and `prepare-exit`;
+the connected proof-resolution paths are `resolve-roundtrip`,
+`resolve-unsubmitted`, `resolve-compensated-partial`, and
+`resolve-aggregate-roundtrip`.  They may query OpenD and, where documented,
+write only scoped local recovery/evidence rows; they never submit, cancel, or
+replace broker orders.  `compensating-exit` and `residual-exit` are explicitly
+armed SIM submission paths, while `cancel-known-partial` is the explicitly
+armed single-cancel path.  `sim-submit` remains the normal broker-order
+command and all order/cancel paths dispatch exclusively through
+`Stage6PilotRunner` → `GenericOMS`.
 The Oct 5 narrative evidence predates this durable validation ledger and does
 not contain a persisted validator recovery observation, so it is retained as
 `LEGACY_VERIFIED_EVIDENCE` and is not counted automatically.  It may only be

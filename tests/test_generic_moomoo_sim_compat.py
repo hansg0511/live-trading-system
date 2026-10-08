@@ -27,6 +27,8 @@ from src.trading_core.domain import (
     MappingPurpose,
     OrderIntent,
     OrderLeg,
+    OwnershipClass,
+    PositionAllocation,
     PositionSnapshot,
     RiskDecisionRecord,
     Side,
@@ -175,7 +177,7 @@ def test_explicitly_unavailable_execution_evidence_blocks_submit(tmp_path):
     intent = _intent()
     repository.create_intent(intent)
     adapter = _FactsAdapter(_facts(ExecutionEvidenceMode.UNAVAILABLE))
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
 
     assert oms._account_wide_broker_fact_gate(intent.id, _account()) is False
     assert adapter.submit_calls == 0
@@ -249,7 +251,7 @@ def test_cumulative_snapshots_require_verified_baseline_then_allow_flat_gate(tmp
     repository.create_intent(intent)
     facts = _facts(ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS)
     adapter = _FactsAdapter(facts)
-    oms = GenericOMS(repository, adapter)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
 
     assert oms._account_wide_broker_fact_gate(intent.id, _account()) is False
 
@@ -257,7 +259,7 @@ def test_cumulative_snapshots_require_verified_baseline_then_allow_flat_gate(tmp
     # account fact by design.
     clean = _repository(tmp_path / "clean")
     clean.create_intent(intent)
-    clean_oms = GenericOMS(clean, _FactsAdapter(facts))
+    clean_oms = GenericOMS(clean, _FactsAdapter(facts), clock=lambda: NOW)
     position_fp, open_order_fp = clean_oms.execution_fact_fingerprints(facts)
     clean.save_execution_evidence_baseline(
         ExecutionEvidenceBaseline(
@@ -693,6 +695,232 @@ def test_compensated_partial_promotes_reconciled_but_exactly_filled_exit(tmp_pat
     )
 
 
+def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_exposure(tmp_path):
+    repository = _repository(tmp_path)
+    repository.save_book(Book(id="compat-book", name="compat book", created_at=NOW, updated_at=NOW))
+    repository.save_instrument(
+        Instrument(
+            id="compat-instrument-2",
+            asset_class=AssetClass.EQUITY,
+            symbol="COMPAT2",
+            venue="US",
+            currency="USD",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    account = _account()
+    source_id = "partial-exit-source"
+    source = OrderIntent(
+        id=source_id,
+        idempotency_key=f"{source_id}-key",
+        strategy_id="compat-strategy",
+        account_id=account.id,
+        book_id="compat-book",
+        action=IntentAction.EXIT,
+        execution_policy=ExecutionPolicy(),
+        legs=(
+            OrderLeg(
+                id=f"{source_id}-leg-a",
+                intent_id=source_id,
+                sequence=0,
+                instrument_id="compat-instrument",
+                side=Side.SELL,
+                quantity=Decimal("1"),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            OrderLeg(
+                id=f"{source_id}-leg-b",
+                intent_id=source_id,
+                sequence=1,
+                instrument_id="compat-instrument-2",
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(source)
+    repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(source.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(source.legs[1].id, LegStatus.CANCELLED, now=NOW)
+
+    def add_filled_leg(intent: OrderIntent, leg: OrderLeg, external_id: str, price: str) -> BrokerOrderSnapshot:
+        repository.create_broker_order(
+            broker_order_id=f"{intent.id}-order",
+            order_leg_id=leg.id,
+            account_id=account.id,
+            broker=account.broker,
+            attempt_number=1,
+            client_order_id=f"{leg.id}:1",
+            submitted_quantity=leg.quantity,
+            now=NOW,
+        )
+        repository.transition_broker_order(f"{intent.id}-order", BrokerOrderStatus.SUBMITTING, now=NOW)
+        repository.record_submission(
+            f"{intent.id}-order",
+            status=BrokerOrderStatus.FILLED,
+            external_order_id=external_id,
+            metadata={"provider_status": "FILLED"},
+            now=NOW,
+        )
+        repository.record_fill(
+            Fill(
+                id=f"{intent.id}-fill",
+                broker_order_id=f"{intent.id}-order",
+                order_leg_id=leg.id,
+                dedupe_key=f"{intent.id}-deal",
+                quantity=leg.quantity,
+                price=Decimal(price),
+                filled_at=NOW,
+                received_at=NOW,
+                account_id=account.id,
+                external_order_id=external_id,
+                evidence_reference=f"{intent.id}-deal",
+            ),
+            now=NOW,
+            _validation_token=repository._fill_validation_capability(),
+        )
+        return BrokerOrderSnapshot(
+            id=f"{intent.id}-snapshot",
+            broker_snapshot_id="partial-exit-history",
+            account_id=account.id,
+            instrument_id=leg.instrument_id,
+            external_order_id=external_id,
+            side=leg.side,
+            quantity=leg.quantity,
+            filled_quantity=leg.quantity,
+            status=BrokerOrderStatus.FILLED,
+            captured_at=NOW,
+            order_time=NOW,
+        )
+
+    source_snapshot = add_filled_leg(source, source.legs[0], "partial-exit-source-external", "100")
+    repository.transition_intent(source_id, IntentStatus.RECONCILIATION_REQUIRED, now=NOW)
+
+    compensation_id = "partial-exit-compensation"
+    compensation = OrderIntent(
+        id=compensation_id,
+        idempotency_key=f"{compensation_id}-key",
+        strategy_id="compat-strategy",
+        account_id=account.id,
+        book_id="compat-book",
+        action=IntentAction.ENTER,
+        execution_policy=ExecutionPolicy(),
+        metadata={
+            "verified_partial_compensation": True,
+            "source_intent_id": source_id,
+        },
+        legs=(
+            OrderLeg(
+                id=f"{compensation_id}-leg",
+                intent_id=compensation_id,
+                sequence=0,
+                instrument_id="compat-instrument",
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(compensation)
+    repository.transition_intent(compensation_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(compensation_id, IntentStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(compensation.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    compensation_snapshot = add_filled_leg(
+        compensation,
+        compensation.legs[0],
+        "partial-exit-compensation-external",
+        "101",
+    )
+    repository.transition_intent(compensation_id, IntentStatus.COMPLETED, now=NOW)
+
+    for instrument_id, quantity, source_intent_id in (
+        ("compat-instrument", "2", "basis-entry-a"),
+        ("compat-instrument-2", "-2", "basis-entry-b"),
+    ):
+        repository.save_position_allocation(
+            PositionAllocation(
+                id=f"{source_intent_id}-allocation",
+                account_id=account.id,
+                instrument_id=instrument_id,
+                ownership_class=OwnershipClass.MANAGED,
+                signed_quantity=Decimal(quantity),
+                strategy_id="compat-strategy",
+                book_id="compat-book",
+                source_intent_id=source_id,
+                updated_at=NOW,
+                metadata={"provenance": "partial-exit-test-basis"},
+            ),
+            _validation_token=repository._allocation_validation_capability(),
+        )
+
+    source_fill = BrokerFill(
+        external_order_id="partial-exit-source-external",
+        dedupe_key="partial-exit-source-deal",
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=NOW,
+        received_at=NOW,
+        account_id=account.id,
+        instrument_id="compat-instrument",
+    )
+    compensation_fill = BrokerFill(
+        external_order_id="partial-exit-compensation-external",
+        dedupe_key="partial-exit-compensation-deal",
+        quantity=Decimal("1"),
+        price=Decimal("101"),
+        filled_at=NOW,
+        received_at=NOW,
+        account_id=account.id,
+        instrument_id="compat-instrument",
+    )
+    facts = replace(
+        _facts(ExecutionEvidenceMode.INDIVIDUAL_DEALS),
+        positions=(
+            PositionSnapshot(
+                id="partial-exit-current-a",
+                broker_snapshot_id="partial-exit-current",
+                account_id=account.id,
+                instrument_id="compat-instrument",
+                signed_quantity=Decimal("2"),
+                average_price=Decimal("100"),
+                captured_at=NOW,
+            ),
+            PositionSnapshot(
+                id="partial-exit-current-b",
+                broker_snapshot_id="partial-exit-current",
+                account_id=account.id,
+                instrument_id="compat-instrument-2",
+                signed_quantity=Decimal("-2"),
+                average_price=Decimal("100"),
+                captured_at=NOW,
+            ),
+        ),
+        fills=(source_fill, compensation_fill),
+    )
+    adapter = _CompensatedPartialAdapter(
+        (source_snapshot, compensation_snapshot),
+        facts=facts,
+    )
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=1))
+
+    result = oms.resolve_compensated_partial_intent(source_id, account=account)
+
+    assert result["status"] == IntentStatus.CANCELLED.value
+    closure = repository.get_intent(source_id)["metadata"]["compensated_partial_closure"]
+    assert closure["reason"] == "fresh_broker_and_historical_proof_of_compensated_partial_exit"
+    assert closure["compensating_intent_ids"] == [compensation_id]
+
+
 def test_compensated_partial_ignores_definite_no_submit_retry_link(tmp_path):
     repository = _repository(tmp_path)
     entry, _exit, snapshots = _seed_compensated_partial(repository)
@@ -751,6 +979,24 @@ def test_compensated_partial_entry_rejects_materially_future_provider_capture(tm
     facts = replace(
         _facts(ExecutionEvidenceMode.INDIVIDUAL_DEALS),
         captured_at=NOW + timedelta(seconds=6),
+    )
+    oms = GenericOMS(
+        repository,
+        _CompensatedPartialAdapter(snapshots, facts=facts),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(OMSExecutionError, match="authoritative account facts are stale"):
+        oms.resolve_compensated_partial_intent(entry.id, account=_account())
+    assert repository.get_intent(entry.id)["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+
+
+def test_compensated_partial_entry_rejects_stale_provider_capture(tmp_path):
+    repository = _repository(tmp_path)
+    entry, _exit, snapshots = _seed_compensated_partial(repository)
+    facts = replace(
+        _facts(ExecutionEvidenceMode.INDIVIDUAL_DEALS),
+        captured_at=NOW - timedelta(seconds=61),
     )
     oms = GenericOMS(
         repository,
@@ -911,7 +1157,7 @@ def test_account_fact_gate_accepts_durable_fill_with_repository_instrument_metad
             ),
         ),
     )
-    oms = GenericOMS(repository, _FactsAdapter(facts))
+    oms = GenericOMS(repository, _FactsAdapter(facts), clock=lambda: NOW)
 
     assert oms._account_wide_broker_fact_gate(intent.id, _account()) is True
 
