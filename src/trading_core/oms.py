@@ -39,6 +39,7 @@ from .domain import (
     PositionSnapshot,
     OwnershipClass,
     Side,
+    TradingEnvironment,
 )
 from .ports import (
     BrokerAdapter,
@@ -1079,7 +1080,7 @@ class GenericOMS:
             raise OMSExecutionError(
                 f"broker positions do not exactly match verified source exposure: {observed!r}"
             )
-        self._validate_exact_selected_fill_facts(
+        self._validate_compensating_source_fill_facts(
             account=account,
             facts=facts,
             expected_rows=verified_rows,
@@ -11383,6 +11384,205 @@ class GenericOMS:
                 f"{source} fresh broker facts lack complete selected fill evidence: {missing!r}"
             )
         return matched
+
+    def _validate_compensating_source_fill_facts(
+        self,
+        *,
+        account: Account,
+        facts: BrokerFactSnapshot,
+        expected_rows: Sequence[Mapping[str, object]],
+        source: str,
+    ) -> None:
+        """Validate exact source fills, using bounded SIM history when needed.
+
+        Moomoo SIM account snapshots can be complete and position-authoritative
+        while omitting the already-filled source rows because its deal
+        endpoint is unavailable.  Keep the fresh account facts as the
+        position/open-order gate, then use the existing bounded historical
+        order capability only for the exact durable source claims.  No history
+        query is allowed when the current snapshot already contains fills, and
+        no history fallback is allowed outside the cumulative SIM contract.
+        """
+        if facts.fills:
+            self._validate_exact_selected_fill_facts(
+                account=account,
+                facts=facts,
+                expected_rows=expected_rows,
+                source=source,
+            )
+            return
+
+        if (
+            account.environment is not TradingEnvironment.SIM
+            or facts.execution_evidence_mode is not ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS
+            or "CURRENT_ORDER_SNAPSHOTS" not in facts.execution_evidence_scope
+        ):
+            # Preserve the existing fail-closed error for any provider that
+            # cannot establish the narrow SIM cumulative-snapshot contract.
+            self._validate_exact_selected_fill_facts(
+                account=account,
+                facts=facts,
+                expected_rows=expected_rows,
+                source=source,
+            )
+            return
+
+        requested_start, requested_end = self._compensating_history_window(
+            expected_rows,
+            source=source,
+        )
+        history = self._strict_historical_order_facts(
+            account,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
+        if history.execution_evidence_mode is not ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
+            raise OMSExecutionError(
+                f"{source} historical order facts do not provide cumulative-order snapshot evidence"
+            )
+        if "HISTORICAL_ORDER_SNAPSHOTS" not in history.execution_evidence_scope:
+            raise OMSExecutionError(
+                f"{source} historical order facts lack historical-order snapshot scope"
+            )
+        self._validate_exact_historical_selected_orders(
+            account=account,
+            history=history,
+            expected_rows=expected_rows,
+            source=source,
+        )
+        historical_facts = replace(
+            facts,
+            fills=history.fills,
+            execution_evidence_mode=history.execution_evidence_mode,
+            execution_evidence_scope=history.execution_evidence_scope,
+        )
+        self._validate_exact_selected_fill_facts(
+            account=account,
+            facts=historical_facts,
+            expected_rows=expected_rows,
+            source=source,
+        )
+
+    def _compensating_history_window(
+        self,
+        expected_rows: Sequence[Mapping[str, object]],
+        *,
+        source: str,
+    ) -> tuple[datetime, datetime]:
+        """Derive a bounded history window from durable source timestamps."""
+        timestamps: list[datetime] = []
+        for row in expected_rows:
+            fill = row.get("fill")
+            attempt = row.get("attempt")
+            if not isinstance(fill, Mapping) or not isinstance(attempt, Mapping):
+                raise OMSExecutionError(f"{source} historical fill proof window lacks durable context")
+            raw_filled_at = fill.get("filled_at")
+            filled_at = self._parse_timestamp(raw_filled_at)
+            if filled_at is None:
+                raise OMSExecutionError(
+                    f"{source} historical fill proof window cannot be derived from filled_at"
+                )
+            timestamps.append(filled_at)
+            for key in ("submitted_at", "updated_at"):
+                raw_value = attempt.get(key)
+                if raw_value in (None, ""):
+                    continue
+                parsed = self._parse_timestamp(raw_value)
+                if parsed is None:
+                    raise OMSExecutionError(
+                        f"{source} historical fill proof window has invalid durable {key}"
+                    )
+                timestamps.append(parsed)
+        if not timestamps:
+            raise OMSExecutionError(f"{source} historical fill proof window cannot be derived")
+        return (
+            min(timestamps) - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS),
+            max(timestamps) + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS),
+        )
+
+    def _validate_exact_historical_selected_orders(
+        self,
+        *,
+        account: Account,
+        history: BrokerHistoricalOrderFacts,
+        expected_rows: Sequence[Mapping[str, object]],
+        source: str,
+    ) -> None:
+        """Require one authoritative filled order and one fill per source leg."""
+        expected: dict[str, Mapping[str, object]] = {}
+        for row in expected_rows:
+            external_order_id = str(row.get("external_order_id") or "").strip()
+            if not external_order_id or external_order_id in expected:
+                raise OMSExecutionError(
+                    f"{source} historical order claims contain ambiguous external identities"
+                )
+            expected[external_order_id] = row
+
+        orders: dict[str, BrokerOrderSnapshot] = {}
+        for order in history.orders:
+            external_order_id = str(order.external_order_id).strip()
+            if external_order_id in orders:
+                raise OMSExecutionError(
+                    f"{source} historical order facts contain duplicate order identity {external_order_id}"
+                )
+            orders[external_order_id] = order
+        if set(orders) != set(expected):
+            missing = sorted(set(expected) - set(orders))
+            extra = sorted(set(orders) - set(expected))
+            raise OMSExecutionError(
+                f"{source} historical order facts do not exactly cover selected orders; "
+                f"missing={missing}, extra={extra}"
+            )
+
+        for external_order_id, row in expected.items():
+            order = orders[external_order_id]
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=order.account_id,
+                external_account_id=order.external_account_id,
+                metadata=order.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"{source} historical order {external_order_id} has account mismatch: {aliases}"
+                )
+            if order.authority != ADAPTER_ORDER_SNAPSHOT_AUTHORITY:
+                raise OMSExecutionError(
+                    f"{source} historical order {external_order_id} lacks adapter order authority"
+                )
+            try:
+                expected_quantity = Decimal(str(row.get("quantity")))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError(f"{source} durable source quantity is malformed") from exc
+            if (
+                order.account_id != account.id
+                or order.instrument_id != str(row.get("instrument_id"))
+                or order.side.value != str(row.get("side"))
+                or order.quantity != expected_quantity
+                or order.filled_quantity != expected_quantity
+                or order.status is not BrokerOrderStatus.FILLED
+            ):
+                raise OMSExecutionError(
+                    f"{source} historical order {external_order_id} conflicts with durable source evidence"
+                )
+            mismatches = self._broker_order_quantity_mismatches(
+                order.status,
+                order.quantity,
+                order.filled_quantity,
+            )
+            if mismatches:
+                raise OMSExecutionError(
+                    f"{source} historical order {external_order_id} has contradictory quantity facts: {mismatches}"
+                )
+
+        fill_external_ids = [str(fill.external_order_id).strip() for fill in history.fills]
+        if len(fill_external_ids) != len(set(fill_external_ids)) or set(fill_external_ids) != set(expected):
+            missing = sorted(set(expected) - set(fill_external_ids))
+            extra = sorted(set(fill_external_ids) - set(expected))
+            raise OMSExecutionError(
+                f"{source} historical fill facts do not exactly cover selected orders; "
+                f"missing={missing}, extra={extra}"
+            )
 
     def _selected_fill_fact_mismatch(
         self,

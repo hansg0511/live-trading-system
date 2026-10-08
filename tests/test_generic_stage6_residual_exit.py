@@ -12,6 +12,7 @@ from src.trading_core.domain import (
     Book,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
+    ExecutionEvidenceBaseline,
     ExecutionEvidenceMode,
     ExecutionPolicy,
     Fill,
@@ -1554,6 +1555,229 @@ def _synthetic_selected_fill_case(tmp_path):
     return account, runner, broker_fill, facts, expected_rows
 
 
+class _CompensatingHistoryAdapter(PilotFakeAdapter):
+    """Fake SIM adapter with bounded historical cumulative-order evidence."""
+
+    def __init__(self, facts, history):  # type: ignore[no-untyped-def]
+        super().__init__(facts)
+        self.history = history
+        self.history_calls = 0
+
+    def get_historical_order_facts(self, _account, requested_start, requested_end):  # type: ignore[no-untyped-def]
+        self.history_calls += 1
+        return replace(
+            self.history,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            captured_at=NOW,
+        )
+
+
+def _seed_cumulative_compensating_case(tmp_path):
+    """Build a full source pair with empty current SIM fill rows."""
+    account = make_account()
+    sleeves = make_sleeves()
+    repository = make_repository(tmp_path, account, sleeves)
+    source_id = "cumulative-history-compensating-source"
+    source_legs = (
+        OrderLeg(
+            id=f"{source_id}-leg-a",
+            intent_id=source_id,
+            sequence=0,
+            instrument_id=sleeves[0].instrument_ids[0],
+            side=Side.BUY,
+            quantity=Decimal("1"),
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+        OrderLeg(
+            id=f"{source_id}-leg-b",
+            intent_id=source_id,
+            sequence=1,
+            instrument_id=sleeves[0].instrument_ids[1],
+            side=Side.SELL,
+            quantity=Decimal("1"),
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+    )
+    source = OrderIntent(
+        id=source_id,
+        idempotency_key=f"{source_id}-key",
+        strategy_id="pilot-strategy",
+        account_id=account.id,
+        book_id=sleeves[0].book_id,
+        action=IntentAction.ENTER,
+        execution_policy=ExecutionPolicy(),
+        legs=source_legs,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(source)
+    repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
+    source_now = NOW - timedelta(seconds=10)
+    external_ids: dict[str, str] = {}
+    for leg in source_legs:
+        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=source_now)
+        broker_order_id = f"{leg.id}-order"
+        external_order_id = f"{leg.id}-external"
+        external_ids[leg.instrument_id] = external_order_id
+        repository.create_broker_order(
+            broker_order_id=broker_order_id,
+            order_leg_id=leg.id,
+            account_id=account.id,
+            broker=account.broker,
+            attempt_number=1,
+            client_order_id=f"{leg.id}:1",
+            submitted_quantity=leg.quantity,
+            now=source_now,
+        )
+        repository.transition_broker_order(broker_order_id, BrokerOrderStatus.SUBMITTING, now=source_now)
+        repository.record_submission(
+            broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            external_order_id=external_order_id,
+            now=source_now,
+            submitted_at=source_now,
+        )
+        dedupe_key = f"moomoo-order-fill:{external_order_id}"
+        evidence_reference = f"{external_order_id}:{dedupe_key}"
+        repository.record_fill(
+            Fill(
+                id=f"{leg.id}-fill",
+                broker_order_id=broker_order_id,
+                order_leg_id=leg.id,
+                dedupe_key=dedupe_key,
+                quantity=leg.quantity,
+                price=Decimal("100"),
+                filled_at=source_now + timedelta(seconds=1),
+                received_at=source_now + timedelta(seconds=1),
+                account_id=account.id,
+                external_order_id=external_order_id,
+                evidence_reference=evidence_reference,
+                evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+                metadata={
+                    "_broker_fill_account_id": account.id,
+                    "_external_order_id": external_order_id,
+                    "_instrument_id": leg.instrument_id,
+                    "_evidence_reference": evidence_reference,
+                },
+            ),
+            now=source_now + timedelta(seconds=1),
+            _validation_token=repository._fill_validation_capability(),
+        )
+
+    source_snapshot = repository.get_intent(source_id)
+    assert source_snapshot is not None
+    assert source_snapshot["status"] == IntentStatus.FILLED.value
+    historical_orders: list[BrokerOrderSnapshot] = []
+    historical_fills: list[BrokerFill] = []
+    current_positions: list[PositionSnapshot] = []
+    for leg in source_snapshot["legs"]:
+        attempts = repository.broker_orders_for_leg(str(leg["id"]))
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        external_order_id = str(attempt["external_order_id"])
+        historical_orders.append(
+            BrokerOrderSnapshot(
+                id=f"history-{external_order_id}",
+                broker_snapshot_id="history-snapshot",
+                account_id=account.id,
+                instrument_id=str(leg["instrument_id"]),
+                external_order_id=external_order_id,
+                side=Side(str(leg["side"])),
+                quantity=Decimal(str(leg["quantity"])),
+                filled_quantity=Decimal(str(leg["quantity"])),
+                status=BrokerOrderStatus.FILLED,
+                captured_at=NOW,
+                order_time=source_now,
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                metadata={"external_symbol": str(leg["instrument_id"]).upper()},
+            )
+        )
+        stored_fills = repository.fills_for_broker_order(str(attempt["id"]))
+        assert len(stored_fills) == 1
+        stored = stored_fills[0]
+        stored_metadata = stored["metadata"]
+        historical_fills.append(
+            BrokerFill(
+                external_order_id=external_order_id,
+                dedupe_key=str(stored["dedupe_key"]),
+                quantity=Decimal(str(stored["quantity"])),
+                price=Decimal(str(stored["price"])),
+                filled_at=source_now + timedelta(seconds=1),
+                received_at=NOW,
+                account_id=account.id,
+                evidence_reference=str(stored_metadata["_evidence_reference"]),
+                evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+                instrument_id=str(leg["instrument_id"]),
+                metadata={
+                    "_broker_fill_account_id": account.id,
+                    "_external_order_id": external_order_id,
+                    "_instrument_id": str(leg["instrument_id"]),
+                    "evidence_reference": str(stored_metadata["_evidence_reference"]),
+                    "source": "history_order_list_query",
+                    "synthetic": True,
+                },
+            )
+        )
+        signed_quantity = Decimal(str(leg["quantity"]))
+        if str(leg["side"]) == Side.SELL.value:
+            signed_quantity = -signed_quantity
+        current_positions.append(
+            PositionSnapshot(
+                id=f"current-{leg['id']}",
+                broker_snapshot_id="current-snapshot",
+                account_id=account.id,
+                instrument_id=str(leg["instrument_id"]),
+                signed_quantity=signed_quantity,
+                average_price=Decimal("100"),
+                captured_at=NOW,
+            )
+        )
+
+    repository.save_execution_evidence_baseline(
+        ExecutionEvidenceBaseline(
+            id="cumulative-history-baseline",
+            account_id=account.id,
+            captured_at=NOW,
+            evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            coverage=("CURRENT_ORDER_SNAPSHOTS", "HISTORICAL_ORDER_SNAPSHOTS"),
+            source_ledger_fingerprint="source-ledger",
+            source_order_ids=tuple(external_ids.values()),
+            position_fingerprint="flat-position-fingerprint",
+            open_order_fingerprint="empty-order-fingerprint",
+        )
+    )
+    facts = BrokerFactSnapshot(
+        account_id=account.id,
+        captured_at=NOW,
+        complete=True,
+        positions=tuple(current_positions),
+        open_orders=(),
+        fills=(),
+        metadata={"fill_history_unsupported": True},
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
+    )
+    history = BrokerHistoricalOrderFacts(
+        account_id=account.id,
+        requested_start=NOW - timedelta(seconds=30),
+        requested_end=NOW,
+        captured_at=NOW,
+        complete=True,
+        orders=tuple(historical_orders),
+        fills=tuple(historical_fills),
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
+    )
+    adapter = _CompensatingHistoryAdapter(facts, history)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW)
+    return account, sleeves, repository, adapter, oms, source_id, external_ids, tuple(current_positions), history
+
+
 def test_selected_synthetic_fill_proof_ignores_local_receipt_timestamp(tmp_path):
     account, runner, broker_fill, facts, expected_rows = _synthetic_selected_fill_case(tmp_path)
 
@@ -1599,6 +1823,132 @@ def test_selected_synthetic_fill_proof_keeps_execution_identity_strict(
             expected_rows=expected_rows,
             source="test compensating exit",
         )
+
+
+def test_compensating_exit_uses_exact_bounded_history_when_sim_current_fills_are_empty(tmp_path):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _current_positions,
+        _history,
+    ) = _seed_cumulative_compensating_case(tmp_path)
+
+    result = oms.submit_verified_compensating_exit(
+        account=account,
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+    )
+
+    assert result["id"].startswith("stage6-compensating-exit-")
+    assert adapter.history_calls == 1
+    assert len(adapter.submit_calls) == 2
+    exit_snapshot = repository.get_intent(result["id"])
+    assert exit_snapshot is not None
+    assert [leg["side"] for leg in exit_snapshot["legs"]] == [Side.SELL.value, Side.BUY.value]
+    assert all(
+        len(repository.broker_orders_for_leg(str(leg["id"]))) == 1
+        for leg in exit_snapshot["legs"]
+    )
+
+
+@pytest.mark.parametrize("failure", ("incomplete", "missing", "mismatch"))
+def test_compensating_exit_rejects_incomplete_or_mismatched_history_before_submit(tmp_path, failure):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _current_positions,
+        history,
+    ) = _seed_cumulative_compensating_case(tmp_path / failure)
+    if failure == "incomplete":
+        adapter.history = replace(history, complete=False, error="history unavailable")
+    elif failure == "missing":
+        adapter.history = replace(history, fills=history.fills[:-1])
+    else:
+        adapter.history = replace(
+            history,
+            fills=(replace(history.fills[0], price=Decimal("101")), *history.fills[1:]),
+        )
+
+    with pytest.raises(OMSExecutionError):
+        oms.submit_verified_compensating_exit(
+            source_intent_id=source_id,
+            expected_external_order_ids=external_ids,
+            account=account,
+        )
+
+    assert adapter.history_calls == 1
+    assert adapter.submit_calls == []
+    assert repository.book_intents(account.id, book_id="pilot-book-a")[0]["id"] == source_id
+
+
+def test_compensating_exit_does_not_query_history_when_current_fills_are_exact(tmp_path):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _current_positions,
+        history,
+    ) = _seed_cumulative_compensating_case(tmp_path)
+    adapter.facts = replace(adapter.facts, fills=history.fills)
+
+    result = oms.submit_verified_compensating_exit(
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+        account=account,
+    )
+
+    assert result["id"]
+    assert adapter.history_calls == 0
+    assert len(adapter.submit_calls) == 2
+
+
+def test_compensating_exit_replay_does_not_create_duplicate_orders(tmp_path):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        current_positions,
+        _history,
+    ) = _seed_cumulative_compensating_case(tmp_path)
+
+    first = oms.submit_verified_compensating_exit(
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+        account=account,
+    )
+    # Restore the authoritative source exposure for the idempotent replay;
+    # this represents a fresh account-facts query that does not include the
+    # just-created exit's synthetic test positions.
+    adapter.facts = replace(adapter.facts, positions=current_positions, fills=())
+    second = oms.submit_verified_compensating_exit(
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+        account=account,
+    )
+
+    assert second["id"] == first["id"]
+    assert len(adapter.submit_calls) == 2
+    snapshot = repository.get_intent(first["id"])
+    assert snapshot is not None
+    assert all(len(repository.broker_orders_for_leg(str(leg["id"]))) == 1 for leg in snapshot["legs"])
 
 
 def test_partial_exit_residual_uses_remaining_book_basis(tmp_path):
