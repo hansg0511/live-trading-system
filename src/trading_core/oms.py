@@ -81,6 +81,10 @@ class GenericOMS:
     # naturally be a few milliseconds after the OMS clock observed the query
     # boundary.  A materially future timestamp is still impossible evidence.
     BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
+    # Residual compensation is an order-bearing safety route, so a successful
+    # account-facts query must describe the current account rather than a
+    # cached/restarted observation.
+    BROKER_FACT_MAX_AGE_SECONDS = 60
 
     def __init__(
         self,
@@ -671,6 +675,7 @@ class GenericOMS:
         account: Account,
         risk_decision: RiskDecisionRecord,
         _internal_capability: object | None = None,
+        _before_submit_leg: Callable[[OrderIntent, OrderLeg, Account], None] | None = None,
     ) -> dict:
         self._startup_safety_audit()
         verified_compensating_exit = (
@@ -863,6 +868,29 @@ class GenericOMS:
                 )
                 return self._required_intent(intent_id)
 
+            if _before_submit_leg is not None:
+                try:
+                    # Stage-specific admission hooks are called immediately
+                    # before each leg can invoke the adapter.  Generic OMS
+                    # callers do not provide a hook, preserving their path.
+                    _before_submit_leg(intent, leg, account)
+                except Exception as exc:
+                    if accepted_any:
+                        self._require_reconciliation(
+                            intent_id,
+                            account,
+                            category="STAGE6_SUBMISSION_GATE_BLOCKED",
+                            entity_type="ORDER_LEG",
+                            entity_key=leg.id,
+                            details={"error": str(exc), "adapter_invoked": False},
+                        )
+                    else:
+                        self.repository.transition_intent(
+                            intent_id,
+                            IntentStatus.REJECTED,
+                            now=self._now(),
+                        )
+                    return self._required_intent(intent_id)
             outcome = self._submit_leg(intent, leg, account, stored_status=stored["status"])
             if outcome == "accepted":
                 accepted_any = True
@@ -894,6 +922,7 @@ class GenericOMS:
         expected_external_order_ids: Mapping[str, str],
         account: Account,
         risk_decision: RiskDecisionRecord | None = None,
+        _before_submit_leg: Callable[[OrderIntent, OrderLeg, Account], None] | None = None,
     ) -> dict:
         """Submit a strictly verified exit for one exact filled source intent.
 
@@ -1033,8 +1062,13 @@ class GenericOMS:
             raise OMSExecutionError("fresh broker facts are incomplete or account-mismatched")
         if facts.open_orders:
             raise OMSExecutionError("compensating exit requires no broker open orders")
+        normalized_positions, position_blockers = self._dedupe_account_position_facts(
+            facts.positions
+        )
+        if position_blockers:
+            raise OMSExecutionError("fresh broker positions contain contradictory duplicate rows")
         observed: dict[str, Decimal] = {}
-        for position in facts.positions:
+        for position in normalized_positions:
             quantity = Decimal(str(position.signed_quantity))
             if not quantity.is_finite():
                 raise OMSExecutionError("broker position quantity is invalid")
@@ -1142,6 +1176,426 @@ class GenericOMS:
             account=account,
             risk_decision=decision,
             _internal_capability=self.__verified_compensating_exit_capability,
+            _before_submit_leg=_before_submit_leg,
+        )
+
+    def submit_verified_residual_exit(
+        self,
+        *,
+        source_intent_id: str,
+        expected_external_order_ids: Mapping[str, str],
+        account: Account,
+        risk_decision: RiskDecisionRecord | None = None,
+        _before_submit_leg: Callable[[OrderIntent, OrderLeg, Account], None] | None = None,
+    ) -> dict:
+        """Submit one exact residual exit for a durably partial source.
+
+        This is deliberately separate from ``submit_verified_compensating_exit``:
+        the latter remains a full-fill-only primitive.  This route accepts a
+        source with one or more proven positive fills and no ambiguous/active
+        attempts, then requires a fresh account snapshot to equal the
+        source-derived residual before creating any exit intent.  It never
+        retries or cancels the source and requires the Stage 6 per-leg safety
+        callback before each broker submission.
+        """
+        source_id = str(source_intent_id).strip()
+        if not source_id:
+            raise OMSExecutionError("source_intent_id is required")
+        if not expected_external_order_ids:
+            raise OMSExecutionError("expected_external_order_ids is required")
+        if _before_submit_leg is None:
+            raise OMSExecutionError("residual exit requires a per-leg safety callback")
+
+        canonical = self.repository.get_account(account.id)
+        if canonical is None or not canonical.enabled:
+            raise OMSExecutionError("residual exit requires an enabled persisted account")
+        mismatches = self._account_contract_mismatches(canonical, account)
+        if mismatches:
+            raise OMSExecutionError(
+                "residual exit account identity mismatch: " + ",".join(mismatches)
+            )
+        account = canonical
+
+        source = self.repository.get_intent(source_id)
+        if source is None:
+            raise OMSExecutionError(f"unknown source intent: {source_id}")
+        if str(source.get("account_id")) != account.id:
+            raise OMSExecutionError("source intent account does not match supplied account")
+        action = str(source.get("action"))
+        if action not in {IntentAction.ENTER.value, IntentAction.EXIT.value}:
+            raise OMSExecutionError("residual exit source must be an ENTER or EXIT intent")
+        if not str(source.get("book_id") or "").strip() or not str(source.get("strategy_id") or "").strip():
+            raise OMSExecutionError("residual exit source lacks durable book/strategy ownership")
+        if str(source.get("status")) not in {
+            IntentStatus.PARTIALLY_FILLED.value,
+            IntentStatus.RECONCILIATION_REQUIRED.value,
+            IntentStatus.FILLED.value,
+            IntentStatus.CANCELLED.value,
+            IntentStatus.FAILED.value,
+        }:
+            raise OMSExecutionError("residual exit source is not durably terminal/partial")
+
+        expected_by_instrument = {
+            str(instrument_id).strip(): str(external_order_id).strip()
+            for instrument_id, external_order_id in expected_external_order_ids.items()
+        }
+        if any(not instrument or not external for instrument, external in expected_by_instrument.items()):
+            raise OMSExecutionError("residual external-order mapping contains an empty identity")
+        if len(set(expected_by_instrument.values())) != len(expected_by_instrument):
+            raise OMSExecutionError("residual external-order mapping reuses one provider order")
+        prior_residuals: list[dict[str, object]] = []
+        for candidate_row in self.repository.book_intents(account.id, book_id=str(source.get("book_id"))):
+            candidate = self.repository.get_intent(str(candidate_row.get("id")))
+            if candidate is None:
+                continue
+            candidate_metadata = candidate.get("metadata")
+            if not isinstance(candidate_metadata, Mapping):
+                continue
+            if (
+                candidate_metadata.get("verified_residual_exit") is True
+                and str(candidate_metadata.get("source_intent_id")) == source_id
+            ):
+                prior_residuals.append(candidate)
+        if len(prior_residuals) > 1:
+            raise OMSExecutionError("source already has conflicting residual exit attempts")
+        if prior_residuals:
+            # A deterministic prior residual is already the durable answer.
+            # Do not re-query or net its now-changed position into a second
+            # exit; verify the immutable source-order mapping before replay.
+            prior_metadata = prior_residuals[0]["metadata"]
+            prior_external_ids = {
+                str(value)
+                for value in prior_metadata.get("source_external_order_ids", ())
+            } if isinstance(prior_metadata, Mapping) else set()
+            if prior_external_ids != set(expected_by_instrument.values()):
+                raise OMSExecutionError("existing residual exit provenance conflicts with source mapping")
+            return prior_residuals[0]
+
+        def decimal(value: object, label: str, *, positive: bool = False) -> Decimal:
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise OMSExecutionError(f"{label} is not numeric") from exc
+            if not parsed.is_finite() or (positive and parsed <= 0) or (not positive and parsed < 0):
+                raise OMSExecutionError(f"{label} is invalid")
+            return parsed
+
+        def timestamp(value: object, label: str) -> datetime:
+            parsed = self._parse_timestamp(value)
+            if parsed is None:
+                raise OMSExecutionError(f"{label} is missing or invalid")
+            return parsed
+
+        legs = list(source.get("legs", ()))
+        if not legs:
+            raise OMSExecutionError("residual exit source has no legs")
+        durable_signed: dict[str, Decimal] = {}
+        requested_signed: dict[str, Decimal] = {}
+        verified_rows: list[dict[str, object]] = []
+        filled_instruments: set[str] = set()
+        for leg in legs:
+            instrument_id = str(leg.get("instrument_id") or "").strip()
+            if not instrument_id:
+                raise OMSExecutionError("residual source leg lacks instrument identity")
+            side = str(leg.get("side") or "").upper()
+            if side not in {Side.BUY.value, Side.SELL.value}:
+                raise OMSExecutionError(f"residual source leg {leg.get('id')} has invalid side")
+            quantity = decimal(leg.get("quantity"), f"source leg {leg.get('id')} quantity", positive=True)
+            cumulative = decimal(
+                leg.get("cumulative_filled_quantity", "0"),
+                f"source leg {leg.get('id')} cumulative fill",
+            )
+            if cumulative > quantity:
+                raise OMSExecutionError(f"source leg {leg.get('id')} cumulative fill exceeds quantity")
+            if instrument_id in requested_signed:
+                raise OMSExecutionError("residual source contains duplicate instrument legs")
+            signed_factor = Decimal("1") if side == Side.BUY.value else Decimal("-1")
+            requested_signed[instrument_id] = signed_factor * quantity
+            attempts = self.repository.broker_orders_for_leg(str(leg.get("id")))
+            if cumulative == 0:
+                # A planned sibling is acceptable for a partial source.  Any
+                # attempted zero-fill row is ambiguous and cannot be netted.
+                if attempts or str(leg.get("status")) not in {
+                    LegStatus.PLANNED.value,
+                    LegStatus.REJECTED.value,
+                    LegStatus.CANCELLED.value,
+                }:
+                    raise OMSExecutionError(
+                        f"source leg {leg.get('id')} has no-fill or ambiguous submission evidence"
+                    )
+                continue
+            if str(leg.get("status")) not in {
+                LegStatus.PARTIALLY_FILLED.value,
+                LegStatus.FILLED.value,
+                LegStatus.CANCELLED.value,
+                LegStatus.FAILED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                raise OMSExecutionError(f"source leg {leg.get('id')} is not durably partial/terminal")
+            if len(attempts) != 1:
+                raise OMSExecutionError(
+                    f"source leg {leg.get('id')} has unsupported attempt count {len(attempts)}"
+                )
+            order = attempts[0]
+            external_order_id = str(order.get("external_order_id") or "").strip()
+            if expected_by_instrument.get(instrument_id) != external_order_id:
+                raise OMSExecutionError(f"source leg {leg.get('id')} external-order mapping mismatch")
+            if str(order.get("account_id")) != account.id:
+                raise OMSExecutionError("source broker order account mismatch")
+            submitted = decimal(order.get("submitted_quantity"), "source submitted quantity", positive=True)
+            if cumulative > submitted:
+                raise OMSExecutionError("source cumulative fill exceeds submitted quantity")
+            order_status = str(order.get("status"))
+            if order_status == BrokerOrderStatus.FILLED.value and cumulative != submitted:
+                raise OMSExecutionError("FILLED source order lacks complete durable fill")
+            if order_status in {BrokerOrderStatus.PARTIALLY_FILLED.value, BrokerOrderStatus.CANCELLED.value}:
+                if not (Decimal("0") < cumulative < submitted):
+                    raise OMSExecutionError("partial source order quantity is not strictly partial")
+            elif order_status in {BrokerOrderStatus.REJECTED.value, BrokerOrderStatus.FAILED.value}:
+                raise OMSExecutionError("rejected/failed source order cannot carry residual fill evidence")
+            elif order_status != BrokerOrderStatus.FILLED.value:
+                raise OMSExecutionError("source broker order is active or unknown")
+            fills = self.repository.fills_for_broker_order(str(order.get("id")))
+            if not fills:
+                raise OMSExecutionError("source broker order lacks durable fill evidence")
+            fill_total = Decimal("0")
+            fill_identities: set[str] = set()
+            for fill in fills:
+                fill_quantity = decimal(fill.get("quantity"), "source durable fill quantity", positive=True)
+                fill_price = decimal(fill.get("price"), "source durable fill price", positive=True)
+                fill_identity = str(fill.get("external_fill_id") or fill.get("dedupe_key") or "").strip()
+                if not fill_identity or fill_identity in fill_identities:
+                    raise OMSExecutionError("source durable fills contain duplicate/unknown identities")
+                fill_identities.add(fill_identity)
+                if str(fill.get("account_id") or account.id) != account.id:
+                    raise OMSExecutionError("source durable fill account mismatch")
+                if str(fill.get("external_order_id") or external_order_id) != external_order_id:
+                    raise OMSExecutionError("source durable fill external-order mismatch")
+                filled_at = timestamp(fill.get("filled_at"), "source durable fill timestamp")
+                received_at = timestamp(fill.get("received_at"), "source durable fill receipt timestamp")
+                if filled_at < timestamp(order.get("submitted_at") or order.get("updated_at"), "source submit timestamp") - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                    raise OMSExecutionError("source durable fill predates durable submission")
+                if received_at < filled_at - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                    raise OMSExecutionError("source durable fill receipt predates fill")
+                fill_total += fill_quantity
+                verified_rows.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "external_order_id": external_order_id,
+                        "quantity": fill_quantity,
+                        "price": fill_price,
+                        "fill_identity": fill_identity,
+                        "side": side,
+                        "attempt": order,
+                    }
+                )
+            if fill_total != cumulative:
+                raise OMSExecutionError("source durable fills do not equal leg cumulative fill")
+            filled_instruments.add(instrument_id)
+            durable_signed[instrument_id] = durable_signed.get(instrument_id, Decimal("0")) + signed_factor * cumulative
+
+        if set(expected_by_instrument) != filled_instruments:
+            raise OMSExecutionError("residual external-order mapping must cover only filled source legs")
+        if not filled_instruments:
+            raise OMSExecutionError("source has no positive durable fill for residual compensation")
+
+        # Prove the source-derived expected residual from the durable book,
+        # rather than treating any current position as an eligible flatten.
+        try:
+            book_basis = self.repository.book_signed_exposure(
+                account.id,
+                str(source["book_id"]),
+                exclude_intent_id=source_id,
+                # ``book_signed_exposure`` historically applies the
+                # exclusion to active intents but not the managed allocation
+                # rows.  Supply both forms so the source's own partial fill
+                # is never mistaken for unrelated book basis.
+                exclude_intent_ids={source_id},
+            )
+        except Exception as exc:
+            raise OMSExecutionError("durable source book exposure is unavailable") from exc
+        if action == IntentAction.ENTER.value:
+            if any(value != 0 for value in book_basis.values()):
+                raise OMSExecutionError("partial ENTER has unrelated durable book exposure")
+            expected_positions = {key: value for key, value in durable_signed.items() if value != 0}
+        else:
+            expected_positions = dict(book_basis)
+            for instrument_id, requested in requested_signed.items():
+                basis = book_basis.get(instrument_id, Decimal("0"))
+                if basis == 0 or requested != -basis:
+                    raise OMSExecutionError("partial EXIT does not exactly match durable book basis")
+                expected_positions[instrument_id] = basis + durable_signed.get(instrument_id, Decimal("0"))
+            expected_positions = {key: value for key, value in expected_positions.items() if value != 0}
+        if not expected_positions:
+            raise OMSExecutionError("source does not leave a residual exposure")
+
+        getter = getattr(self.adapter, "get_authoritative_account_facts", None)
+        if not callable(getter):
+            raise OMSExecutionError("adapter lacks authoritative account facts for residual compensation")
+        try:
+            facts = getter(account)
+        except Exception as exc:
+            raise OMSExecutionError("fresh broker facts failed before residual exit") from exc
+        if not isinstance(facts, BrokerFactSnapshot):
+            raise OMSExecutionError("authoritative account facts have invalid type")
+        if facts.account_id != account.id or not facts.complete or facts.error:
+            raise OMSExecutionError("fresh broker facts are incomplete or account-mismatched")
+        captured_at = self._parse_timestamp(facts.captured_at)
+        now = self._now()
+        if captured_at is None or captured_at > now + timedelta(seconds=self.BROKER_CLOCK_SKEW_TOLERANCE_SECONDS):
+            raise OMSExecutionError("fresh broker facts timestamp is invalid or in the future")
+        if (now - captured_at).total_seconds() > self.BROKER_FACT_MAX_AGE_SECONDS:
+            raise OMSExecutionError("fresh broker facts are stale")
+        if facts.open_orders:
+            raise OMSExecutionError("residual exit requires no broker open orders")
+        _, duplicate_order_blockers = self._dedupe_account_broker_order_facts(facts.open_orders)
+        if duplicate_order_blockers:
+            raise OMSExecutionError("fresh broker orders contain contradictory duplicate rows")
+        normalized_positions, duplicate_position_blockers = self._dedupe_account_position_facts(facts.positions)
+        if duplicate_position_blockers:
+            raise OMSExecutionError("fresh broker positions contain contradictory duplicate rows")
+        observed: dict[str, Decimal] = {}
+        for position in normalized_positions:
+            if position.account_id != account.id or self._account_alias_mismatches(account, metadata=position.metadata):
+                raise OMSExecutionError("fresh broker position account provenance mismatch")
+            quantity = decimal(position.signed_quantity, "fresh broker position quantity")
+            if quantity != 0:
+                observed[position.instrument_id] = observed.get(position.instrument_id, Decimal("0")) + quantity
+        if observed != expected_positions:
+            raise OMSExecutionError(
+                f"fresh broker positions do not equal the proven residual exposure: {observed!r}"
+            )
+        if self._account_alias_mismatches(account, metadata=facts.metadata):
+            raise OMSExecutionError("fresh broker facts contain foreign account aliases")
+
+        # Fresh fills must prove every durable source fill and may not contain
+        # an account fill with no durable owner.  Duplicate identity is never
+        # netted, even when quantities happen to sum to the expected amount.
+        fresh_by_external: dict[str, list[BrokerFill]] = {}
+        seen_fresh_fill_ids: set[tuple[str, str]] = set()
+        for broker_fill in facts.fills:
+            if broker_fill.account_id not in (None, account.id):
+                raise OMSExecutionError("fresh broker facts contain a foreign-account fill")
+            aliases = self._account_alias_mismatches(account, metadata=broker_fill.metadata)
+            if aliases:
+                raise OMSExecutionError("fresh broker facts contain foreign fill aliases")
+            identity = (
+                str(broker_fill.external_order_id),
+                str(broker_fill.external_fill_id or broker_fill.dedupe_key),
+            )
+            if identity in seen_fresh_fill_ids:
+                raise OMSExecutionError("fresh broker facts contain duplicate fill identity")
+            seen_fresh_fill_ids.add(identity)
+            if broker_fill.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE or not broker_fill.evidence_reference:
+                raise OMSExecutionError("fresh broker fill lacks execution provenance")
+            if not self.repository.broker_orders_for_external_order_id(broker_fill.external_order_id):
+                raise OMSExecutionError("fresh broker facts contain an unattributed fill")
+            if broker_fill.instrument_id is not None:
+                durable_instrument = next(
+                    (str(row["instrument_id"]) for row in verified_rows if str(row["external_order_id"]) == broker_fill.external_order_id),
+                    None,
+                )
+                if durable_instrument is not None and broker_fill.instrument_id != durable_instrument:
+                    raise OMSExecutionError("fresh broker fill instrument provenance mismatch")
+            fresh_by_external.setdefault(str(broker_fill.external_order_id), []).append(broker_fill)
+        for instrument_id in filled_instruments:
+            external_order_id = expected_by_instrument[instrument_id]
+            durable_rows = [row for row in verified_rows if row["external_order_id"] == external_order_id]
+            fresh_rows = fresh_by_external.get(external_order_id, [])
+            if not fresh_rows:
+                raise OMSExecutionError(f"fresh broker facts lack source fill {external_order_id}")
+            if sum((row.quantity for row in fresh_rows), Decimal("0")) != sum((row["quantity"] for row in durable_rows), Decimal("0")):
+                raise OMSExecutionError(f"fresh broker fill quantity differs for {external_order_id}")
+
+        digest_material = [account.id, str(source.get("book_id")), str(source.get("strategy_id")), source_id]
+        digest_material.extend(
+            f"{row['instrument_id']}:{row['external_order_id']}:{row['fill_identity']}:{row['quantity']}:{row['price']}"
+            for row in sorted(verified_rows, key=lambda item: (str(item["instrument_id"]), str(item["fill_identity"])))
+        )
+        digest_material.extend(f"{key}:{value}" for key, value in sorted(expected_positions.items()))
+        digest = hashlib.sha256("|".join(digest_material).encode("utf-8")).hexdigest()[:24]
+        exit_id = f"stage6-residual-exit-{digest}"
+        exit_key = f"stage6-residual-exit|{source_id}|{digest}"
+        existing = self.repository.get_intent_by_idempotency_key(account.id, exit_key)
+        if existing is not None:
+            metadata = existing.get("metadata")
+            if not isinstance(metadata, Mapping) or metadata.get("verified_residual_exit") is not True or str(metadata.get("source_intent_id")) != source_id or str(metadata.get("proof_digest")) != digest:
+                raise OMSExecutionError("residual exit idempotency key has conflicting durable provenance")
+            return existing
+        now = self._now()
+        exit_legs: list[OrderLeg] = []
+        for sequence, (instrument_id, residual_quantity) in enumerate(sorted(expected_positions.items())):
+            exit_legs.append(
+                OrderLeg(
+                    id=f"{exit_id}-leg-{sequence}",
+                    intent_id=exit_id,
+                    sequence=sequence,
+                    instrument_id=instrument_id,
+                    side=Side.SELL if residual_quantity > 0 else Side.BUY,
+                    quantity=abs(residual_quantity),
+                    order_type="MARKET",
+                    metadata={
+                        "verified_residual_exit": True,
+                        "source_intent_id": source_id,
+                        "proof_digest": digest,
+                    },
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        exit_intent = OrderIntent(
+            id=exit_id,
+            idempotency_key=exit_key,
+            strategy_id=str(source["strategy_id"]),
+            account_id=account.id,
+            action=IntentAction.EXIT,
+            legs=tuple(exit_legs),
+            book_id=str(source["book_id"]),
+            source_signal_id=f"verified-residual-exit:{source_id}",
+            execution_policy=ExecutionPolicy(),
+            metadata={
+                "verified_residual_exit": True,
+                "source_intent_id": source_id,
+                "source_external_order_ids": sorted(expected_by_instrument.values()),
+                "source_fill_evidence": [
+                    {
+                        "instrument_id": str(row["instrument_id"]),
+                        "external_order_id": str(row["external_order_id"]),
+                        "fill_identity": str(row["fill_identity"]),
+                        "quantity": str(row["quantity"]),
+                        "price": str(row["price"]),
+                    }
+                    for row in verified_rows
+                ],
+                "residual_positions": {key: str(value) for key, value in sorted(expected_positions.items())},
+                "proof_digest": digest,
+                "fresh_facts_captured_at": facts.captured_at.isoformat(),
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        decision = risk_decision or RiskDecisionRecord(
+            id=f"stage6-residual-exit-risk-{digest}",
+            intent_id=exit_id,
+            approved=True,
+            reason="explicit approved SIM residual exit for exact partial exposure",
+            checks={
+                "source_intent_id": source_id,
+                "fresh_positions_exact": True,
+                "fresh_open_orders_empty": True,
+                "partial_source_proven": True,
+            },
+            evaluated_at=now,
+            metadata={"verified_residual_exit": True, "proof_digest": digest},
+        )
+        if decision.intent_id != exit_id:
+            raise OMSExecutionError("residual exit risk decision identity mismatch")
+        return self.submit_intent(
+            exit_intent,
+            account=account,
+            risk_decision=decision,
+            _internal_capability=self.__verified_compensating_exit_capability,
+            _before_submit_leg=_before_submit_leg,
         )
 
     def resolve_verified_roundtrip(
@@ -4801,11 +5255,30 @@ class GenericOMS:
         self._quarantine_multiple_attempts_for_account(account)
         proof_closed = self._closed_historical_intent_ids(account)
         recovered: list[dict] = []
-        for intent_id in self.repository.recoverable_intent_ids(
+        recoverable_ids = self.repository.recoverable_intent_ids(
             account.id,
             now=self._now(),
             terminal_window_seconds=self.TERMINAL_RECOVERY_WINDOW_SECONDS,
-        ):
+        )
+        # Recover compensating EXIT lifecycles before their source ENTER
+        # lifecycles.  A source intent with complete fills can otherwise be
+        # temporarily re-quarantined solely because a sibling EXIT still has
+        # a WAIT_FOR_BROKER action; once the EXIT is recovered, no second
+        # broker cycle should be required to restore the source aggregate.
+        # This ordering does not promote anything by itself: each intent still
+        # applies the full broker-fact, fill, duplicate-attempt, and blocker
+        # gates in recover_intent().
+        ordered_ids = sorted(
+            recoverable_ids,
+            key=lambda intent_id: (
+                0
+                if str((self.repository.get_intent(intent_id) or {}).get("action"))
+                in {IntentAction.EXIT.value, IntentAction.FLATTEN.value}
+                else 1,
+                str(intent_id),
+            ),
+        )
+        for intent_id in ordered_ids:
             # A validated retired-baseline or round-trip closure is durable
             # lifecycle evidence.  Do not poll it again merely because its
             # terminal broker rows are recent; a transient read failure must
@@ -5242,6 +5715,42 @@ class GenericOMS:
             deduped.append(first)
         return tuple(deduped), blockers
 
+    @staticmethod
+    def _dedupe_account_position_facts(
+        positions: Sequence[PositionSnapshot],
+    ) -> tuple[tuple[PositionSnapshot, ...], list[dict[str, object]]]:
+        """Reject contradictory duplicate position rows before netting."""
+
+        grouped: dict[str, list[PositionSnapshot]] = {}
+        for position in positions:
+            grouped.setdefault(str(position.instrument_id), []).append(position)
+        deduped: list[PositionSnapshot] = []
+        blockers: list[dict[str, object]] = []
+        for instrument_id, rows in grouped.items():
+            first = rows[0]
+            if all(item == first for item in rows[1:]):
+                deduped.append(first)
+                continue
+            blockers.append(
+                {
+                    "kind": "duplicate_broker_position_fact",
+                    "instrument_id": instrument_id,
+                    "row_count": len(rows),
+                    "rows": [
+                        {
+                            "snapshot_id": item.broker_snapshot_id,
+                            "position_id": item.id,
+                            "account_id": item.account_id,
+                            "signed_quantity": str(item.signed_quantity),
+                            "captured_at": item.captured_at.isoformat(),
+                        }
+                        for item in rows
+                    ],
+                }
+            )
+            deduped.append(first)
+        return tuple(deduped), blockers
+
     def _account_wide_broker_fact_gate(self, intent_id: str, account: Account) -> bool:
         """Block a new submit when account-wide broker facts are unsafe.
 
@@ -5274,7 +5783,9 @@ class GenericOMS:
                 )
             if not facts.complete:
                 raise RuntimeError(facts.error or "broker account facts are incomplete")
-            positions = facts.positions
+            positions, duplicate_position_blockers = self._dedupe_account_position_facts(
+                facts.positions
+            )
             open_orders, duplicate_order_blockers = self._dedupe_account_broker_order_facts(facts.open_orders)
             fills = facts.fills
         except Exception as exc:
@@ -5305,7 +5816,10 @@ class GenericOMS:
             )
             return False
 
-        blockers: list[dict[str, object]] = list(duplicate_order_blockers)
+        blockers: list[dict[str, object]] = [
+            *duplicate_order_blockers,
+            *duplicate_position_blockers,
+        ]
         if facts.error not in (None, ""):
             blockers.append(
                 {

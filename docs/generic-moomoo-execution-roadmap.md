@@ -712,6 +712,14 @@ market state, and no broker/local blockers immediately before `sim-submit`.
 This is configuration/readiness tooling only and does not constitute Stage 6
 pilot evidence or completion.
 
+Stage 6 execution compatibility is `stage6-execution-v3`.  This version keeps
+GenericOMS broker-neutral while allowing only the reviewed safety seams needed
+by the pilot: a per-leg admission callback for fresh account/RTH facts, the
+strict residual-compensation primitive, contradictory-position quarantine, and
+EXIT-before-ENTER recovery ordering.  The architecture test pins the reviewed
+normalized OMS source blob; any further OMS execution change requires a new
+compatibility review rather than being silently treated as validation-only.
+
 The connected `broker-preflight` command is the read-only checkpoint for this
 checklist.  It reports the exact configured SIM account, complete fresh
 account facts, provider market/RTH rows, execution-evidence mode, local
@@ -952,6 +960,18 @@ gate.
 
 The existing Stage 6 CLI now has validation/reporting commands.  They never
 create a second submission path:
+
+The CLI help groups the supported workflow into five operator-facing
+categories: `validate`/`dry-run` for offline preparation; `broker-preflight`,
+`baseline`, `recover`, and `final-state` for connected read-only facts or
+local recovery evidence; `sim-submit`, `compensating-exit`, and `residual-exit`
+for explicitly armed SIM order paths; `resolve-*` for proof-backed local
+resolution; and `session-*`/`stage-status` for durable validation reporting.
+Every intent-ID command validates account, strategy, book, and configured
+instrument scope before invoking its existing OMS boundary.  Resolution
+commands return a non-zero process status when proof is absent or a lifecycle
+remains active/ambiguous; a successful safe cancellation may intentionally
+retain `RECONCILIATION_REQUIRED` when its durable proof is present.
 
 ```powershell
 # Record an explicit no-submit preflight observation.

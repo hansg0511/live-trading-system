@@ -68,7 +68,7 @@ class Stage6RunMode(str, Enum):
 # Same-invocation market/session validation is part of the order-capable
 # boundary.  Keep the identity explicit so validation rows cannot silently be
 # mixed with the older execution semantics.
-STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v2"
+STAGE6_EXECUTION_COMPATIBILITY = "stage6-execution-v3"
 BROKER_FACT_MAX_AGE_SECONDS = 60
 BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 _US_EASTERN = ZoneInfo("America/New_York")
@@ -381,10 +381,11 @@ class Stage6PilotRunner:
         mode: str = Stage6RunMode.SIM_SUBMIT.value,
         source_intent_id: str | None = None,
     ) -> None:
-        """Retain the process that created a new SIM submission intent.
+        """Retain immutable process provenance before broker submission.
 
-        This is appended only after the normal OMS call has durably created
-        the intent.  It is provenance, not part of the idempotency payload;
+        The intent row already exists when the Stage 6 per-leg admission hook
+        calls this method, but no adapter submission has happened yet.  The
+        marker is audit provenance, not part of the idempotency payload;
         old intents and resumed intents remain untagged and therefore cannot
         later claim a verified fresh-process recovery.
         """
@@ -395,6 +396,26 @@ class Stage6PilotRunner:
         stage5 = intent.get("metadata", {}).get("stage5", {})
         if not isinstance(stage5, Mapping):
             stage5 = {}
+        metadata = intent.get("metadata")
+        existing_marker = metadata.get("stage6_submission") if isinstance(metadata, Mapping) else None
+        if existing_marker is not None:
+            if not isinstance(existing_marker, Mapping):
+                raise ValueError("existing Stage 6 submission provenance is malformed")
+            expected_source = str(source_intent_id).strip() if source_intent_id else ""
+            existing_source = str(
+                existing_marker.get("correlation", {}).get("source_intent_id", "")
+                if isinstance(existing_marker.get("correlation"), Mapping)
+                else ""
+            ).strip()
+            if (
+                str(existing_marker.get("run_id", "")).strip() != str(run_id).strip()
+                or str(existing_marker.get("mode", "")).strip() != str(mode).strip()
+                or str(existing_marker.get("execution_compatibility", "")).strip()
+                != STAGE6_EXECUTION_COMPATIBILITY
+                or (expected_source and existing_source != expected_source)
+            ):
+                raise ValueError("immutable Stage 6 submission provenance conflicts with this dispatch")
+            return
         submitted_at: datetime | None = None
         for leg in intent.get("legs", ()):
             for order in self.repository.broker_orders_for_leg(str(leg.get("id"))):
@@ -642,6 +663,9 @@ class Stage6PilotRunner:
     def _fresh_broker_snapshot(
         self,
         spec: Stage6PilotSpec,
+        *,
+        exit_target_books: set[str] | None = None,
+        transient_intent: Any | None = None,
     ) -> tuple[BrokerFactSnapshot | None, list[str]]:
         """Read and validate one fresh account-scoped fact set.
 
@@ -690,17 +714,106 @@ class Stage6PilotRunner:
                 and str(row.get("source_intent_id") or "") not in closed_historical_intents
             ):
                 expected[str(row["instrument_id"])] += Decimal(str(row["signed_quantity"]))
-        observed: dict[str, Decimal] = defaultdict(Decimal)
-        for position in facts.positions:
-            if not isinstance(position, PositionSnapshot):
-                reasons.append("authoritative positions contain an invalid row")
+        # A sequential intent can have a verified filled sibling leg before
+        # its next leg reaches the per-leg admission hook.  That exposure is
+        # not a new allocation yet, but it is part of the expected fresh
+        # account state for this exact in-flight intent.  Bind it to durable
+        # cumulative fills; never infer it from a submitted/working status or
+        # from the requested quantity alone.
+        transient_local: dict[str, Decimal] = defaultdict(Decimal)
+        transient_claims: dict[str, tuple[str, Decimal]] = {}
+        if transient_intent is not None:
+            transient_id = str(getattr(transient_intent, "id", "") or "").strip()
+            persisted_transient = self.repository.get_intent(transient_id) if transient_id else None
+            if persisted_transient is None:
+                reasons.append("in-flight Stage 6 intent is not durably persisted")
+            else:
+                for leg in persisted_transient.get("legs", ()):
+                    try:
+                        cumulative = Decimal(str(leg.get("cumulative_filled_quantity", "0")))
+                    except (InvalidOperation, TypeError, ValueError):
+                        reasons.append(
+                            f"in-flight Stage 6 leg {leg.get('id')} has malformed cumulative fill quantity"
+                        )
+                        continue
+                    if not cumulative.is_finite() or cumulative < 0:
+                        reasons.append(
+                            f"in-flight Stage 6 leg {leg.get('id')} has invalid cumulative fill quantity"
+                        )
+                        continue
+                    instrument_id = str(leg.get("instrument_id") or "").strip()
+                    if not instrument_id or str(leg.get("side")) not in {Side.BUY.value, Side.SELL.value}:
+                        reasons.append(
+                            f"in-flight Stage 6 leg {leg.get('id')} has malformed filled identity"
+                        )
+                        continue
+                    signed = cumulative if str(leg.get("side")) == Side.BUY.value else -cumulative
+                    for attempt in self.repository.broker_orders_for_leg(str(leg.get("id"))):
+                        external_id = str(attempt.get("external_order_id") or "").strip()
+                        if not external_id:
+                            continue
+                        prior_claim = transient_claims.get(external_id)
+                        claim = (
+                            instrument_id,
+                            Decimal("1")
+                            if str(leg.get("side")) == Side.BUY.value
+                            else Decimal("-1"),
+                        )
+                        if prior_claim is not None and prior_claim != claim:
+                            reasons.append(
+                                f"in-flight Stage 6 external order {external_id} has contradictory leg claims"
+                            )
+                        else:
+                            transient_claims[external_id] = claim
+                    if cumulative != 0:
+                        transient_local[instrument_id] += signed
+        # Provider fills may be visible before the generic OMS poll has
+        # advanced the durable leg's cumulative quantity.  Reconcile that
+        # exact, already-claimed external identity into the transient
+        # expectation; an unclaimed provider fill is still rejected below.
+        transient_provider: dict[str, Decimal] = defaultdict(Decimal)
+        for fill in facts.fills:
+            claim = transient_claims.get(str(fill.external_order_id).strip())
+            if claim is None:
                 continue
-            observed[position.instrument_id] += position.signed_quantity
+            instrument_id, sign = claim
+            if fill.account_id not in (None, spec.account.id):
+                reasons.append(
+                    f"in-flight Stage 6 fill {fill.external_order_id} belongs to a different account"
+                )
+                continue
+            if fill.instrument_id not in (None, instrument_id):
+                reasons.append(
+                    f"in-flight Stage 6 fill {fill.external_order_id} has a foreign instrument"
+                )
+                continue
+            if not fill.quantity.is_finite() or fill.quantity <= 0:
+                reasons.append(
+                    f"in-flight Stage 6 fill {fill.external_order_id} has an invalid quantity"
+                )
+                continue
+            transient_provider[instrument_id] += sign * fill.quantity
+        for instrument_id, provider_quantity in transient_provider.items():
+            local_quantity = transient_local.get(instrument_id, Decimal("0"))
+            if local_quantity and local_quantity != provider_quantity:
+                reasons.append(
+                    f"in-flight Stage 6 durable/provider fill mismatch for {instrument_id}: "
+                    f"durable {local_quantity}, provider {provider_quantity}"
+                )
+            expected[instrument_id] += provider_quantity
+        for instrument_id, local_quantity in transient_local.items():
+            if instrument_id not in transient_provider:
+                expected[instrument_id] += local_quantity
+        observed, position_reasons = self._strict_position_map(
+            facts.positions,
+            account_id=spec.account.id,
+        )
+        reasons.extend(position_reasons)
         for instrument_id in set(expected) | set(observed):
-            if expected[instrument_id] != observed[instrument_id]:
+            if expected[instrument_id] != observed.get(instrument_id, Decimal("0")):
                 reasons.append(
                     "broker position does not match the durable managed allocation for "
-                    f"{instrument_id}: expected {expected[instrument_id]}, observed {observed[instrument_id]}"
+                    f"{instrument_id}: expected {expected[instrument_id]}, observed {observed.get(instrument_id, Decimal('0'))}"
                 )
 
         # EXIT targets are expressed as the signed exposure being closed;
@@ -712,6 +825,8 @@ class Stage6PilotRunner:
         # is currently present for that configured instrument.
         if spec.action is IntentAction.EXIT:
             for sleeve, target in zip(spec.sleeves, spec.targets, strict=True):
+                if exit_target_books is not None and sleeve.book_id not in exit_target_books:
+                    continue
                 for instrument_id, target_quantity in zip(
                     target.instrument_ids,
                     target.signed_quantities,
@@ -731,6 +846,49 @@ class Stage6PilotRunner:
                     f"unattributed broker fill evidence is present for {fill.external_order_id}"
                 )
         return facts, reasons
+
+    @staticmethod
+    def _strict_position_map(
+        positions: Sequence[PositionSnapshot],
+        *,
+        account_id: str,
+    ) -> tuple[dict[str, Decimal], list[str]]:
+        """Normalize broker positions without silently netting contradictions.
+
+        One instrument may have one authoritative row.  An exact repeated row
+        (including provider snapshot identity) is harmless and is collapsed;
+        any other duplicate is ambiguous and blocks the safety boundary.
+        """
+
+        grouped: dict[str, list[PositionSnapshot]] = defaultdict(list)
+        reasons: list[str] = []
+        for position in positions:
+            if not isinstance(position, PositionSnapshot):
+                reasons.append("authoritative positions contain an invalid row")
+                continue
+            if position.account_id != account_id:
+                reasons.append(
+                    f"authoritative position {position.instrument_id} belongs to a different account"
+                )
+            if not position.instrument_id.strip():
+                reasons.append("authoritative position has no instrument identity")
+                continue
+            if not position.signed_quantity.is_finite():
+                reasons.append(
+                    f"authoritative position {position.instrument_id} has a non-finite quantity"
+                )
+                continue
+            grouped[position.instrument_id].append(position)
+        normalized: dict[str, Decimal] = {}
+        for instrument_id, rows in grouped.items():
+            first = rows[0]
+            if any(row != first for row in rows[1:]):
+                reasons.append(
+                    f"authoritative positions contain contradictory duplicate rows for {instrument_id}"
+                )
+                continue
+            normalized[instrument_id] = first.signed_quantity
+        return normalized, reasons
 
     def _freshness_reasons(
         self,
@@ -1104,11 +1262,13 @@ class Stage6PilotRunner:
 
         if spec.account.environment is not TradingEnvironment.SIM:
             raise ValueError("Stage 6 compensating exits accept SIM accounts only")
-        report, reasons = self._fresh_market_state(
+        _facts, fact_reasons = self._fresh_broker_snapshot(spec)
+        report, market_reasons = self._fresh_market_state(
             spec,
             tuple(market_symbols) or self._configured_symbols(spec),
             require_rth=True,
         )
+        reasons = list(fact_reasons) + list(market_reasons)
         return {
             "run_id": spec.run_id,
             "mode": "COMPENSATING_EXIT_PREFLIGHT",
@@ -1147,15 +1307,32 @@ class Stage6PilotRunner:
         account: Account,
         source_intent_id: str,
         expected_external_order_ids: Mapping[str, str],
+        spec: Stage6PilotSpec | None = None,
+        market_symbols: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Expose the existing proof-gated OMS primitive without reimplementing it."""
 
         if account.environment is not TradingEnvironment.SIM:
             raise ValueError("Stage 6 compensating exits accept SIM accounts only")
+        if spec is None:
+            raise ValueError(
+                "Stage 6 compensating exits require the configured pilot spec for scope and fresh-fact gates"
+            )
+        if account.id != spec.account.id or account.external_account_id != spec.account.external_account_id:
+            raise ValueError("Stage 6 compensating exit account does not match the configured account")
+        spec.validate_repository(self.repository)
+        self._validate_recovery_scope(spec, (source_intent_id,))
+        before_submit = self._submission_safety_gate(
+            spec,
+            tuple(market_symbols) or self._configured_symbols(spec),
+            provenance_mode="COMPENSATING_EXIT",
+            source_intent_id=str(source_intent_id),
+        )
         result = self.oms.submit_verified_compensating_exit(
             source_intent_id=source_intent_id,
             expected_external_order_ids=expected_external_order_ids,
             account=account,
+            _before_submit_leg=before_submit,
         )
         compensating_intent_id = str(result.get("id") or result.get("intent_id") or "")
         snapshots = self.repository.get_intent(compensating_intent_id) if compensating_intent_id else None
@@ -1182,6 +1359,7 @@ class Stage6PilotRunner:
                 for row in attempt_rows
             ],
             "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+            "broker_contacted": True,
             "broker_submission_count": len(attempt_rows),
             "cancel_count": 0,
             "replace_count": 0,
@@ -1192,17 +1370,182 @@ class Stage6PilotRunner:
             "stop_reasons": [],
         }
 
+    def submit_verified_residual_exit(
+        self,
+        *,
+        account: Account,
+        source_intent_id: str,
+        expected_external_order_ids: Mapping[str, str],
+        spec: Stage6PilotSpec,
+        market_symbols: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Submit a proof-gated exit for one exact partial Stage 6 source.
+
+        Scope is checked here, while the broker-neutral OMS owns the durable
+        fill/position proof and idempotent exit construction.  Retired legacy
+        evidence is intentionally excluded from this order-bearing route.
+        """
+        if account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 residual exits accept SIM accounts only")
+        if account.id != spec.account.id or account.external_account_id != spec.account.external_account_id:
+            raise ValueError("Stage 6 residual exit account does not match the configured account")
+        spec.validate_repository(self.repository)
+        self._validate_recovery_scope(spec, (source_intent_id,))
+        source = self.repository.get_intent(str(source_intent_id))
+        if source is None:
+            raise ValueError(f"unknown Stage 6 residual source intent: {source_intent_id}")
+        metadata = source.get("metadata")
+        if isinstance(metadata, Mapping) and (metadata.get("legacy_import") or metadata.get("retired_baseline")):
+            raise ValueError("retired legacy evidence cannot submit a residual exit")
+        allowed_strategies = {str(item.strategy_id) for item in spec.sleeves}
+        allowed_books = {str(item.book_id) for item in spec.sleeves}
+        allowed_instruments = {
+            str(instrument_id)
+            for sleeve in spec.sleeves
+            for instrument_id in sleeve.instrument_ids
+        }
+        if str(source.get("strategy_id")) not in allowed_strategies:
+            raise ValueError("Stage 6 residual source strategy is outside the configured pilot")
+        if str(source.get("book_id") or "") not in allowed_books:
+            raise ValueError("Stage 6 residual source book is outside the configured pilot")
+        for leg in source.get("legs", ()):
+            if str(leg.get("instrument_id") or "") not in allowed_instruments:
+                raise ValueError("Stage 6 residual source instrument is outside the configured pilot")
+
+        before_submit = self._submission_safety_gate(
+            spec,
+            tuple(market_symbols) or self._configured_symbols(spec),
+            provenance_mode="RESIDUAL_EXIT",
+            source_intent_id=str(source_intent_id),
+        )
+        result = self.oms.submit_verified_residual_exit(
+            source_intent_id=str(source_intent_id),
+            expected_external_order_ids=expected_external_order_ids,
+            account=account,
+            _before_submit_leg=before_submit,
+        )
+        residual_intent_id = str(result.get("id") or result.get("intent_id") or "")
+        snapshot = self.repository.get_intent(residual_intent_id) if residual_intent_id else None
+        attempt_rows = [
+            attempt
+            for leg in (snapshot or {}).get("legs", ())
+            for attempt in self.repository.broker_orders_for_leg(str(leg.get("id")))
+        ]
+        return {
+            "source_intent_id": str(source_intent_id),
+            "source_external_order_ids": dict(expected_external_order_ids),
+            "residual_result": _stable_value(result),
+            "residual_exit_intent_id": residual_intent_id,
+            "residual_leg_ids": [str(leg.get("id")) for leg in (snapshot or {}).get("legs", ())],
+            "broker_order_attempt_ids": [str(row.get("id")) for row in attempt_rows],
+            "external_broker_order_ids": [str(row.get("external_order_id")) for row in attempt_rows],
+            "statuses": [str(row.get("status")) for row in attempt_rows],
+            "fill_state": [
+                {
+                    "external_order_id": str(row.get("external_order_id")),
+                    "filled_quantity": row.get("filled_quantity"),
+                    "average_fill_price": row.get("average_fill_price"),
+                }
+                for row in attempt_rows
+            ],
+            "execution_path": "Stage6PilotRunner->GenericOMS->MooMooGenericAdapter->OpenD",
+            "broker_contacted": True,
+            "broker_submission_count": len(attempt_rows),
+            "cancel_count": 0,
+            "replace_count": 0,
+            "duplicate_attempt": any(
+                len(self.repository.broker_orders_for_leg(str(leg.get("id")))) > 1
+                for leg in (snapshot or {}).get("legs", ())
+            ),
+            "stop_reasons": [],
+        }
+
+    def _submission_safety_gate(
+        self,
+        spec: Stage6PilotSpec,
+        market_symbols: Sequence[str],
+        *,
+        provenance_mode: str = Stage6RunMode.SIM_SUBMIT.value,
+        source_intent_id: str | None = None,
+    ) -> Callable[[Any, Any, Account], None]:
+        """Build a per-leg fresh account/RTH admission callback."""
+
+        recorded_intents: set[str] = set()
+
+        def gate(_intent: Any, _leg: Any, account: Account) -> None:
+            if account.id != spec.account.id or account.environment is not TradingEnvironment.SIM:
+                raise ValueError("Stage 6 submission account is not the configured SIM account")
+            intent_id = str(getattr(_intent, "id", "")).strip()
+            if not intent_id:
+                raise ValueError("Stage 6 submission intent identity is missing")
+            if intent_id not in recorded_intents:
+                # Persist immutable provenance after the local intent exists,
+                # but before any adapter submit call can occur.  A failure
+                # here is therefore a durable pre-submit block, never a
+                # post-submit provenance hole.
+                self._record_submission_process_identity(
+                    intent_id=intent_id,
+                    account_id=account.id,
+                    run_id=spec.run_id,
+                    mode=provenance_mode,
+                    source_intent_id=source_intent_id,
+                )
+                recorded_intents.add(intent_id)
+            exit_target_books: set[str] | None = None
+            if spec.action is IntentAction.EXIT:
+                # An EXIT batch is dispatched one book at a time.  The first
+                # leg for this intent must prove that its book still matches
+                # the configured closing target; after that leg fills, the
+                # account snapshot necessarily changes before the sibling leg
+                # and before the next book.  Keep the global allocation/fact
+                # equality checks on every leg, while scoping this target
+                # equality check to the current book and only its first
+                # attempt.
+                persisted = self.repository.get_intent(str(getattr(_intent, "id", "")))
+                has_attempts = bool(
+                    persisted
+                    and any(
+                        self.repository.broker_orders_for_leg(str(row.get("id")))
+                        for row in persisted.get("legs", ())
+                    )
+                )
+                exit_target_books = (
+                    set()
+                    if has_attempts
+                    else {str(getattr(_intent, "book_id", "") or "")}
+                )
+            _facts, fact_reasons = self._fresh_broker_snapshot(
+                spec,
+                exit_target_books=exit_target_books,
+                transient_intent=_intent,
+            )
+            _market, market_reasons = self._fresh_market_state(
+                spec,
+                market_symbols,
+                require_rth=True,
+            )
+            reasons = list(fact_reasons) + list(market_reasons)
+            if reasons:
+                raise ValueError("Stage 6 per-leg submission gate blocked: " + "; ".join(reasons))
+
+        return gate
+
     def resolve_verified_roundtrip(
         self,
         *,
         account: Account,
         entry_intent_id: str,
         exit_intent_id: str,
+        spec: Stage6PilotSpec,
     ) -> dict[str, Any]:
         """Expose the existing proof-backed resolver as a local-only boundary."""
 
         if account.environment is not TradingEnvironment.SIM:
             raise ValueError("Stage 6 round-trip resolution accepts SIM accounts only")
+        if account.id != spec.account.id or account.external_account_id != spec.account.external_account_id:
+            raise ValueError("Stage 6 round-trip account does not match the configured account")
+        spec.validate_repository(self.repository)
+        self._validate_recovery_scope(spec, (entry_intent_id, exit_intent_id))
         result = self.oms.resolve_verified_roundtrip(
             entry_intent_id=str(entry_intent_id),
             exit_intent_id=str(exit_intent_id),
@@ -1219,6 +1562,84 @@ class Stage6PilotRunner:
             "cancel_count": 0,
             "replace_count": 0,
         }
+
+    def _validate_recovery_scope(
+        self,
+        spec: Stage6PilotSpec,
+        intent_ids: Sequence[str],
+    ) -> None:
+        """Reject proof operations that name foreign strategy/book rows."""
+
+        allowed_strategies = {str(item.strategy_id) for item in spec.sleeves}
+        allowed_books = {str(item.book_id) for item in spec.sleeves}
+        allowed_instruments = {
+            str(instrument_id)
+            for sleeve in spec.sleeves
+            for instrument_id in sleeve.instrument_ids
+        }
+        for raw_id in intent_ids:
+            intent_id = str(raw_id).strip()
+            intent = self.repository.get_intent(intent_id)
+            if intent is None:
+                raise ValueError(f"unknown Stage 6 recovery intent: {intent_id}")
+            if str(intent.get("account_id")) != spec.account.id:
+                raise ValueError(f"recovery intent {intent_id} belongs to another account")
+            if str(intent.get("strategy_id")) not in allowed_strategies:
+                raise ValueError(f"recovery intent {intent_id} belongs to another strategy")
+            if str(intent.get("book_id") or "") not in allowed_books:
+                raise ValueError(f"recovery intent {intent_id} belongs to another book")
+            for leg in intent.get("legs", ()):
+                if str(leg.get("instrument_id") or "") not in allowed_instruments:
+                    raise ValueError(
+                        f"recovery intent {intent_id} contains an instrument outside the configured universe"
+                    )
+
+    def resolve_unsubmitted(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        intent_id: str,
+        expected_book_id: str | None = None,
+    ) -> dict[str, Any]:
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 resolution accepts SIM accounts only")
+        self._validate_recovery_scope(spec, (intent_id,))
+        return _stable_value(
+            self.oms.resolve_unsubmitted_intent(
+                str(intent_id),
+                account=spec.account,
+                expected_book_id=expected_book_id,
+            )
+        )
+
+    def resolve_compensated_partial(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        intent_id: str,
+    ) -> dict[str, Any]:
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 resolution accepts SIM accounts only")
+        self._validate_recovery_scope(spec, (intent_id,))
+        return _stable_value(
+            self.oms.resolve_compensated_partial_intent(str(intent_id), account=spec.account)
+        )
+
+    def resolve_aggregate_roundtrip(
+        self,
+        spec: Stage6PilotSpec,
+        *,
+        intent_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        if spec.account.environment is not TradingEnvironment.SIM:
+            raise ValueError("Stage 6 resolution accepts SIM accounts only")
+        self._validate_recovery_scope(spec, intent_ids)
+        return _stable_value(
+            self.oms.resolve_verified_aggregate_roundtrip(
+                intent_ids=tuple(str(value) for value in intent_ids),
+                account=spec.account,
+            )
+        )
 
     def final_state(
         self,
@@ -1428,10 +1849,13 @@ class Stage6PilotRunner:
                     }
                 )
             books.append({"book_id": sleeve.book_id, "sleeve_id": sleeve.sleeve_id, "signed_quantities": target, "closing_legs": legs})
-        observed: dict[str, Decimal] = defaultdict(Decimal)
+        observed: dict[str, Decimal] = {}
         if facts is not None:
-            for position in facts.positions:
-                observed[position.instrument_id] += Decimal(str(position.signed_quantity))
+            observed, position_reasons = self._strict_position_map(
+                facts.positions,
+                account_id=spec.account.id,
+            )
+            reasons.extend(position_reasons)
         if facts is None or not facts.complete:
             reasons.append("fresh broker positions are unavailable")
         elif dict(expected_by_instrument) != {key: value for key, value in observed.items() if value != 0}:
@@ -1781,6 +2205,24 @@ class Stage6PilotRunner:
             if not isinstance(row.get("evidence"), Mapping):
                 observation_errors.append(f"retained {phase} observation evidence is not an object")
                 continue
+            source = row["evidence"].get("observation_source")
+            if not isinstance(source, Mapping):
+                observation_errors.append(
+                    f"retained {phase} observation lacks a runner source marker"
+                )
+            elif (
+                str(source.get("kind", "")).strip().upper() != "STAGE6_RUNNER"
+                or source.get("self_generated") is not True
+                or source.get("broker_contacted") is not True
+                or str(source.get("phase", "")).strip().upper() != phase
+                or str(source.get("run_id", "")).strip() != spec.run_id
+                or not str(source.get("invocation_id", "")).strip()
+                or str(source.get("process_id", "")).strip()
+                != str(row.get("process_id") or "").strip()
+            ):
+                observation_errors.append(
+                    f"retained {phase} observation is not a self-generated connected runner observation"
+                )
             observations_by_phase[phase].append(row)
 
         for phase in sorted(expected_phases):
@@ -1871,6 +2313,13 @@ class Stage6PilotRunner:
                 "durable evidence in: "
                 + ", ".join(mismatches)
             )
+        if isinstance(evidence, dict):
+            # This marker is written only after the canonical repository graph
+            # and the retained phase observations have matched.  The
+            # repository still requires its instance-scoped capability before
+            # accepting a clean row, so an input document cannot self-authorize
+            # this boundary.
+            evidence["_stage6_durable_graph_verified"] = True
 
     @staticmethod
     def _parse_history_timestamp(value: object, *, field: str) -> datetime:
@@ -2332,6 +2781,7 @@ class Stage6PilotRunner:
         broker_facts: dict[str, Any] = {}
         market_state: dict[str, Any] = {}
         broker_preflight_passed = False
+        submission_gate: Callable[[Any, Any, Account], None] | None = None
 
         self.repository.initialize()
         try:
@@ -2412,6 +2862,11 @@ class Stage6PilotRunner:
                 )
                 stop_reasons.extend(market_reasons)
                 broker_preflight_passed = not fresh_reasons and not market_reasons
+                if broker_preflight_passed:
+                    submission_gate = self._submission_safety_gate(
+                        spec,
+                        tuple(market_symbols) or self._configured_symbols(spec),
+                    )
             elif selected_mode is Stage6RunMode.DRY_RUN:
                 broker_facts = {"queried": False, "reason": "dry-run does not contact the broker"}
 
@@ -2481,22 +2936,15 @@ class Stage6PilotRunner:
                 metadata={"pilot_run_id": spec.run_id},
             )
             try:
-                result = self.oms.submit_intent(intent, account=spec.account, risk_decision=risk)
+                result = self.oms.submit_intent(
+                    intent,
+                    account=spec.account,
+                    risk_decision=risk,
+                    _before_submit_leg=submission_gate,
+                )
                 status = str(result.get("status", "UNKNOWN"))
                 wait_outcome = "FULL" if self._is_verified_full_fill(result) else status
                 final_result: Mapping[str, Any] = result
-                if existing is None:
-                    try:
-                        self._record_submission_process_identity(
-                            intent_id=intent.id,
-                            account_id=spec.account.id,
-                            run_id=spec.run_id,
-                        )
-                    except Exception as exc:
-                        stop_reasons.append(
-                            f"submission process identity persistence failed for {intent.id}: {exc}"
-                        )
-                        break
                 if status in {
                     IntentStatus.WORKING.value,
                     IntentStatus.SUBMITTING.value,

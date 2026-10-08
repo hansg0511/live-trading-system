@@ -174,7 +174,9 @@ def test_recover_cli_uses_runner_boundary_and_emits_recovery_evidence(tmp_path, 
     monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
     monkeypatch.setattr(Stage6PilotConfig, "build_runner", lambda _self, _repository, adapter=None: runner)
 
-    assert main(["recover", "--config", str(path), "--json"]) == 0
+    # A connected runner with no authoritative fresh-facts capability must
+    # fail closed; broker contact alone cannot justify NO_RECOVERY_NEEDED.
+    assert main(["recover", "--config", str(path), "--json"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert runner.accounts == [config.account]
     assert (adapter.connect_calls, adapter.disconnect_calls) == (1, 1)
@@ -186,6 +188,9 @@ def test_recover_cli_uses_runner_boundary_and_emits_recovery_evidence(tmp_path, 
     assert payload["cancel_count"] == 0
     assert payload["replace_count"] == 0
     assert payload["orders_submitted"] == 0
+    assert payload["restart_recovery"]["result"] == "BLOCKED"
+    assert payload["restart_recovery"]["fresh_facts_complete"] is False
+    assert payload["stop_reasons"]
     assert payload["restart_recovery"]["fresh_process"] is False
     assert "no recoverable source intents" in payload["restart_recovery"]["process_identity_reason"]
     assert payload["restart_recovery"]["process_id"]
@@ -267,7 +272,7 @@ def test_recover_does_not_record_session_recover_observation_and_session_recover
     adapter = ReadOnlyAdapter()
     monkeypatch.setattr(Stage6PilotConfig, "build_moomoo_adapter", lambda _self: adapter)
     monkeypatch.setattr(Stage6PilotConfig, "build_runner", lambda _self, _repository, adapter=None: EmptyRunner())
-    assert main(["recover", "--config", str(path), "--json"]) == 0
+    assert main(["recover", "--config", str(path), "--json"]) == 2
     capsys.readouterr()
     assert repository.stage6_validation_observations(f"stage6-validation-{config.spec().run_id}") == []
 

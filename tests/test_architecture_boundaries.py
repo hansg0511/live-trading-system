@@ -58,7 +58,13 @@ PAIR_TOKEN_BASELINE_EXEMPTIONS = {
     "src/trading_core/oms.py",
 }
 
-CURRENT_GENERIC_OMS_BLOB = "c7d2730c05a4b15bbb6ccc9b56330d698f2e35d0"
+# Stage 6 v3 intentionally carries a narrowly bounded OMS safety surface:
+# the per-leg admission callback, strict residual-compensation primitive,
+# contradictory-position quarantine, and EXIT-before-ENTER recovery ordering.
+# These are execution-safety seams required by the v3 contract, not a generic
+# strategy dependency. Keep the exact normalized source blob pinned so any
+# further OMS change requires an explicit compatibility review/bump.
+CURRENT_GENERIC_OMS_V3_BLOB = "e400f121083d4ae042abc0ed52f8c76c98998203"
 
 CURRENT_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",
@@ -173,8 +179,8 @@ def test_generic_core_has_no_pair_specific_domain_tokens():
     assert not violations, "pair-specific vocabulary crossed into trading_core:\n" + "\n".join(violations)
 
 
-def test_generic_oms_execution_source_remains_the_committed_baseline():
-    """Stage 6 validation must not alter the existing GenericOMS boundary."""
+def test_generic_oms_execution_source_matches_the_reviewed_v3_safety_baseline():
+    """Only the reviewed Stage 6 v3 OMS safety seams are permitted here."""
     git_root = _git_root()
     if git_root is None:
         pytest.skip("Git repository is not available; cannot verify OMS baseline")
@@ -184,8 +190,8 @@ def test_generic_oms_execution_source_remains_the_committed_baseline():
         actual_blob = _git_blob(git_root, "src/trading_core/oms.py")
     except (OSError, subprocess.CalledProcessError) as exc:
         pytest.skip(f"Git blob lookup unavailable: {exc}")
-    assert actual_blob == CURRENT_GENERIC_OMS_BLOB, (
-        "GenericOMS execution source changed; Stage 6 validation must remain additive"
+    assert actual_blob == CURRENT_GENERIC_OMS_V3_BLOB, (
+        "GenericOMS execution source changed beyond the reviewed Stage 6 v3 safety baseline"
     )
 
 

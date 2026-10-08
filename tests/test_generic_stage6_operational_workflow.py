@@ -6,6 +6,7 @@ from decimal import Decimal
 import copy
 import json
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -75,6 +76,14 @@ class CliWorkflowAdapter(DelayedPilotAdapter):
             if quantity != 0
         )
         self.facts = replace(self.facts, positions=positions)
+
+    def get_authoritative_account_facts(self, account):  # type: ignore[no-untyped-def]
+        # The real adapter's account-facts endpoint returns one authoritative
+        # row per instrument.  Keep this fake's accumulated per-order rows
+        # normalized before every fresh safety read as well as before the
+        # recovery/order readers below.
+        self._net_positions()
+        return super().get_authoritative_account_facts(account)
 
     def get_order(self, account, external_order_id):  # type: ignore[no-untyped-def]
         result = super().get_order(account, external_order_id)
@@ -197,6 +206,38 @@ def test_sim_submit_rechecks_rth_and_submits_nothing_when_session_changes(tmp_pa
     assert adapter.submit_calls == []
 
 
+def test_sim_submit_rechecks_rth_before_each_leg_and_stops_on_transition(tmp_path):
+    account, sleeves, repository, adapter, runner = make_runner(tmp_path)
+    calls = 0
+
+    def changing_market(symbols):
+        nonlocal calls
+        calls += 1
+        state = "RTH" if calls < 3 else "CLOSED"
+        return {
+            "market": "US",
+            "captured_at": NOW.isoformat(),
+            "complete": True,
+            "rows": [{"symbol": str(symbol), "market_state": state} for symbol in symbols],
+        }
+
+    adapter.get_authoritative_market_state = changing_market
+    report = runner.run(make_spec(account, sleeves), mode=Stage6RunMode.SIM_SUBMIT)
+
+    # Call 1 is the run-level gate, call 2 is the first leg gate, and call 3
+    # closes RTH before the second leg can reach the adapter.  The first leg
+    # remains durable/auditable; the blocked second leg is never submitted.
+    assert calls >= 3
+    assert report.preflight_passed is False
+    assert any("returned RECONCILIATION_REQUIRED" in reason for reason in report.stop_reasons)
+    assert any(
+        "not RTH" in str(issue.get("details_json"))
+        for issue in repository.open_reconciliation_issues(account.id)
+    )
+    assert len(adapter.submit_calls) == 1
+    assert len(repository.book_intents(account.id)) == 1
+
+
 @pytest.mark.parametrize("condition", ("closed", "stale", "incomplete"))
 def test_compensating_exit_requires_fresh_rth_before_oms_boundary(tmp_path, condition):
     account, sleeves, _repository, adapter, runner = make_runner(tmp_path)
@@ -232,6 +273,38 @@ def test_compensating_exit_fresh_rth_gate_passes_without_mutation(tmp_path):
 
     assert gate["preflight_passed"] is True
     assert gate["market_state"]["rth"]["observed"] is True
+    assert adapter.submit_calls == []
+
+
+def test_strict_position_normalizer_rejects_conflicting_duplicates_at_shared_boundaries(tmp_path):
+    account = make_account()
+    sleeves = make_sleeves()
+    instrument_id = sleeves[0].instrument_ids[0]
+    first = PositionSnapshot(
+        id="position-a",
+        broker_snapshot_id="snapshot-a",
+        account_id=account.id,
+        instrument_id=instrument_id,
+        signed_quantity=Decimal("1"),
+        captured_at=NOW,
+    )
+    conflicting = replace(first, id="position-b", broker_snapshot_id="snapshot-b", signed_quantity=Decimal("2"))
+    facts = BrokerFactSnapshot(
+        account_id=account.id,
+        captured_at=NOW,
+        complete=True,
+        positions=(first, conflicting),
+    )
+    account, sleeves, _repository, adapter, runner = make_runner(tmp_path, facts=facts)
+    spec = make_spec(account, sleeves)
+
+    preflight = runner.broker_preflight(spec)
+    assert preflight["preflight_passed"] is False
+    assert any("contradictory duplicate rows" in reason for reason in preflight["stop_reasons"])
+
+    report = runner.run(spec, mode=Stage6RunMode.SIM_SUBMIT)
+    assert report.preflight_passed is False
+    assert any("contradictory duplicate rows" in reason for reason in report.stop_reasons)
     assert adapter.submit_calls == []
 
 
@@ -567,6 +640,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     include_retired_baseline,
 ):
     values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    runtime_trading_date = runtime_now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
     if include_retired_baseline:
         _baseline_account, _baseline_sleeves, _baseline_repository, baseline_adapter, _baseline_runner = (
             make_retired_baseline_runner(tmp_path)
@@ -586,10 +660,14 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     # CLI. Every later evidence artifact is captured from a CLI result.
     dry_code, dry_payload = _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])
     assert dry_code == 0, json.dumps(dry_payload, indent=2, sort_keys=True)
+    session_id = "clean-cli-session"
     preflight_path = tmp_path / "preflight.json"
     preflight_code, preflight = _run_cli(
         capsys,
-        ["broker-preflight", "--config", str(config_path), "--json"],
+        [
+            "broker-preflight", "--config", str(config_path), "--json",
+            "--session-id", session_id, "--record-observation",
+        ],
         preflight_path,
     )
     assert preflight_code == 0
@@ -605,6 +683,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     )
     assert entry_code == 0
     assert entry["preflight_passed"] is True
+    assert entry["broker_contacted"] is True
     assert len(adapter.submit_calls) == 4
     entry_intent_ids = [item["intent_id"] for item in entry["intent_results"]]
     assert len(entry_intent_ids) == 2
@@ -614,7 +693,10 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     monkeypatch.setattr(stage6_cli.os, "getpid", lambda: "separate-recovery-process")
     recovery_code, recovery = _run_cli(
         capsys,
-        ["recover", "--config", str(config_path), "--json"],
+        [
+            "recover", "--config", str(config_path), "--json",
+            "--session-id", session_id, "--record-observation",
+        ],
         recovery_path,
     )
     monkeypatch.setattr(stage6_cli.os, "getpid", original_getpid)
@@ -652,6 +734,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
         ],
     )
     assert exit_code == 0
+    assert exit_report["broker_contacted"] is True
     assert len(adapter.submit_calls) == 8
     exit_intent_ids = [item["intent_id"] for item in exit_report["intent_results"]]
     assert len(exit_intent_ids) == 2
@@ -659,7 +742,10 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     final_path = tmp_path / "final.json"
     final_code, final = _run_cli(
         capsys,
-        ["final-state", "--config", str(config_path), "--json"],
+        [
+            "final-state", "--config", str(config_path), "--json",
+            "--session-id", session_id, "--record-observation",
+        ],
         final_path,
     )
     assert final_code == 0, json.dumps(final, indent=2, sort_keys=True)
@@ -676,7 +762,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
             "--exit-intent-id", exit_intent_ids[0], "--exit-intent-id", exit_intent_ids[1],
             "--preflight-evidence", str(preflight_path), "--recovery-evidence", str(recovery_path),
             "--final-evidence", str(final_path), "--commit-sha", "offline-test",
-            "--trading-date", "2026-10-07", "--json",
+                "--trading-date", runtime_trading_date, "--json",
         ],
         evidence_path,
     )
@@ -686,19 +772,8 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     assert evidence["exit"]["fills_complete"] is True
     assert evidence["exit"]["current_exposure_inverse"] is True
 
-    # Record and finalize only the generated artifacts; no favorable facts
-    # are authored by the test.
-    session_id = "clean-cli-session"
-    for command, artifact in (("session-preflight", preflight_path), ("session-recover", recovery_path), ("session-final", final_path)):
-        args = [
-            command, "--config", str(config_path), "--session-id", session_id,
-            "--evidence", str(artifact), "--commit-sha", "offline-test",
-            "--execution-compatibility", "stage6-execution-v2", "--trading-date", "2026-10-07",
-        ]
-        if command == "session-recover":
-            args.append("--fresh-process")
-        args.append("--json")
-        assert _run_cli(capsys, args)[0] == 0
+    # The phase rows above were persisted by the connected runner commands;
+    # session-* artifact ingestion remains audit-only and cannot qualify.
 
     def record_phase_observations(session_id: str) -> None:
         for command, artifact in (
@@ -713,7 +788,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
             args = [
                 command, "--config", str(config_path), "--session-id", session_id,
                 "--evidence", str(phase_artifact), "--commit-sha", "offline-test",
-                "--execution-compatibility", "stage6-execution-v2", "--trading-date", "2026-10-07",
+                "--execution-compatibility", "stage6-execution-v2", "--trading-date", runtime_trading_date,
             ]
             if command == "session-recover":
                 args.append("--fresh-process")
@@ -743,10 +818,16 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
         tampered["session_id"] = f"tampered-{label}"
         mutate(tampered)
         pure_result = evaluate_stage6_session(tampered)
-        if label == "external-order":
-            assert pure_result.outcome is Stage6SessionOutcome.INVALID
-        else:
-            assert pure_result.outcome is Stage6SessionOutcome.CLEAN_PASS
+        # The pure document validator checks the top-level lifecycle shape;
+        # nested fill/provenance tampering is intentionally rejected later by
+        # the repository-backed durable graph gate.  Only the forged order
+        # identity is structurally invalid at this pure boundary.
+        expected_pure = (
+            Stage6SessionOutcome.INVALID
+            if label == "external-order"
+            else Stage6SessionOutcome.CLEAN_PASS
+        )
+        assert pure_result.outcome is expected_pure
         tampered_path = tmp_path / f"tampered-{label}.json"
         tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
         record_phase_observations(tampered["session_id"])
@@ -790,7 +871,7 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
         capsys,
         ["session-finalize", "--config", str(config_path), "--session-id", session_id, "--evidence", str(evidence_path), "--json"],
     )
-    assert finalize_code == 0, finalized.get("failure_reasons")
+    assert finalize_code == 0, json.dumps(finalized, indent=2, sort_keys=True)
     assert finalized["result"] == "CLEAN_PASS"
 
 
@@ -822,7 +903,7 @@ def test_same_process_recovery_cannot_count_as_fresh_process(
         ["recover", "--config", str(config_path), "--json"],
         recovery_path,
     )
-    assert recovery_code == 0
+    assert recovery_code == 2
     assert recovery["restart_recovery"]["fresh_process"] is False
     assert recovery["restart_recovery"]["result"] == "BLOCKED"
     assert "matches the original" in recovery["restart_recovery"]["process_identity_reason"]
@@ -923,6 +1004,7 @@ def test_cli_delayed_first_book_never_dispatches_second_and_cannot_finalize(
         ],
     )
     assert compensating_code == 0, json.dumps(compensating, indent=2, sort_keys=True)
+    assert compensating["broker_contacted"] is True
     exit_intent_id = compensating["compensating_exit_intent_id"]
     assert exit_intent_id
     assert compensating["broker_submission_count"] == 2
@@ -931,6 +1013,8 @@ def test_cli_delayed_first_book_never_dispatches_second_and_cannot_finalize(
     exit_snapshot = repository.get_intent(exit_intent_id)
     assert exit_snapshot is not None
     assert exit_snapshot["status"] == "WORKING"
+    assert exit_snapshot["metadata"]["stage6_submission"]["mode"] == "COMPENSATING_EXIT"
+    assert exit_snapshot["metadata"]["stage6_submission"]["correlation"]["source_intent_id"] == source_intent_id
     assert all(len(repository.broker_orders_for_leg(leg["id"])) == 1 for leg in exit_snapshot["legs"])
     assert repository.book_intents(config.account.id, book_id="pilot-book-b") == []
 

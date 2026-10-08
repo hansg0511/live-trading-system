@@ -187,6 +187,8 @@ class SQLiteTradingRepository:
         self.__fill_validation_capability = object()
         self.__resolution_capability = object()
         self.__allocation_validation_capability = object()
+        self.__stage6_validation_capability = object()
+        self.__stage6_observation_capability = object()
 
     def _fill_validation_capability(self) -> object:
         """Return the private capability used by validated OMS ingestion."""
@@ -199,6 +201,14 @@ class SQLiteTradingRepository:
     def _allocation_validation_capability(self) -> object:
         """Return the instance-scoped capability for validated ledger writes."""
         return self.__allocation_validation_capability
+
+    def _stage6_validation_capability(self) -> object:
+        """Return the instance-scoped capability for durable clean evidence."""
+        return self.__stage6_validation_capability
+
+    def _stage6_observation_capability(self) -> object:
+        """Return the private capability for runner-generated observations."""
+        return self.__stage6_observation_capability
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -2773,6 +2783,7 @@ class SQLiteTradingRepository:
         evidence: Mapping[str, Any],
         process_id: str | None = None,
         fresh_process: bool = False,
+        _observation_capability: object | None = None,
     ) -> str:
         """Append one immutable validation-phase observation.
 
@@ -2803,6 +2814,21 @@ class SQLiteTradingRepository:
         evidence_account_id = evidence.get("account_id")
         if evidence_account_id is not None and str(evidence_account_id).strip() != account_id:
             raise ValueError("Stage 6 observation evidence account_id does not match the row")
+        source = evidence.get("observation_source")
+        if isinstance(source, Mapping) and str(source.get("kind", "")).strip().upper() == "STAGE6_RUNNER":
+            if _observation_capability is not self.__stage6_observation_capability:
+                raise PermissionError(
+                    "runner-generated Stage 6 observation capability is required"
+                )
+            if source.get("self_generated") is not True or source.get("broker_contacted") is not True:
+                raise ValueError(
+                    "runner-generated Stage 6 observation provenance is incomplete"
+                )
+            source_process_id = str(source.get("process_id", "")).strip()
+            if not source_process_id or process_id is None or str(process_id).strip() != source_process_id:
+                raise ValueError(
+                    "runner-generated Stage 6 observation process identity is incomplete"
+                )
         evidence_hash = _fingerprint(json.loads(evidence_json))
         values = (
             observation_id,
@@ -2839,6 +2865,17 @@ class SQLiteTradingRepository:
                 if normalized_current != expected:
                     raise ValueError("Stage 6 validation observation ID was reused with different evidence")
                 return observation_id
+            phase_rows = conn.execute(
+                """SELECT id, evidence_hash FROM core_stage6_validation_observations
+                   WHERE session_id = ? AND phase = ?""",
+                (session_id, phase),
+            ).fetchall()
+            if phase_rows:
+                if len(phase_rows) == 1 and str(phase_rows[0]["evidence_hash"]) == evidence_hash:
+                    return str(phase_rows[0]["id"])
+                raise ValueError(
+                    f"Stage 6 validation session already has conflicting {phase} observation evidence"
+                )
             conn.execute(
                 """INSERT INTO core_stage6_validation_observations
                    (id, session_id, account_id, phase, captured_at, process_id,
@@ -2947,6 +2984,8 @@ class SQLiteTradingRepository:
     def save_stage6_validation_session(
         self,
         result: Stage6SessionResult | Mapping[str, Any],
+        *,
+        _validation_capability: object | None = None,
     ) -> Stage6SessionResult:
         """Persist one immutable derived Stage 6 validation result.
 
@@ -2978,6 +3017,15 @@ class SQLiteTradingRepository:
         else:
             raise TypeError("Stage 6 validation result must be Stage6SessionResult or a mapping")
         if normalized.outcome is Stage6SessionOutcome.CLEAN_PASS:
+            if _validation_capability is not self.__stage6_validation_capability:
+                raise PermissionError(
+                    "durable Stage 6 CLEAN_PASS capability is required; "
+                    "use the verified Stage6 runner boundary"
+                )
+            if normalized.evidence.get("_stage6_durable_graph_verified") is not True:
+                raise ValueError(
+                    "durable Stage 6 CLEAN_PASS graph proof is missing"
+                )
             if not normalized.qualified or not normalized.counted_for_completion:
                 raise ValueError("CLEAN_PASS must be qualified and initially countable")
             if normalized.evidence_class != Stage6EvidenceClass.DURABLE.value:

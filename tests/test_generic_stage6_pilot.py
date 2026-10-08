@@ -14,6 +14,7 @@ from src.strategies.stat_arb.stage5_sleeves import (
     SleeveAllocationTarget,
 )
 from src.strategies.stat_arb.stage6_pilot import (
+    STAGE6_EXECUTION_COMPATIBILITY,
     Stage6PilotRunner,
     Stage6PilotSpec,
     Stage6RunMode,
@@ -393,6 +394,34 @@ class DelayedPilotAdapter(PilotFakeAdapter):
         )
 
 
+class NettedPilotAdapter(PilotFakeAdapter):
+    """Model an account-level provider position row per instrument."""
+
+    def submit_order(self, account: Account, request) -> BrokerSubmissionResult:
+        result = super().submit_order(account, request)
+        matching = [
+            position
+            for position in self.facts.positions
+            if position.instrument_id == request.order_leg.instrument_id
+        ]
+        if len(matching) > 1:
+            net_quantity = sum((position.signed_quantity for position in matching), Decimal("0"))
+            retained = replace(
+                matching[0],
+                signed_quantity=net_quantity,
+                captured_at=NOW,
+            )
+            self.facts = replace(
+                self.facts,
+                positions=tuple(
+                    position
+                    for position in self.facts.positions
+                    if position.instrument_id != request.order_leg.instrument_id
+                ) + (retained,),
+            )
+        return result
+
+
 def make_repository(tmp_path, account: Account, sleeves: tuple[PairSleeve, PairSleeve]):
     repository = SQLiteTradingRepository(tmp_path / "stage6.db")
     repository.initialize()
@@ -539,7 +568,7 @@ def make_retired_baseline_runner(tmp_path):
         execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
         execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
     )
-    adapter = PilotFakeAdapter(facts)
+    adapter = NettedPilotAdapter(facts)
     oms = GenericOMS(repository, adapter, clock=lambda: NOW)
     return account, sleeves, repository, adapter, Stage6PilotRunner(repository, oms, clock=lambda: NOW)
 
@@ -652,11 +681,37 @@ def test_explicit_sim_arm_dispatches_both_through_generic_oms_and_persists_run_m
         if item
     )
     assert all(
-        item["metadata"]["stage6_submission"]["execution_compatibility"] == "stage6-execution-v2"
+        item["metadata"]["stage6_submission"]["execution_compatibility"] == STAGE6_EXECUTION_COMPATIBILITY
         for item in stored
         if item
     )
     assert len(report.after_status) >= 2
+
+
+def test_stage6_provenance_failure_blocks_before_adapter_submission(tmp_path, monkeypatch):
+    account, sleeves, repository, adapter, runner = make_runner(tmp_path)
+    original_append = repository.append_intent_metadata
+
+    def fail_stage6_provenance(intent_id, metadata, *, account_id=None):
+        if "stage6_submission" in metadata:
+            raise RuntimeError("simulated pre-submit provenance persistence failure")
+        return original_append(intent_id, metadata, account_id=account_id)
+
+    monkeypatch.setattr(repository, "append_intent_metadata", fail_stage6_provenance)
+    report = runner.run(make_spec(account, sleeves), mode=Stage6RunMode.SIM_SUBMIT)
+
+    # The callback runs after the local intent exists but before GenericOMS
+    # can invoke the provider.  A provenance write failure therefore leaves a
+    # durable rejected/auditable intent and zero broker submissions.
+    assert adapter.submit_calls == []
+    assert report.stop_reasons
+    intents = repository.book_intents(account.id)
+    assert intents
+    assert all(item["status"] == "REJECTED" for item in intents)
+    assert all(
+        "stage6_submission" not in (repository.get_intent(item["id"]) or {}).get("metadata", {})
+        for item in intents
+    )
 
 
 def test_sim_arm_dispatches_all_legs_for_moomoo_zero_fill_ack_shape(tmp_path):
@@ -921,6 +976,62 @@ def test_restart_recovery_hook_is_explicit_and_never_submits(tmp_path):
     result = runner.recover(account)
 
     assert result == []
+    assert adapter.submit_calls == []
+
+
+def test_roundtrip_resolution_rejects_same_account_foreign_strategy_or_book(tmp_path):
+    account, sleeves, repository, adapter, runner = make_runner(tmp_path)
+    spec = make_spec(account, sleeves)
+    source = sleeves[0].to_intent(make_targets(sleeves)[0])
+    repository.save_strategy(
+        Strategy(
+            id="foreign-strategy",
+            name="Foreign strategy",
+            strategy_type="generic_stat_arb",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    foreign_strategy_legs = tuple(
+        replace(leg, id=f"foreign-strategy-intent-{leg.sequence}", intent_id="foreign-strategy-intent")
+        for leg in source.legs
+    )
+    foreign_strategy = replace(
+        source,
+        id="foreign-strategy-intent",
+        idempotency_key="foreign-strategy-intent-key",
+        strategy_id="foreign-strategy",
+        legs=foreign_strategy_legs,
+    )
+    repository.create_intent(foreign_strategy)
+    with pytest.raises(ValueError, match="another strategy"):
+        runner.resolve_verified_roundtrip(
+            account=account,
+            spec=spec,
+            entry_intent_id=foreign_strategy.id,
+            exit_intent_id=source.id,
+        )
+
+    repository.save_book(Book(id="foreign-book", name="Foreign book", created_at=NOW, updated_at=NOW))
+    foreign_book_legs = tuple(
+        replace(leg, id=f"foreign-book-intent-{leg.sequence}", intent_id="foreign-book-intent")
+        for leg in source.legs
+    )
+    foreign_book = replace(
+        source,
+        id="foreign-book-intent",
+        idempotency_key="foreign-book-intent-key",
+        book_id="foreign-book",
+        legs=foreign_book_legs,
+    )
+    repository.create_intent(foreign_book)
+    with pytest.raises(ValueError, match="another book"):
+        runner.resolve_verified_roundtrip(
+            account=account,
+            spec=spec,
+            entry_intent_id=foreign_book.id,
+            exit_intent_id=source.id,
+        )
     assert adapter.submit_calls == []
 
 

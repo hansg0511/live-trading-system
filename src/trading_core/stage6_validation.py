@@ -49,7 +49,7 @@ _EXECUTION_PATHS = {
     "STAGE6_PILOT_RUNNER_GENERIC_OMS",
 }
 _US_EASTERN = ZoneInfo("America/New_York")
-_PROVENANCE_MODES = {"SIM_SUBMIT", "COMPENSATING_EXIT"}
+_PROVENANCE_MODES = {"SIM_SUBMIT", "COMPENSATING_EXIT", "RESIDUAL_EXIT"}
 
 
 def _mapping(value: object, name: str) -> Mapping[str, Any] | None:
@@ -569,6 +569,68 @@ def _validate_execution_provenance(
         )
 
 
+def _validate_temporal_order(evidence: Mapping[str, Any], reasons: list[str]) -> None:
+    """Reject phase evidence that claims an impossible lifecycle order."""
+
+    def phase_capture(section: object, name: str) -> datetime | None:
+        if not isinstance(section, Mapping):
+            return None
+        value = section.get("captured_at")
+        if value is None and isinstance(section.get("fresh_facts"), Mapping):
+            value = section["fresh_facts"].get("captured_at")
+        if value is None:
+            reasons.append(f"{name}.captured_at is required for temporal ordering")
+            return None
+        try:
+            return _timestamp(value, f"{name}.captured_at")
+        except Stage6ValidationError as exc:
+            reasons.append(str(exc))
+            return None
+
+    preflight = phase_capture(evidence.get("preflight"), "preflight")
+    recovery = phase_capture(
+        evidence.get("restart_recovery", evidence.get("recovery")),
+        "recovery",
+    )
+    final = phase_capture(evidence.get("final"), "final")
+    provenance = evidence.get("execution_provenance")
+    entry_times: list[datetime] = []
+    exit_times: list[datetime] = []
+    if isinstance(provenance, Mapping):
+        for label, target in (("entry", entry_times), ("exit", exit_times)):
+            section = provenance.get(label)
+            if isinstance(section, Mapping):
+                for marker in section.values():
+                    if not isinstance(marker, Mapping):
+                        continue
+                    try:
+                        target.append(_timestamp(marker.get("submitted_at"), f"{label}.submitted_at"))
+                    except Stage6ValidationError as exc:
+                        reasons.append(str(exc))
+    entry = max(entry_times) if entry_times else None
+    exit_time = max(exit_times) if exit_times else None
+    tolerance = 5.0
+    ordered = (
+        preflight is not None
+        and entry is not None
+        and recovery is not None
+        and exit_time is not None
+        and final is not None
+    )
+    if not ordered:
+        reasons.append("complete phase timestamps are required for temporal ordering")
+        return
+    checks = (
+        (preflight, entry, "preflight must not follow entry submission"),
+        (entry, recovery, "entry submission must not follow recovery"),
+        (recovery, exit_time, "recovery must not follow exit submission"),
+        (exit_time, final, "exit submission must not follow final observation"),
+    )
+    for earlier, later, message in checks:
+        if (earlier - later).total_seconds() > tolerance:
+            reasons.append(message)
+
+
 def evaluate_stage6_session(evidence: Mapping[str, Any]) -> "Stage6SessionResult":
     """Validate an explicit Stage6 evidence document without side effects."""
 
@@ -735,6 +797,7 @@ def evaluate_stage6_session(evidence: Mapping[str, Any]) -> "Stage6SessionResult
 
     final = _mapping(evidence.get("final"), "final")
     _validate_final(final, reasons, account_id=account_id, expected_book_ids=expected_book_ids)
+    _validate_temporal_order(evidence, reasons)
 
     manual_intervention = bool(evidence.get("manual_intervention", False))
     manual_flags = evidence.get("manual_flags", evidence.get("manual_actions", []))

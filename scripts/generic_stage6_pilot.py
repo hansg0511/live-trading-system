@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Any
-import uuid
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -58,44 +58,83 @@ from src.trading_core.stage6_validation import (  # noqa: E402
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generic Stage 6 combined-book SIM pilot")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    validate = subparsers.add_parser("validate", help="validate config only; no DB or broker access")
-    dry_run = subparsers.add_parser("dry-run", help="prepare repository and print a no-submit report")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        title="Stage 6 command categories",
+        description=(
+            "offline validation/reporting; connected read-only facts; SIM submission; "
+            "local proof resolution; and durable session validation"
+        ),
+    )
+    validate = subparsers.add_parser("validate", help="offline: validate config only; no DB or broker access")
+    dry_run = subparsers.add_parser("dry-run", help="offline: prepare repository and print a no-submit report")
     broker_preflight = subparsers.add_parser(
         "broker-preflight",
-        help="query fresh SIM account/RTH facts without creating or submitting orders",
+        help="read-only broker facts: query fresh SIM account/RTH facts without creating or submitting orders",
+    )
+    broker_preflight.add_argument("--session-id")
+    broker_preflight.add_argument(
+        "--record-observation", action="store_true",
+        help="persist this runner-generated PREFLIGHT observation for the supplied session",
     )
     baseline = subparsers.add_parser(
         "baseline",
-        help="explicitly verify fresh flat SIM facts and import bounded legacy order evidence (no submit)",
+        help="read-only baseline: verify fresh flat SIM facts and import bounded legacy order evidence (no submit)",
     )
-    sim_submit = subparsers.add_parser("sim-submit", help="explicitly arm one SIM pilot through GenericOMS")
+    sim_submit = subparsers.add_parser("sim-submit", help="SIM submission: explicitly arm one pilot through GenericOMS")
     recover = subparsers.add_parser(
         "recover",
         help=(
-            "broker-read-only restart recovery; may write recovered local ledger evidence, "
+            "read-only recovery: broker-read-only restart recovery; may write recovered local ledger evidence, "
             "never submits/cancels/replaces"
         ),
     )
+    recover.add_argument("--session-id")
+    recover.add_argument(
+        "--record-observation", action="store_true",
+        help="persist this runner-generated RECOVERY observation for the supplied session",
+    )
     compensating_exit = subparsers.add_parser(
         "compensating-exit",
-        help="submit one proof-gated SIM exit for one exact filled source intent",
+        help="SIM submission: submit one proof-gated exit for one exact filled source intent",
     )
     resolve_roundtrip = subparsers.add_parser(
         "resolve-roundtrip",
-        help="persist one proof-backed entry/exit closure; never submits orders",
+        help="local resolution: persist one proof-backed entry/exit closure; never submits orders",
+    )
+    resolve_unsubmitted = subparsers.add_parser(
+        "resolve-unsubmitted",
+        help="local resolution: resolve one proof-backed never-submitted intent; never submits orders",
+    )
+    resolve_compensated = subparsers.add_parser(
+        "resolve-compensated-partial",
+        help="local resolution: resolve one proof-backed compensated partial intent; never submits orders",
+    )
+    resolve_aggregate = subparsers.add_parser(
+        "resolve-aggregate-roundtrip",
+        help="local resolution: resolve one explicitly named proof-backed aggregate round-trip",
+    )
+    residual_exit = subparsers.add_parser(
+        "residual-exit",
+        help="SIM submission: submit one exact proof-gated residual/compensating exit",
     )
     final_state = subparsers.add_parser(
         "final-state",
-        help="obtain fresh broker/local final state without lifecycle mutation",
+        help="read-only facts: obtain fresh broker/local final state without lifecycle mutation",
+    )
+    final_state.add_argument("--session-id")
+    final_state.add_argument(
+        "--record-observation", action="store_true",
+        help="persist this runner-generated FINAL observation for the supplied session",
     )
     prepare_exit = subparsers.add_parser(
         "prepare-exit",
-        help="derive normal two-book EXIT quantities from fresh broker/local exposure",
+        help="offline/read-only: derive normal two-book EXIT quantities from fresh broker/local exposure",
     )
     session_evidence = subparsers.add_parser(
         "session-evidence",
-        help="derive validator evidence from durable repository rows and captured artifacts",
+        help="validation: derive evidence from durable repository rows and captured artifacts",
     )
     for command in (
         validate,
@@ -106,6 +145,10 @@ def _parser() -> argparse.ArgumentParser:
         recover,
         compensating_exit,
         resolve_roundtrip,
+        resolve_unsubmitted,
+        resolve_compensated,
+        resolve_aggregate,
+        residual_exit,
         final_state,
         prepare_exit,
         session_evidence,
@@ -139,6 +182,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     resolve_roundtrip.add_argument("--entry-intent-id", required=True)
     resolve_roundtrip.add_argument("--exit-intent-id", required=True)
+    resolve_unsubmitted.add_argument("--intent-id", required=True)
+    resolve_unsubmitted.add_argument("--expected-book-id")
+    resolve_compensated.add_argument("--intent-id", required=True)
+    resolve_aggregate.add_argument("--intent-id", action="append", required=True)
+    for command in (residual_exit,):
+        command.add_argument("--source-intent-id", required=True)
+        command.add_argument(
+            "--external-order",
+            action="append",
+            default=[],
+            metavar="INSTRUMENT_ID=EXTERNAL_ORDER_ID",
+        )
+        command.add_argument("--arm-sim", action="store_true", help="required explicit SIM arm")
+        command.add_argument("--confirm", help="must equal the exact residual exit arm phrase")
     prepare_exit.add_argument("--output", type=Path, help="optional new derived artifact; existing files are never overwritten")
     session_evidence.add_argument("--session-id", required=True)
     session_evidence.add_argument("--entry-intent-id", action="append", default=[])
@@ -162,6 +219,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--json", action="store_true", dest="as_json")
         command.add_argument("--session-id")
+        command.add_argument("--account-id")
         command.add_argument("--evidence", type=Path, help="JSON evidence document captured around the existing runner")
         command.add_argument("--commit-sha")
         command.add_argument("--execution-compatibility")
@@ -193,6 +251,30 @@ def _summary(config: Stage6PilotConfig) -> dict[str, Any]:
         "execution_compatibility": STAGE6_EXECUTION_COMPATIBILITY,
         "mode": "DRY_RUN",
     }
+
+
+def _resolution_exit_code(result: Mapping[str, Any]) -> int:
+    """Return a non-zero CLI status for an unsuccessful proof resolution.
+
+    Resolver success is represented by an explicit durable ``proof``.  Some
+    safe resolutions intentionally preserve ``RECONCILIATION_REQUIRED`` (for
+    example, cancelling only legs proven never submitted), so the lifecycle
+    status alone is not a failure signal.  A missing proof, explicit error,
+    or active/ambiguous status remains a failed command.
+    """
+
+    if not isinstance(result, Mapping):
+        return 2
+    if result.get("error") or result.get("resolution_passed") is False:
+        return 2
+    status = str(result.get("status", "")).strip().upper()
+    if status in {"FAILED", "REJECTED", "UNKNOWN", "ERROR", "BLOCKED"}:
+        return 2
+    if status in {"RECONCILIATION_REQUIRED", "CANCELLED"} and not result.get("proof"):
+        return 2
+    if status in {"CREATED", "RISK_APPROVED", "SUBMITTING", "WORKING", "PARTIALLY_FILLED"}:
+        return 2
+    return 0
 
 
 def _recovery_intent_snapshot(
@@ -329,6 +411,16 @@ def _recovery_report(
         attempts_by_leg[leg_id] = attempts_by_leg.get(leg_id, 0) + 1
     duplicate_legs = sorted(leg_id for leg_id, count in attempts_by_leg.items() if count > 1)
     completed_at = datetime.now(timezone.utc)
+    # The recovery phase timestamp must describe the authoritative broker
+    # facts used for the phase, rather than the later local JSON assembly
+    # time.  This keeps causal ordering stable when a test/fake provider uses
+    # a deterministic execution clock, and is more conservative for real
+    # providers because stale facts still fail the age gate below.
+    captured_at = (
+        fresh_facts.captured_at
+        if isinstance(fresh_facts, BrokerFactSnapshot)
+        else completed_at
+    )
     open_issues = repository.open_reconciliation_issues(account_id)
     open_actions = repository.open_recovery_actions(account_id)
     source_submission_process_ids, missing_source_process_ids = _durable_submission_process_ids(
@@ -387,8 +479,11 @@ def _recovery_report(
                 facts_valid = False
         if fresh_facts.open_orders:
             facts_valid = False
-        raw_by_instrument: dict[str, list[Decimal]] = {}
+        raw_by_instrument: dict[str, list[Any]] = {}
         for position in fresh_facts.positions:
+            if position.account_id != account_id:
+                facts_valid = False
+                break
             try:
                 quantity = Decimal(str(position.signed_quantity))
             except (InvalidOperation, TypeError, ValueError):
@@ -398,17 +493,16 @@ def _recovery_report(
                 facts_valid = False
                 break
             instrument_id = str(position.instrument_id)
-            raw_by_instrument.setdefault(instrument_id, []).append(quantity)
+            raw_by_instrument.setdefault(instrument_id, []).append(position)
             broker_exposure[instrument_id] = broker_exposure.get(instrument_id, Decimal("0")) + quantity
-        if any(
-            len(values) > 1
-            and any(value != 0 for value in values)
-            and sum(values, Decimal("0")) == 0
-            for values in raw_by_instrument.values()
-        ):
-            # Do not infer that contradictory/non-netted provider rows are a
-            # proven flat exposure merely because their aggregate is zero.
-            facts_valid = False
+        for instrument_id, rows in raw_by_instrument.items():
+            if len(rows) > 1:
+                # Exact row replay is safe to collapse; distinct provider
+                # identities are not safe to net, even when their quantities
+                # happen to sum to zero.
+                if any(row != rows[0] for row in rows[1:]):
+                    facts_valid = False
+                broker_exposure[instrument_id] = Decimal(str(rows[0].signed_quantity))
     broker_exposure = {key: value for key, value in broker_exposure.items() if value != 0}
     exposure_agrees = facts_valid and broker_exposure == durable_exposure
     exposure_stop_reasons: list[str] = []
@@ -422,9 +516,25 @@ def _recovery_report(
         )
     terminal_statuses = {"FILLED", "COMPLETED"}
     recovered_statuses = [str(item.get("status")) for item in after_status]
-    recovery_clean = bool(before_intent_ids) and fresh_process and all(
-        status in terminal_statuses for status in recovered_statuses
-    ) and not open_issues and not open_actions and intents_preserved and orders_preserved and no_duplicate_attempts and exposure_agrees
+    # Empty local recovery state is not sufficient to claim that no recovery
+    # was needed.  The same fresh, complete, account-scoped, normalized fact
+    # gate must prove broker exposure agrees with the durable managed ledger.
+    no_recovery_needed = (
+        not before_intent_ids
+        and not open_issues
+        and not open_actions
+        and facts_valid
+        and exposure_agrees
+    )
+    recovery_clean = no_recovery_needed or (
+        bool(before_intent_ids)
+        and fresh_process
+        and all(status in terminal_statuses for status in recovered_statuses)
+        and intents_preserved
+        and orders_preserved
+        and no_duplicate_attempts
+        and exposure_agrees
+    )
     restart_recovery = {
         "performed": True,
         "broker_contacted": True,
@@ -434,8 +544,8 @@ def _recovery_report(
         "source_submission_process_ids": source_submission_process_ids,
         "source_submission_process_identity_complete": bool(before_intent_ids) and not missing_source_process_ids,
         "process_identity_reason": process_identity_reason,
-        "captured_at": completed_at.isoformat(),
-        "result": "RECOVERED" if recovery_clean else "BLOCKED",
+        "captured_at": captured_at.isoformat(),
+        "result": "NO_RECOVERY_NEEDED" if no_recovery_needed else "RECOVERED" if recovery_clean else "BLOCKED",
         "preserved_intent_ids": sorted(after_intent_ids),
         "preserved_order_ids": sorted(after_external_order_ids),
         "intents_preserved": intents_preserved,
@@ -509,7 +619,7 @@ def _recovery_report(
             "replace_calls": 0,
             "recovery_calls": 1,
         },
-        "stop_reasons": list(dict.fromkeys(exposure_stop_reasons)),
+        "stop_reasons": list(dict.fromkeys(exposure_stop_reasons if not no_recovery_needed else ())),
     }
 
 
@@ -641,7 +751,44 @@ def _derive_external_order_mapping(
     return mapping
 
 
-def _compensating_confirmation(source_intent_id: str) -> str:
+def _derive_residual_external_order_mapping(
+    repository: SQLiteTradingRepository,
+    source_intent_id: str,
+) -> dict[str, str]:
+    """Derive identities only for source legs with proven positive fills."""
+
+    intent = repository.get_intent(source_intent_id)
+    if intent is None:
+        raise Stage6ConfigError(f"unknown source intent: {source_intent_id}")
+    mapping: dict[str, str] = {}
+    for leg in intent.get("legs", ()):
+        try:
+            cumulative = Decimal(str(leg.get("cumulative_filled_quantity") or "0"))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise Stage6ConfigError(f"source leg {leg.get('id')} has malformed cumulative fill") from exc
+        attempts = repository.broker_orders_for_leg(str(leg.get("id")))
+        if cumulative <= 0:
+            if attempts:
+                raise Stage6ConfigError(
+                    f"source leg {leg.get('id')} has an attempted zero-fill and cannot be residual-compensated"
+                )
+            continue
+        if len(attempts) != 1 or not attempts[0].get("external_order_id"):
+            raise Stage6ConfigError(
+                f"source leg {leg.get('id')} lacks exactly one durable filled external-order identity"
+            )
+        instrument_id = str(leg.get("instrument_id"))
+        if instrument_id in mapping:
+            raise Stage6ConfigError("source intent has ambiguous instrument identities")
+        mapping[instrument_id] = str(attempts[0]["external_order_id"])
+    if not mapping:
+        raise Stage6ConfigError("source intent has no proven positive durable fills")
+    return mapping
+
+
+def _compensating_confirmation(source_intent_id: str, *, residual: bool = False) -> str:
+    if residual:
+        return f"ARM STAGE6 SIM RESIDUAL EXIT {str(source_intent_id).strip()}"
     return f"ARM STAGE6 SIM COMPENSATING EXIT {str(source_intent_id).strip()}"
 
 
@@ -742,13 +889,29 @@ def _validation_defaults(
     value = dict(evidence or {})
     run_id = config.spec().run_id
     now = datetime.now(timezone.utc).isoformat()
-    value.setdefault("session_id", args.session_id or f"stage6-validation-{run_id}")
-    value.setdefault("account_id", config.account.id)
+    def bind_text(key: str, explicit: object | None, default: str | None = None) -> None:
+        supplied = str(explicit).strip() if explicit is not None else ""
+        existing = str(value.get(key)).strip() if value.get(key) is not None else ""
+        if supplied and existing and supplied != existing:
+            raise Stage6ConfigError(
+                f"explicit --{key.replace('_', '-')} conflicts with evidence {key}"
+            )
+        if supplied:
+            value[key] = supplied
+        elif not existing and default is not None:
+            value[key] = default
+
+    bind_text("session_id", getattr(args, "session_id", None), f"stage6-validation-{run_id}")
+    bind_text("account_id", getattr(args, "account_id", None), config.account.id)
     value.setdefault("environment", config.account.environment.value)
     value.setdefault("execution_path", "Stage6PilotRunner->GenericOMS")
-    value.setdefault("execution_compatibility", args.execution_compatibility or STAGE6_EXECUTION_COMPATIBILITY)
-    value.setdefault("commit_sha", args.commit_sha or "UNKNOWN")
-    value.setdefault("us_trading_date", args.trading_date or value.get("trading_date"))
+    bind_text(
+        "execution_compatibility",
+        getattr(args, "execution_compatibility", None),
+        STAGE6_EXECUTION_COMPATIBILITY,
+    )
+    bind_text("commit_sha", getattr(args, "commit_sha", None), "UNKNOWN")
+    bind_text("us_trading_date", getattr(args, "trading_date", None), str(value.get("trading_date") or ""))
     value.setdefault("started_at", now)
     value.setdefault("completed_at", value.get("started_at", now))
     value.setdefault("captured_at", value.get("completed_at", now))
@@ -763,6 +926,94 @@ def _observation_payload(value: Mapping[str, Any], phase: str) -> dict[str, Any]
     return payload
 
 
+def _captured_us_trading_date(value: object) -> str:
+    try:
+        captured = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise Stage6ConfigError("runner observation has no valid captured_at") from exc
+    if captured.tzinfo is None or captured.utcoffset() is None:
+        raise Stage6ConfigError("runner observation captured_at must include a timezone")
+    return captured.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _record_runner_observation(
+    repository: SQLiteTradingRepository,
+    *,
+    config: Stage6PilotConfig,
+    args: argparse.Namespace,
+    phase: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist only an observation emitted by the same runner invocation."""
+
+    session_id = str(getattr(args, "session_id", "") or "").strip()
+    if not session_id:
+        raise Stage6ConfigError(
+            f"--record-observation for {phase} requires --session-id"
+        )
+    phase_key = {
+        "PREFLIGHT": "preflight",
+        "RECOVERY": "restart_recovery",
+        "FINAL": "final",
+    }[phase]
+    nested = payload.get(phase_key)
+    if not isinstance(nested, Mapping):
+        raise Stage6ConfigError(
+            f"runner output lacks authoritative {phase_key} evidence for observation"
+        )
+    captured_at = nested.get("captured_at") or (
+        payload.get("broker_facts", {}).get("captured_at")
+        if isinstance(payload.get("broker_facts"), Mapping)
+        else None
+    ) or payload.get("captured_at")
+    if not captured_at:
+        raise Stage6ConfigError(
+            f"runner output lacks authoritative {phase} capture timestamp"
+        )
+    nested = {**dict(nested), "captured_at": captured_at}
+    # Keep the emitted artifact's phase section identical to the section that
+    # is durably retained.  The runner may expose its authoritative capture
+    # timestamp at the envelope level; copy that timestamp into the nested
+    # phase object before emitting so a later evidence builder cannot compare
+    # two different representations of the same observation.
+    if isinstance(payload, dict):
+        payload[phase_key] = nested
+    evidence = {
+        **dict(payload),
+        "session_id": session_id,
+        "account_id": config.account.id,
+        "environment": config.account.environment.value,
+        "execution_path": "Stage6PilotRunner->GenericOMS",
+        "execution_compatibility": STAGE6_EXECUTION_COMPATIBILITY,
+        "commit_sha": "RUNNER_GENERATED",
+        "us_trading_date": _captured_us_trading_date(captured_at),
+        "captured_at": captured_at,
+        "process_id": str(os.getpid()),
+        "supervised": True,
+        phase_key: nested,
+        "observation_source": {
+            "kind": "STAGE6_RUNNER",
+            "self_generated": True,
+            "broker_contacted": True,
+            "process_id": str(os.getpid()),
+            "run_id": config.spec().run_id,
+            "phase": phase,
+            "invocation_id": (
+                f"{phase.lower()}:{session_id}:{os.getpid()}:{captured_at}"
+            ),
+        },
+    }
+    return _record_validation_observation(
+        repository,
+        config=config,
+        args=args,
+        phase=phase,
+        evidence=evidence,
+        _runner_generated=True,
+        _broker_contacted=True,
+    )
+
+
 def _record_validation_observation(
     repository: SQLiteTradingRepository,
     *,
@@ -770,6 +1021,8 @@ def _record_validation_observation(
     args: argparse.Namespace,
     phase: str,
     evidence: dict[str, Any] | None,
+    _runner_generated: bool = False,
+    _broker_contacted: bool = False,
 ) -> dict[str, Any]:
     if evidence is None:
         if phase != "PREFLIGHT":
@@ -779,15 +1032,15 @@ def _record_validation_observation(
             )
         dry_report = config.build_runner(repository).run(config.spec(), mode=Stage6RunMode.DRY_RUN)
         evidence = {
-            "session_id": args.session_id or f"stage6-validation-{config.spec().run_id}",
+            "session_id": getattr(args, "session_id", None) or f"stage6-validation-{config.spec().run_id}",
             "account_id": config.account.id,
             "environment": config.account.environment.value,
             "execution_path": "Stage6PilotRunner->GenericOMS",
             "execution_mode": "DRY_RUN",
             "supervised": True,
-            "commit_sha": args.commit_sha or "UNKNOWN",
-            "execution_compatibility": args.execution_compatibility or "UNKNOWN",
-            "us_trading_date": args.trading_date,
+            "commit_sha": getattr(args, "commit_sha", None) or "UNKNOWN",
+            "execution_compatibility": getattr(args, "execution_compatibility", None) or "UNKNOWN",
+            "us_trading_date": getattr(args, "trading_date", None),
             "run_ids": [config.spec().run_id],
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "dry_run_report": dry_report.as_dict(),
@@ -810,8 +1063,8 @@ def _record_validation_observation(
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise Stage6ConfigError("validation observation captured_at must include a timezone")
     session_id = str(value["session_id"])
-    observation_id = f"{session_id}:{phase.lower()}:{uuid.uuid4().hex}"
-    process_id = args.process_id
+    observation_id = f"{session_id}:{phase.lower()}"
+    process_id = getattr(args, "process_id", None) or value.get("process_id")
     if phase == "RECOVERY":
         recovery = value.get("restart_recovery")
         if not isinstance(recovery, Mapping):
@@ -870,11 +1123,33 @@ def _record_validation_observation(
             )
         if recovery.get("source_submission_process_identity_complete") is not True:
             raise Stage6ConfigError("recovery artifact must prove complete source process identity coverage")
-        if args.fresh_process and recovery.get("fresh_process") is not True:
+        if getattr(args, "fresh_process", False) and recovery.get("fresh_process") is not True:
             raise Stage6ConfigError("--fresh-process does not override recovery evidence")
         if process_id is not None and str(process_id) != artifact_process_id:
             raise Stage6ConfigError("--process-id does not match the recovery artifact")
         process_id = artifact_process_id
+    if _runner_generated:
+        source = value.get("observation_source")
+        if not isinstance(source, Mapping):
+            raise Stage6ConfigError(
+                "runner-generated observation is missing its source marker"
+            )
+        if (
+            str(source.get("kind", "")).strip().upper() != "STAGE6_RUNNER"
+            or source.get("self_generated") is not True
+            or source.get("broker_contacted") is not True
+            or str(source.get("process_id", "")).strip() != str(process_id or os.getpid())
+        ):
+            raise Stage6ConfigError("runner-generated observation source marker is invalid")
+    else:
+        # An operator-supplied artifact is retained for audit, but it is never
+        # allowed to claim that it came from the connected runner boundary.
+        value["observation_source"] = {
+            "kind": "EXTERNAL_ARTIFACT",
+            "self_generated": False,
+            "broker_contacted": False,
+            "phase": phase,
+        }
     repository.record_stage6_validation_observation(
         observation_id=observation_id,
         session_id=session_id,
@@ -888,6 +1163,11 @@ def _record_validation_observation(
             and isinstance(value.get("restart_recovery"), Mapping)
             and value["restart_recovery"].get("fresh_process") is True
         ),
+        _observation_capability=(
+            repository._stage6_observation_capability()
+            if _runner_generated
+            else None
+        ),
     )
     return {
         "observation_id": observation_id,
@@ -895,7 +1175,7 @@ def _record_validation_observation(
         "account_id": config.account.id,
         "phase": phase,
         "captured_at": parsed.isoformat(),
-        "broker_contacted": False,
+        "broker_contacted": bool(_broker_contacted),
         "orders_submitted": 0,
         "evidence": value,
     }
@@ -989,7 +1269,14 @@ def _run_validation_command(args: argparse.Namespace, config: Stage6PilotConfig)
                 )
             except ValueError as exc:
                 raise Stage6ConfigError(str(exc)) from exc
-        repository.save_stage6_validation_session(result)
+        repository.save_stage6_validation_session(
+            result,
+            _validation_capability=(
+                repository._stage6_validation_capability()
+                if result.outcome is Stage6SessionOutcome.CLEAN_PASS
+                else None
+            ),
+        )
         payload = result.as_dict()
         payload["broker_contacted"] = False
         payload["orders_submitted"] = 0
@@ -1047,7 +1334,16 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         )
         return (0 if not evidence.get("evidence_builder_missing") else 2), evidence
 
-    if args.command in {"final-state", "prepare-exit", "resolve-roundtrip", "compensating-exit"}:
+    if args.command in {
+        "final-state",
+        "prepare-exit",
+        "resolve-roundtrip",
+        "resolve-unsubmitted",
+        "resolve-compensated-partial",
+        "resolve-aggregate-roundtrip",
+        "compensating-exit",
+        "residual-exit",
+    }:
         if str(config.account.environment.value).upper() != "SIM":
             raise Stage6ConfigError(f"{args.command} accepts SIM accounts only")
         repository = SQLiteTradingRepository(config.state_db)
@@ -1056,10 +1352,121 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         except Exception as exc:
             raise Stage6ConfigError(f"existing repository validation failed: {exc}") from exc
 
-        if args.command == "compensating-exit":
-            expected_confirmation = _compensating_confirmation(args.source_intent_id)
+        if args.command in {"resolve-unsubmitted", "resolve-compensated-partial", "resolve-aggregate-roundtrip"}:
+            adapter = config.build_moomoo_adapter()
+            connected = False
+            try:
+                adapter.connect()
+                connected = True
+                runner = config.build_runner(repository, adapter=adapter)
+                if args.command == "resolve-unsubmitted":
+                    result = runner.resolve_unsubmitted(
+                        config.spec(),
+                        intent_id=args.intent_id,
+                        expected_book_id=args.expected_book_id,
+                    )
+                elif args.command == "resolve-compensated-partial":
+                    result = runner.resolve_compensated_partial(
+                        config.spec(), intent_id=args.intent_id
+                    )
+                else:
+                    result = runner.resolve_aggregate_roundtrip(
+                        config.spec(), intent_ids=args.intent_id
+                    )
+                result = {**dict(result), "broker_contacted": True, "orders_submitted": 0}
+                return _resolution_exit_code(result), result
+            finally:
+                if connected:
+                    adapter.disconnect()
+
+        if args.command == "residual-exit":
+            expected_confirmation = _compensating_confirmation(
+                args.source_intent_id,
+                residual=True,
+            )
             if not args.arm_sim:
-                raise Stage6ConfigError("compensating-exit requires --arm-sim")
+                raise Stage6ConfigError("residual-exit requires --arm-sim")
+            if args.confirm != expected_confirmation:
+                raise Stage6ConfigError(
+                    f"exact SIM confirmation required: {expected_confirmation!r}; no broker connection was attempted"
+                )
+            residual_mapping = _parse_external_order_args(args.external_order)
+            if not residual_mapping:
+                residual_mapping = _derive_residual_external_order_mapping(
+                    repository,
+                    args.source_intent_id,
+                )
+            adapter = config.build_moomoo_adapter()
+            connected = False
+            try:
+                adapter.connect()
+                connected = True
+                runner = config.build_runner(repository, adapter=adapter)
+                result = runner.submit_verified_residual_exit(
+                    account=config.account,
+                    source_intent_id=args.source_intent_id,
+                    expected_external_order_ids=residual_mapping,
+                    spec=config.spec(),
+                    market_symbols=tuple(item.external_symbol for item in config.mappings),
+                )
+                residual_intent_id = str(
+                    result.get("residual_exit_intent_id")
+                    or result.get("residual_result", {}).get("id")
+                    or ""
+                )
+                if not residual_intent_id:
+                    raise Stage6ConfigError("residual exit did not return a durable intent identity")
+                snapshots = _recovery_intent_snapshot(
+                    repository,
+                    config.account.id,
+                    [residual_intent_id],
+                )
+                attempts = [
+                    attempt
+                    for snapshot in snapshots
+                    for leg in snapshot.get("legs", [])
+                    for attempt in leg.get("attempts", [])
+                ]
+                result.update(
+                    {
+                        "residual_exit_intent_id": residual_intent_id,
+                        "residual_leg_ids": [
+                            leg.get("id")
+                            for snapshot in snapshots
+                            for leg in snapshot.get("legs", [])
+                        ],
+                        "broker_order_attempt_ids": [attempt.get("id") for attempt in attempts],
+                        "external_broker_order_ids": [
+                            attempt.get("external_order_id") for attempt in attempts
+                        ],
+                        "statuses": [attempt.get("status") for attempt in attempts],
+                        "fill_state": [
+                            {
+                                "external_order_id": attempt.get("external_order_id"),
+                                "filled_quantity": attempt.get("filled_quantity"),
+                                "average_fill_price": attempt.get("average_fill_price"),
+                            }
+                            for attempt in attempts
+                        ],
+                        "broker_contacted": True,
+                        "broker_submission_count": len(attempts),
+                        "rth_per_leg": True,
+                    }
+                )
+                blocked_statuses = {"RECONCILIATION_REQUIRED", "REJECTED", "FAILED", "UNKNOWN"}
+                raw_statuses = {str(value).upper() for value in result.get("statuses", ())}
+                return (2 if raw_statuses & blocked_statuses else 0), result
+            finally:
+                if connected:
+                    adapter.disconnect()
+
+        if args.command == "compensating-exit":
+            expected_confirmation = _compensating_confirmation(
+                args.source_intent_id,
+                residual=args.command == "residual-exit",
+            )
+            if not args.arm_sim:
+                raise Stage6ConfigError(f"{args.command} requires --arm-sim")
             if args.confirm != expected_confirmation:
                 raise Stage6ConfigError(
                     f"exact SIM confirmation required: {expected_confirmation!r}; no broker connection was attempted"
@@ -1088,15 +1495,12 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         }
                     )
                     return 2, rth_gate
-                pre_existing_intents = {
-                    str(row.get("id"))
-                    for row in repository.book_intents(config.account.id)
-                    if row.get("id") is not None
-                }
                 result = runner.submit_verified_compensating_exit(
                     account=config.account,
                     source_intent_id=args.source_intent_id,
                     expected_external_order_ids=mapping,
+                    spec=config.spec(),
+                    market_symbols=market_symbols,
                 )
                 raw_result = result.get("compensating_result", {})
                 exit_intent_id = str(raw_result.get("intent_id") or raw_result.get("id") or "")
@@ -1115,14 +1519,6 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         exit_intent_id = str(candidates[0]["id"])
                 if not exit_intent_id:
                     raise Stage6ConfigError("compensating exit did not return a durable intent identity")
-                if exit_intent_id not in pre_existing_intents:
-                    runner._record_submission_process_identity(
-                        intent_id=exit_intent_id,
-                        account_id=config.account.id,
-                        run_id=config.spec().run_id,
-                        mode="COMPENSATING_EXIT",
-                        source_intent_id=args.source_intent_id,
-                    )
                 snapshots = _recovery_intent_snapshot(repository, config.account.id, [exit_intent_id])
                 attempts = [
                     attempt
@@ -1149,13 +1545,16 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                             }
                             for attempt in attempts
                         ],
+                        "broker_contacted": True,
                         "stop_reasons": [],
                         "duplicate_attempt": _has_duplicate_attempts_per_leg(snapshots),
                         "broker_submission_count": len(attempts),
                         "rth_preflight": rth_gate,
                     }
                 )
-                return 0, result
+                raw_statuses = {str(value).upper() for value in result.get("statuses", ())}
+                blocked_statuses = {"RECONCILIATION_REQUIRED", "REJECTED", "FAILED", "UNKNOWN"}
+                return (2 if raw_statuses & blocked_statuses else 0), result
             finally:
                 if connected:
                     adapter.disconnect()
@@ -1171,6 +1570,14 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                     config.spec(),
                     market_symbols=tuple(mapping.external_symbol for mapping in config.mappings),
                 )
+                if getattr(args, "record_observation", False):
+                    result["validation_observation"] = _record_runner_observation(
+                        repository,
+                        config=config,
+                        args=args,
+                        phase="FINAL",
+                        payload=result,
+                    )
                 return (0 if result.get("final_state_passed") else 2), result
             if args.command == "prepare-exit":
                 result = runner.prepare_exit(
@@ -1193,8 +1600,9 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                 account=config.account,
                 entry_intent_id=args.entry_intent_id,
                 exit_intent_id=args.exit_intent_id,
+                spec=config.spec(),
             )
-            return 0, result
+            return _resolution_exit_code(result), result
         finally:
             if connected:
                 adapter.disconnect()
@@ -1246,7 +1654,21 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
             fresh_facts=fresh_facts,
             fresh_facts_error=fresh_facts_error,
         )
-        return 0, payload
+        if getattr(args, "record_observation", False):
+            payload["validation_observation"] = _record_runner_observation(
+                repository,
+                config=config,
+                args=args,
+                phase="RECOVERY",
+                payload=payload,
+            )
+        return (
+            0
+            if payload.get("restart_recovery", {}).get("result")
+            in {"RECOVERED", "NO_RECOVERY_NEEDED"}
+            else 2,
+            payload,
+        )
 
     if args.command == "sim-submit":
         if not args.arm_sim:
@@ -1293,6 +1715,14 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                 mapping_details=mapping_details,
             )
             result["config"] = _summary(config)
+            if getattr(args, "record_observation", False):
+                result["validation_observation"] = _record_runner_observation(
+                    repository,
+                    config=config,
+                    args=args,
+                    phase="PREFLIGHT",
+                    payload=result,
+                )
             return (0 if result.get("preflight_passed") else 2), result
         finally:
             if connected:
@@ -1328,6 +1758,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         if connected:
             adapter.disconnect()
     payload = report.as_dict()
+    payload["broker_contacted"] = True
     payload["config"] = _summary(config)
     return (0 if report.preflight_passed and not report.stop_reasons else 2), payload
 

@@ -61,12 +61,17 @@ def _evidence(
     exit_ids = [f"exit-a-{trading_date}", f"exit-b-{trading_date}"]
 
     def provenance(intent_id: str, *, mode: str = "SIM_SUBMIT") -> dict:
+        submitted_at = (
+            f"{trading_date}T13:40:00+00:00"
+            if intent_id.startswith("entry-")
+            else f"{trading_date}T13:50:00+00:00"
+        )
         return {
             "process_id": "stage6-submit-process-1",
             "run_id": f"stage6-run-{trading_date}",
             "mode": mode,
             "execution_compatibility": compatibility,
-            "submitted_at": f"{trading_date}T13:40:00+00:00",
+            "submitted_at": submitted_at,
             "correlation": {
                 "intent_id": intent_id,
                 "run_id": f"stage6-run-{trading_date}",
@@ -78,8 +83,8 @@ def _evidence(
     return {
         "session_id": f"session-{trading_date}",
         "us_trading_date": trading_date,
-        "started_at": "2026-10-05T13:40:00+00:00",
-        "completed_at": "2026-10-05T14:00:00+00:00",
+        "started_at": f"{trading_date}T13:40:00+00:00",
+        "completed_at": f"{trading_date}T14:00:00+00:00",
         "commit_sha": "871cb83844ead41272bc07bb7fbf6f83c3bf2ea2",
         "execution_compatibility": compatibility,
         "account_id": "validation-account",
@@ -102,7 +107,7 @@ def _evidence(
             "account_identity": {"account_id": "validation-account", "environment": "SIM"},
             "fresh_facts": {
                 "complete": True,
-                "captured_at": "2026-10-05T13:40:00+00:00",
+                "captured_at": f"{trading_date}T13:40:00+00:00",
                 "flat": True,
                 "open_order_count": 0,
             },
@@ -132,7 +137,7 @@ def _evidence(
             "broker_contacted": True,
             "fresh_process": True,
             "process_id": "stage6-recovery-process-2",
-            "captured_at": "2026-10-05T13:46:40+00:00",
+            "captured_at": f"{trading_date}T13:46:40+00:00",
             "result": "PASS",
             "source_intent_ids": [f"entry-a-{trading_date}", f"entry-b-{trading_date}"],
             "source_submission_process_ids": {
@@ -162,7 +167,7 @@ def _evidence(
         "final": {
             "fresh_facts": {
                 "complete": True,
-                "captured_at": "2026-10-05T13:56:00+00:00",
+                "captured_at": f"{trading_date}T13:56:00+00:00",
                 "flat": True,
                 "open_order_count": 0,
             },
@@ -187,13 +192,42 @@ def _repository(tmp_path: Path) -> SQLiteTradingRepository:
     return repository
 
 
+def _save_verified_clean(
+    repository: SQLiteTradingRepository,
+    evidence: dict,
+):
+    """Model the private runner proof boundary for persistence tests."""
+
+    verified = copy.deepcopy(evidence)
+    verified["_stage6_durable_graph_verified"] = True
+    result = evaluate_stage6_session(verified)
+    assert result.outcome is Stage6SessionOutcome.CLEAN_PASS
+    return repository.save_stage6_validation_session(
+        result,
+        _validation_capability=repository._stage6_validation_capability(),
+    )
+
+
+def test_direct_clean_save_requires_verified_runner_capability_but_failed_is_retained(tmp_path):
+    repository = _repository(tmp_path)
+    clean = evaluate_stage6_session(_evidence())
+    with pytest.raises(PermissionError, match="CLEAN_PASS capability"):
+        repository.save_stage6_validation_session(clean)
+
+    failed_evidence = _evidence("2026-10-06")
+    failed_evidence["declared_result"] = "FAILED"
+    failed_evidence["failure_reasons"] = ["operator stopped before qualification"]
+    failed = evaluate_stage6_session(failed_evidence)
+    assert failed.outcome is Stage6SessionOutcome.FAILED
+    repository.save_stage6_validation_session(failed)
+    assert repository.stage6_validation_status("validation-account")["retained_session_count"] == 1
+
+
 def test_clean_session_result_is_derived_and_retained(tmp_path):
     repository = _repository(tmp_path)
     for trading_date in ("2026-10-05", "2026-10-06", "2026-10-07"):
-        result = evaluate_stage6_session(_evidence(trading_date))
-        assert result.outcome is Stage6SessionOutcome.CLEAN_PASS
+        result = _save_verified_clean(repository, _evidence(trading_date))
         assert result.qualified is True
-        repository.save_stage6_validation_session(result)
 
     status = repository.stage6_validation_status("validation-account")
     assert status["complete"] is True
@@ -202,10 +236,16 @@ def test_clean_session_result_is_derived_and_retained(tmp_path):
 
 def test_duplicate_clean_date_is_rejected_but_failed_history_is_retained(tmp_path):
     repository = _repository(tmp_path)
-    repository.save_stage6_validation_session(evaluate_stage6_session(_evidence()))
-    duplicate = evaluate_stage6_session(_evidence().copy() | {"session_id": "different-session"})
+    _save_verified_clean(repository, _evidence())
+    duplicate_evidence = copy.deepcopy(_evidence())
+    duplicate_evidence["session_id"] = "different-session"
+    duplicate_evidence["_stage6_durable_graph_verified"] = True
+    duplicate = evaluate_stage6_session(duplicate_evidence)
     with pytest.raises(ValueError, match="CLEAN_PASS already exists"):
-        repository.save_stage6_validation_session(duplicate)
+        repository.save_stage6_validation_session(
+            duplicate,
+            _validation_capability=repository._stage6_validation_capability(),
+        )
 
     failed_evidence = _evidence("2026-10-06")
     failed_evidence["preflight"]["rth"] = {"observed": False, "market_state": "CLOSED"}
@@ -283,19 +323,30 @@ def test_durable_provenance_date_and_compatibility_guards_fail_closed(mutation, 
 def test_clean_pass_cannot_reuse_intents_or_orders_on_another_date(tmp_path):
     repository = _repository(tmp_path)
     first = _evidence("2026-10-05")
-    repository.save_stage6_validation_session(evaluate_stage6_session(first))
+    _save_verified_clean(repository, first)
 
     reused = copy.deepcopy(first)
     reused["session_id"] = "reused-execution-on-new-date"
     reused["us_trading_date"] = "2026-10-06"
     reused["derived_us_trading_date"] = "2026-10-06"
-    for section in ("entry", "exit"):
-        for marker in reused["execution_provenance"][section].values():
-            marker["submitted_at"] = "2026-10-06T13:40:00+00:00"
+    reused["started_at"] = "2026-10-06T13:40:00+00:00"
+    reused["completed_at"] = "2026-10-06T14:00:00+00:00"
+    reused["preflight"]["fresh_facts"]["captured_at"] = "2026-10-06T13:40:00+00:00"
+    reused["restart_recovery"]["captured_at"] = "2026-10-06T13:46:40+00:00"
+    reused["final"]["fresh_facts"]["captured_at"] = "2026-10-06T13:56:00+00:00"
+    for marker in reused["execution_provenance"]["entry"].values():
+        marker["submitted_at"] = "2026-10-06T13:40:00+00:00"
+    for marker in reused["execution_provenance"]["exit"].values():
+        marker["submitted_at"] = "2026-10-06T13:50:00+00:00"
     result = evaluate_stage6_session(reused)
     assert result.outcome is Stage6SessionOutcome.CLEAN_PASS
+    reused["_stage6_durable_graph_verified"] = True
+    result = evaluate_stage6_session(reused)
     with pytest.raises(ValueError, match="reuses durable execution identity"):
-        repository.save_stage6_validation_session(result)
+        repository.save_stage6_validation_session(
+            result,
+            _validation_capability=repository._stage6_validation_capability(),
+        )
 
 
 def test_failed_run_duplicate_attempt_and_missing_recovery_are_not_clean():
@@ -323,11 +374,9 @@ def test_failed_run_duplicate_attempt_and_missing_recovery_are_not_clean():
 
 def test_compatibility_mismatch_does_not_complete_series(tmp_path):
     repository = _repository(tmp_path)
-    repository.save_stage6_validation_session(evaluate_stage6_session(_evidence("2026-10-05")))
-    repository.save_stage6_validation_session(
-        evaluate_stage6_session(_evidence("2026-10-06", compatibility="different-execution-v2"))
-    )
-    repository.save_stage6_validation_session(evaluate_stage6_session(_evidence("2026-10-07")))
+    _save_verified_clean(repository, _evidence("2026-10-05"))
+    _save_verified_clean(repository, _evidence("2026-10-06", compatibility="different-execution-v2"))
+    _save_verified_clean(repository, _evidence("2026-10-07"))
     status = repository.stage6_validation_status("validation-account")
     assert status["complete"] is False
     assert "incompatible execution identities" in " ".join(status["reasons"])
@@ -336,13 +385,16 @@ def test_compatibility_mismatch_does_not_complete_series(tmp_path):
 def test_session_and_observation_evidence_are_immutable(tmp_path):
     repository = _repository(tmp_path)
     value = _evidence()
-    result = evaluate_stage6_session(value)
-    repository.save_stage6_validation_session(result)
-    repository.save_stage6_validation_session(result)
+    _save_verified_clean(repository, value)
+    _save_verified_clean(repository, value)
     changed = dict(value)
     changed["commit_sha"] = "changed"
+    changed["_stage6_durable_graph_verified"] = True
     with pytest.raises(ValueError, match="immutable"):
-        repository.save_stage6_validation_session(evaluate_stage6_session(changed))
+        repository.save_stage6_validation_session(
+            evaluate_stage6_session(changed),
+            _validation_capability=repository._stage6_validation_capability(),
+        )
 
     observation = {"phase": "RECOVERY", "fresh_process": True, "process_id": "p2"}
     repository.record_stage6_validation_observation(
@@ -355,6 +407,16 @@ def test_session_and_observation_evidence_are_immutable(tmp_path):
         process_id="p2",
         fresh_process=True,
     )
+    assert repository.record_stage6_validation_observation(
+        observation_id="obs-2",
+        session_id="session-2026-10-05",
+        account_id="validation-account",
+        phase="RECOVERY",
+        captured_at=NOW,
+        evidence=observation,
+        process_id="p2",
+        fresh_process=True,
+    ) == "obs-1"
     with pytest.raises(ValueError, match="reused with different evidence"):
         repository.record_stage6_validation_observation(
             observation_id="obs-1",
@@ -366,6 +428,77 @@ def test_session_and_observation_evidence_are_immutable(tmp_path):
             process_id="p2",
             fresh_process=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        (
+            lambda value: value["preflight"]["fresh_facts"].update(
+                {"captured_at": "2026-10-14T13:46:00+00:00"}
+            ),
+            "preflight must not follow entry submission",
+        ),
+        (
+            lambda value: value["restart_recovery"].update(
+                {"captured_at": "2026-10-14T13:30:00+00:00"}
+            ),
+            "entry submission must not follow recovery",
+        ),
+        (
+            lambda value: value["restart_recovery"].update(
+                {"captured_at": "2026-10-14T13:56:00+00:00"}
+            ),
+            "recovery must not follow exit submission",
+        ),
+        (
+            lambda value: value["final"]["fresh_facts"].update(
+                {"captured_at": "2026-10-14T13:45:00+00:00"}
+            ),
+            "exit submission must not follow final observation",
+        ),
+    ),
+)
+def test_phase_temporal_order_is_causal(mutation, reason):
+    value = _evidence("2026-10-14")
+    mutation(value)
+    result = evaluate_stage6_session(value)
+    assert result.outcome is Stage6SessionOutcome.INVALID
+    assert reason in result.failure_reasons
+
+
+def test_validation_cli_rejects_explicit_identity_conflicts_with_artifact(tmp_path, capsys):
+    values = _config_dict(tmp_path)
+    config_path = tmp_path / "stage6-conflict.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    artifact = _evidence()
+    artifact["session_id"] = "artifact-session"
+    artifact["account_id"] = "pilot-account"
+    artifact_path = tmp_path / "artifact.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    conflicts = (
+        ("--session-id", "cli-session"),
+        ("--account-id", "other-account"),
+        ("--commit-sha", "other-commit"),
+        ("--execution-compatibility", "other-execution"),
+        ("--trading-date", "2026-10-06"),
+    )
+    for option, value in conflicts:
+        assert stage6_cli(
+            [
+                "session-preflight",
+                "--config",
+                str(config_path),
+                "--evidence",
+                str(artifact_path),
+                option,
+                value,
+                "--json",
+            ]
+        ) == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert "conflicts with evidence" in payload["error"]
 
 
 def test_unparseable_document_fails_closed():
