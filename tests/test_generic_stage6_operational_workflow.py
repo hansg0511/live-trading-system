@@ -697,14 +697,66 @@ def test_compensating_duplicate_attempt_flag_is_per_leg():
     assert _has_duplicate_attempts_per_leg(repeated_attempt) is True
 
 
+def _fully_filled_cli_result(*, status="FILLED", filled_quantity="1", submitted_quantity="1"):
+    return {
+        "statuses": [status],
+        "broker_order_attempt_ids": ["attempt-1"],
+        "external_broker_order_ids": ["external-1"],
+        "fill_state": [{
+            "external_order_id": "external-1",
+            "submitted_quantity": submitted_quantity,
+            "filled_quantity": filled_quantity,
+            "average_fill_price": "100.25",
+        }],
+    }
+
+
 @pytest.mark.parametrize("status", ("SUBMITTING", "WORKING", "PARTIALLY_FILLED"))
 def test_cli_order_status_matrix_returns_nonzero_for_nonterminal_attempts(status):
     """Every order-bearing CLI path reports an unfinished attempt as exit 2."""
 
-    assert stage6_cli._order_submission_exit_code({"statuses": [status]}) == 2
-    assert stage6_cli._order_submission_exit_code({"statuses": [status.lower()]}) == 2
+    assert stage6_cli._order_submission_exit_code(_fully_filled_cli_result(status=status)) == 2
+    assert stage6_cli._order_submission_exit_code(_fully_filled_cli_result(status=status.lower())) == 2
     assert stage6_cli._order_submission_exit_code({"statuses": ["FILLED", status]}) == 2
-    assert stage6_cli._order_submission_exit_code({"statuses": ["FILLED"]}) == 0
+    assert stage6_cli._order_submission_exit_code(_fully_filled_cli_result()) == 0
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
+        {},
+        {"statuses": []},
+        {"statuses": ["FILLED"], "broker_order_attempt_ids": []},
+        _fully_filled_cli_result(status="CANCELLED"),
+        _fully_filled_cli_result(status="REJECTED"),
+        _fully_filled_cli_result(status="FAILED"),
+        {
+            **_fully_filled_cli_result(),
+            "broker_order_attempt_ids": [None],
+        },
+        {
+            **_fully_filled_cli_result(),
+            "external_broker_order_ids": [None],
+            "fill_state": [{
+                **_fully_filled_cli_result()["fill_state"][0],
+                "external_order_id": None,
+            }],
+        },
+        _fully_filled_cli_result(filled_quantity="0"),
+        _fully_filled_cli_result(filled_quantity="0.5"),
+        {
+            **_fully_filled_cli_result(),
+            "fill_state": [{
+                **_fully_filled_cli_result()["fill_state"][0],
+                "external_order_id": "other-order",
+            }],
+        },
+    ),
+)
+def test_cli_order_exit_requires_one_to_one_durable_full_fill_evidence(result):
+    """Cancelled or evidence-free exits must never report a successful flatten."""
+
+    assert stage6_cli._order_submission_exit_code(result) == 2
 
 
 def test_cli_partial_enter_residual_exit_recovery_and_resolution(tmp_path, monkeypatch, capsys):

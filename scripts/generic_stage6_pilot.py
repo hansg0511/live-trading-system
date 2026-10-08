@@ -306,16 +306,66 @@ _STAGE6_NONTERMINAL_ORDER_STATUSES = frozenset(
 
 
 def _order_submission_exit_code(result: Mapping[str, Any]) -> int:
-    """Return 2 unless every reported broker attempt is terminal and safe."""
+    """Return success only for fully, durably filled broker attempts.
+
+    A terminal-looking lifecycle string alone is not evidence that a residual
+    or compensating exit flattened its intended exposure. The order-bearing
+    CLI paths construct the fields checked here from persisted broker-order
+    rows after the runner returns. Treat absent, partial, cancelled, or
+    malformed evidence as ambiguous and leave the operator at a non-zero
+    command result.
+    """
 
     if not isinstance(result, Mapping):
         return 2
-    statuses = {
-        str(value).strip().upper()
-        for value in result.get("statuses", ())
-        if str(value).strip()
-    }
-    return 2 if statuses & _STAGE6_NONTERMINAL_ORDER_STATUSES else 0
+
+    statuses_raw = result.get("statuses")
+    attempt_ids_raw = result.get("broker_order_attempt_ids")
+    external_ids_raw = result.get("external_broker_order_ids")
+    fill_state_raw = result.get("fill_state")
+    if any(
+        not isinstance(value, Sequence) or isinstance(value, (str, bytes))
+        for value in (statuses_raw, attempt_ids_raw, external_ids_raw, fill_state_raw)
+    ):
+        return 2
+
+    statuses = tuple(str(value).strip().upper() for value in statuses_raw)
+    attempt_ids = tuple(str(value).strip() for value in attempt_ids_raw)
+    external_ids = tuple(str(value).strip() for value in external_ids_raw)
+    fill_state = tuple(fill_state_raw)
+    if (
+        not statuses
+        or len(statuses) != len(attempt_ids)
+        or len(statuses) != len(external_ids)
+        or len(statuses) != len(fill_state)
+        or any(not value for value in statuses + attempt_ids + external_ids)
+        or any(value is None for value in (*attempt_ids_raw, *external_ids_raw))
+    ):
+        return 2
+    if any(status not in {"FILLED", "COMPLETED"} for status in statuses):
+        return 2
+
+    for external_order_id, evidence in zip(external_ids, fill_state, strict=True):
+        if not isinstance(evidence, Mapping):
+            return 2
+        if str(evidence.get("external_order_id", "")).strip() != external_order_id:
+            return 2
+        try:
+            submitted = Decimal(str(evidence["submitted_quantity"]))
+            filled = Decimal(str(evidence["filled_quantity"]))
+            average_price = Decimal(str(evidence["average_fill_price"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            return 2
+        if (
+            not submitted.is_finite()
+            or not filled.is_finite()
+            or not average_price.is_finite()
+            or submitted <= 0
+            or filled != submitted
+            or average_price <= 0
+        ):
+            return 2
+    return 0
 
 
 def _cancel_partial_exit_code(
@@ -1616,6 +1666,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         "fill_state": [
                             {
                                 "external_order_id": attempt.get("external_order_id"),
+                                "submitted_quantity": attempt.get("submitted_quantity"),
                                 "filled_quantity": attempt.get("filled_quantity"),
                                 "average_fill_price": attempt.get("average_fill_price"),
                             }
@@ -1769,6 +1820,7 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
                         "fill_state": [
                             {
                                 "external_order_id": attempt.get("external_order_id"),
+                                "submitted_quantity": attempt.get("submitted_quantity"),
                                 "filled_quantity": attempt.get("filled_quantity"),
                                 "average_fill_price": attempt.get("average_fill_price"),
                             }
