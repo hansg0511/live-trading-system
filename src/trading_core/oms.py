@@ -5102,6 +5102,7 @@ class GenericOMS:
         leg: Mapping[str, object],
         snapshot: BrokerOrderSnapshot,
         require_working_zero_fill_evidence: bool = False,
+        authenticated_filled_quantity: Decimal | None = None,
     ) -> dict[str, object]:
         """Validate normalized broker facts before they can affect lifecycle state."""
         mismatches: list[str] = []
@@ -5154,7 +5155,17 @@ class GenericOMS:
                 )
             )
             durable_quantity = self._durable_filled_quantity(str(attempt["id"]))
-            if snapshot.filled_quantity != durable_quantity:
+            # A fresh strict account-fact context may already authenticate the
+            # exact cumulative fill while the repository has not yet ingested
+            # it for this attempt.  Recovery records that evidence in the
+            # subsequent fill-ingestion phase; do not quarantine the order
+            # merely because this snapshot is the first observation of it.
+            # Any mismatch still fails closed, and the normal provenance/
+            # ownership checks run before the fill can be persisted.
+            if snapshot.filled_quantity != durable_quantity and (
+                authenticated_filled_quantity is None
+                or authenticated_filled_quantity != snapshot.filled_quantity
+            ):
                 mismatches.append("filled_quantity_not_supported_by_durable_fills")
             if (
                 snapshot.status in {BrokerOrderStatus.REJECTED, BrokerOrderStatus.CANCELLED}
@@ -9630,10 +9641,11 @@ class GenericOMS:
                 # not let that raw snapshot create fill evidence: refresh the
                 # strict account-fact context first, and continue only if the
                 # refreshed facts authenticate the same cumulative quantity.
-                if match.filled_quantity > 0 and (
-                    self._recovery_context_fill_quantity(context, match.external_order_id)
-                    != match.filled_quantity
-                ):
+                authenticated_filled_quantity = self._recovery_context_fill_quantity(
+                    context,
+                    match.external_order_id,
+                )
+                if match.filled_quantity > 0 and authenticated_filled_quantity != match.filled_quantity:
                     try:
                         context = self._validated_recovery_fact_context(account)
                     except Exception as exc:
@@ -9646,11 +9658,16 @@ class GenericOMS:
                     self._recovery_fact_context = context
                     observed_positions = dict(context["observed_positions"])
                     open_orders = tuple(context["open_orders"])
+                    authenticated_filled_quantity = self._recovery_context_fill_quantity(
+                        context,
+                        match.external_order_id,
+                    )
                 validation = self._validate_poll_snapshot(
                     account=account,
                     attempt=attempt,
                     leg=leg,
                     snapshot=match,
+                    authenticated_filled_quantity=authenticated_filled_quantity,
                 )
                 if not validation["valid"]:
                     self._record_poll_snapshot_failure(
@@ -9848,7 +9865,19 @@ class GenericOMS:
                             remaining_quantities=self._remaining_quantities(self._required_intent(intent_id)),
                             metadata={"broker_order_id": str(attempt["id"]), **age},
                         )
-                    elif target is BrokerOrderStatus.FILLED and current_leg["status"] == LegStatus.FILLED.value:
+                    elif target is BrokerOrderStatus.FILLED and (
+                        current_leg["status"] == LegStatus.FILLED.value
+                        or (
+                            authenticated_filled_quantity is not None
+                            and authenticated_filled_quantity == match.filled_quantity
+                            and match.filled_quantity > 0
+                        )
+                    ):
+                        # The strict account-fact context authenticated the
+                        # exact fill, but the repository may not have ingested
+                        # that fill until the recovery phase below.  Leave
+                        # the leg eligible for that ingestion instead of
+                        # creating a false FILL_EVIDENCE_REQUIRED blocker.
                         self._resolve_recovery_actions_for_order(
                             account,
                             intent_id,

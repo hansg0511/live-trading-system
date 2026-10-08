@@ -394,6 +394,75 @@ class DelayedPilotAdapter(PilotFakeAdapter):
         )
 
 
+class SequencedDelayedPilotAdapter(DelayedPilotAdapter):
+    """Record that the second submit saw durable evidence for the first."""
+
+    def __init__(self, *, release_after_order_reads: int = 3) -> None:
+        super().__init__(release_after_order_reads=release_after_order_reads)
+        self.second_submit_saw_first_fill: bool | None = None
+
+    def submit_order(self, account: Account, request) -> BrokerSubmissionResult:
+        if len(self.submit_calls) == 1:
+            self.second_submit_saw_first_fill = "delayed-order-1" in self._filled_orders
+        return super().submit_order(account, request)
+
+
+class RejectingPilotAdapter(PilotFakeAdapter):
+    """Return an explicit no-submit rejection for the first leg."""
+
+    def submit_order(self, _account: Account, request) -> BrokerSubmissionResult:
+        self.submit_calls.append(request.broker_order_id)
+        return BrokerSubmissionResult(
+            broker_order_id=request.broker_order_id,
+            accepted=False,
+            status=BrokerOrderStatus.REJECTED,
+            external_order_id=None,
+            client_order_id=request.client_order_id,
+            submitted_at=NOW,
+            cumulative_filled_quantity=Decimal("0"),
+            no_submit_asserted=True,
+            no_fill_asserted=True,
+            submitted_quantity=request.order_leg.quantity,
+            instrument_id=request.order_leg.instrument_id,
+        )
+
+
+class ClosedOnSiblingGateAdapter(PilotFakeAdapter):
+    """Keep the first leg fillable, then close RTH before its sibling."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.market_state_calls = 0
+
+    def get_authoritative_market_state(self, symbols):
+        self.market_state_calls += 1
+        state = "CLOSED" if self.market_state_calls >= 3 else "RTH"
+        return {
+            "market": "US",
+            "captured_at": NOW.isoformat(),
+            "complete": True,
+            "rows": [
+                {"symbol": str(symbol), "market_state": state}
+                for symbol in symbols
+            ],
+        }
+
+
+class ContradictoryAfterFirstFillAdapter(PilotFakeAdapter):
+    """Return a contradictory account position at the sibling gate."""
+
+    def get_authoritative_account_facts(self, account: Account) -> BrokerFactSnapshot:
+        facts = super().get_authoritative_account_facts(account)
+        # The first post-submit recovery fact set must remain coherent so the
+        # prior leg can be durably terminalized.  Contradict it only on the
+        # fresh account gate immediately before the sibling adapter call.
+        if self.submit_calls and self.fact_calls >= 4 and facts.positions:
+            first = facts.positions[0]
+            contradictory = replace(first, signed_quantity=first.signed_quantity + Decimal("1"))
+            return replace(facts, positions=(contradictory, *facts.positions[1:]))
+        return facts
+
+
 class NettedPilotAdapter(PilotFakeAdapter):
     """Model an account-level provider position row per instrument."""
 
@@ -737,7 +806,7 @@ def test_working_ack_waits_for_full_recovery_before_dispatching_next_sleeve(tmp_
     account = make_account()
     sleeves = make_sleeves()
     repository = make_repository(tmp_path, account, sleeves)
-    adapter = DelayedPilotAdapter(release_after_order_reads=2)
+    adapter = SequencedDelayedPilotAdapter(release_after_order_reads=2)
     elapsed = [0.0]
 
     def clock() -> datetime:
@@ -766,6 +835,7 @@ def test_working_ack_waits_for_full_recovery_before_dispatching_next_sleeve(tmp_
     # truth.
     assert adapter.fact_calls >= 2
     assert adapter.open_order_reads == 0
+    assert adapter.second_submit_saw_first_fill is True
     assert all(item["dispatch_outcome"] == "FULL" for item in report.intent_results)
 
 
@@ -796,8 +866,84 @@ def test_partial_or_timeout_working_ack_stops_before_next_sleeve(tmp_path):
 
     assert report.preflight_passed is False
     assert any("returned TIMEOUT" in reason for reason in report.stop_reasons)
-    assert len(adapter.submit_calls) == 2
+    # Per-leg sequencing now waits for the first working order before the
+    # sibling reaches the adapter.  A timeout therefore leaves the sibling
+    # completely unattempted rather than creating another open exposure.
+    assert len(adapter.submit_calls) == 1
+    first_intent = repository.get_intent(report.intent_results[0]["intent_id"])
+    assert first_intent is not None
+    assert repository.broker_orders_for_leg(first_intent["legs"][1]["id"]) == []
     assert [item["sleeve_id"] for item in report.intent_results] == ["pilot-sleeve-a"]
+
+
+def test_rejected_prior_leg_leaves_sibling_unsubmitted(tmp_path):
+    account = make_account()
+    sleeves = make_sleeves()
+    repository = make_repository(tmp_path, account, sleeves)
+    adapter = RejectingPilotAdapter()
+    runner = Stage6PilotRunner(
+        repository,
+        GenericOMS(repository, adapter, clock=lambda: NOW),
+        clock=lambda: NOW,
+    )
+
+    report = runner.run(make_spec(account, sleeves), mode=Stage6RunMode.SIM_SUBMIT)
+
+    assert report.preflight_passed is False
+    assert any("returned REJECTED" in reason for reason in report.stop_reasons)
+    assert len(adapter.submit_calls) == 1
+    first_intent = repository.get_intent(report.intent_results[0]["intent_id"])
+    assert first_intent is not None
+    assert repository.broker_orders_for_leg(first_intent["legs"][1]["id"]) == []
+
+
+def test_rth_close_before_sibling_gate_leaves_sibling_unsubmitted(tmp_path):
+    account = make_account()
+    sleeves = make_sleeves()
+    repository = make_repository(tmp_path, account, sleeves)
+    adapter = ClosedOnSiblingGateAdapter()
+    runner = Stage6PilotRunner(
+        repository,
+        GenericOMS(repository, adapter, clock=lambda: NOW),
+        clock=lambda: NOW,
+    )
+
+    report = runner.run(make_spec(account, sleeves), mode=Stage6RunMode.SIM_SUBMIT)
+
+    assert report.preflight_passed is False
+    assert any("RECONCILIATION_REQUIRED" in reason for reason in report.stop_reasons)
+    assert adapter.market_state_calls >= 3
+    assert len(adapter.submit_calls) == 1
+    first_intent = repository.get_intent(report.intent_results[0]["intent_id"])
+    assert first_intent is not None
+    assert repository.broker_orders_for_leg(first_intent["legs"][1]["id"]) == []
+    issues = repository.open_reconciliation_issues(account.id)
+    assert len(issues) == 1
+    assert "not RTH" in issues[0]["details_json"]
+
+
+def test_contradictory_account_facts_before_sibling_gate_block_dispatch(tmp_path):
+    account = make_account()
+    sleeves = make_sleeves()
+    repository = make_repository(tmp_path, account, sleeves)
+    adapter = ContradictoryAfterFirstFillAdapter()
+    runner = Stage6PilotRunner(
+        repository,
+        GenericOMS(repository, adapter, clock=lambda: NOW),
+        clock=lambda: NOW,
+    )
+
+    report = runner.run(make_spec(account, sleeves), mode=Stage6RunMode.SIM_SUBMIT)
+
+    assert report.preflight_passed is False
+    assert any("RECONCILIATION_REQUIRED" in reason for reason in report.stop_reasons)
+    assert len(adapter.submit_calls) == 1
+    first_intent = repository.get_intent(report.intent_results[0]["intent_id"])
+    assert first_intent is not None
+    assert repository.broker_orders_for_leg(first_intent["legs"][1]["id"]) == []
+    issues = repository.open_reconciliation_issues(account.id)
+    assert len(issues) == 1
+    assert "does not match the durable managed allocation" in issues[0]["details_json"]
 
 
 def test_sim_arm_dispatches_with_verified_retired_baseline_and_old_terminal_orders(tmp_path):

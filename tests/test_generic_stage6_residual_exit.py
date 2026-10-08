@@ -1555,7 +1555,7 @@ def _synthetic_selected_fill_case(tmp_path):
     return account, runner, broker_fill, facts, expected_rows
 
 
-class _CompensatingHistoryAdapter(PilotFakeAdapter):
+class _CompensatingHistoryAdapter(NettedPilotAdapter):
     """Fake SIM adapter with bounded historical cumulative-order evidence."""
 
     def __init__(self, facts, history):  # type: ignore[no-untyped-def]
@@ -1854,6 +1854,51 @@ def test_compensating_exit_uses_exact_bounded_history_when_sim_current_fills_are
         len(repository.broker_orders_for_leg(str(leg["id"]))) == 1
         for leg in exit_snapshot["legs"]
     )
+
+
+def test_stage6_compensating_exit_waits_for_first_leg_before_sibling(tmp_path):
+    """A working first compensation leg must be durably filled before the next."""
+
+    (
+        account,
+        sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _current_positions,
+        _history,
+    ) = _seed_cumulative_compensating_case(tmp_path)
+    # The Stage 6 spec is intentionally two-sleeved.  Reuse the source pair
+    # for the second test sleeve so the test isolates sequencing of this
+    # compensating Book A action without introducing unrelated Book B exposure.
+    test_sleeves = (
+        sleeves[0],
+        replace(sleeves[1], instrument_ids=sleeves[0].instrument_ids, symbols=sleeves[0].symbols),
+    )
+    spec = make_spec(
+        account,
+        test_sleeves,
+        targets=make_targets(test_sleeves, quantities=("1", "1"), action=IntentAction.EXIT),
+    )
+    runner = Stage6PilotRunner(repository, oms, clock=lambda: NOW)
+
+    result = runner.submit_verified_compensating_exit(
+        account=account,
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+        spec=spec,
+    )
+
+    assert len(adapter.submit_calls) == 2
+    assert result["duplicate_attempt"] is False
+    snapshot = repository.get_intent(result["compensating_exit_intent_id"])
+    assert snapshot is not None
+    assert snapshot["legs"][0]["status"] == LegStatus.FILLED.value
+    assert snapshot["legs"][1]["status"] == LegStatus.WORKING.value
+    assert len(repository.broker_orders_for_leg(snapshot["legs"][0]["id"])) == 1
+    assert len(repository.broker_orders_for_leg(snapshot["legs"][1]["id"])) == 1
 
 
 @pytest.mark.parametrize("failure", ("incomplete", "missing", "mismatch"))

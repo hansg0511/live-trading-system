@@ -30,12 +30,14 @@ from zoneinfo import ZoneInfo
 
 from src.trading_core.domain import (
     Account,
+    BrokerOrderStatus,
     ExecutionEvidenceBaseline,
     ExecutionEvidenceMode,
     ExecutionPolicy,
     ExecutionSession,
     IntentAction,
     IntentStatus,
+    LegStatus,
     OwnershipClass,
     PositionSnapshot,
     RiskDecisionRecord,
@@ -368,6 +370,7 @@ class Stage6PilotRunner:
             raise ValueError("dispatch_poll_seconds must be positive")
         self.dispatch_wait_seconds = float(dispatch_wait_seconds)
         self.dispatch_poll_seconds = float(dispatch_poll_seconds)
+        self._last_submission_gate_outcome: str | None = None
 
     def _now(self) -> datetime:
         value = self.clock()
@@ -481,6 +484,21 @@ class Stage6PilotRunner:
                 return False
         return True
 
+    def _has_active_working_leg(self, status: Mapping[str, Any]) -> bool:
+        """Return whether an incomplete intent still owns a live sibling."""
+
+        for leg in status.get("legs", ()):
+            if not isinstance(leg, Mapping):
+                continue
+            if str(leg.get("status")) not in {
+                LegStatus.WORKING.value,
+                LegStatus.SUBMITTING.value,
+            }:
+                continue
+            if self.repository.broker_orders_for_leg(str(leg.get("id"))):
+                return True
+        return False
+
     def _wait_for_verified_full_fill(
         self,
         *,
@@ -512,7 +530,10 @@ class Stage6PilotRunner:
                 IntentStatus.CANCELLED.value,
                 IntentStatus.FAILED.value,
                 IntentStatus.RECONCILIATION_REQUIRED.value,
-            }:
+            } and not (
+                status == IntentStatus.PARTIALLY_FILLED.value
+                and self._has_active_working_leg(last)
+            ):
                 return last, status
             now = self._now()
             if now >= deadline:
@@ -534,11 +555,141 @@ class Stage6PilotRunner:
                 IntentStatus.CANCELLED.value,
                 IntentStatus.FAILED.value,
                 IntentStatus.RECONCILIATION_REQUIRED.value,
-            }:
+            } and not (
+                status == IntentStatus.PARTIALLY_FILLED.value
+                and self._has_active_working_leg(last)
+            ):
                 return last, status
             remaining = max(0.0, (deadline - self._now()).total_seconds())
             if remaining <= 0:
                 return last, "TIMEOUT"
+            self.sleep(min(self.dispatch_poll_seconds, remaining))
+
+    def _leg_fill_state(
+        self,
+        *,
+        intent_id: str,
+        leg_id: str,
+    ) -> tuple[Mapping[str, Any], bool, str]:
+        """Read one leg's durable state without inferring a broker fill.
+
+        The per-leg Stage 6 gate needs a narrower proof than the existing
+        sleeve hand-off wait.  A sibling may advance only when this exact leg
+        has one broker attempt in a terminal ``FILLED`` state and the OMS can
+        account for the requested quantity from durable fill rows.  Provider
+        ACKs, requested quantities, and local ``FILLED`` labels without that
+        attempt-scoped evidence remain blocked.
+        """
+
+        snapshot = self.repository.get_intent(intent_id)
+        if snapshot is None:
+            return {"id": intent_id, "legs": ()}, False, "UNKNOWN_INTENT"
+        leg = next(
+            (row for row in snapshot.get("legs", ()) if str(row.get("id")) == str(leg_id)),
+            None,
+        )
+        if not isinstance(leg, Mapping):
+            return snapshot, False, "MISSING_LEG"
+        status = str(leg.get("status", "UNKNOWN"))
+        try:
+            requested = Decimal(str(leg["quantity"]))
+            cumulative = Decimal(str(leg.get("cumulative_filled_quantity", "0")))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            return snapshot, False, "MALFORMED_FILL_QUANTITY"
+        attempts = self.repository.broker_orders_for_leg(str(leg_id))
+        if (
+            status == LegStatus.FILLED.value
+            and requested.is_finite()
+            and requested > 0
+            and cumulative == requested
+            and len(attempts) == 1
+        ):
+            try:
+                verified = self.oms._attempt_has_complete_fill_evidence(attempts[0], leg)
+            except (AttributeError, KeyError, InvalidOperation, TypeError, ValueError, sqlite3.Error):
+                verified = False
+            if verified:
+                return snapshot, True, "FULL"
+
+        if status in {
+            LegStatus.REJECTED.value,
+            LegStatus.CANCELLED.value,
+            LegStatus.FAILED.value,
+            LegStatus.RECONCILIATION_REQUIRED.value,
+        }:
+            return snapshot, False, status
+        if not attempts and status in {
+            LegStatus.PLANNED.value,
+            LegStatus.SUBMITTING.value,
+        }:
+            return snapshot, False, "UNSUBMITTED"
+        return snapshot, False, status or "UNKNOWN"
+
+    def _wait_for_verified_leg_fill(
+        self,
+        *,
+        intent_id: str,
+        leg_id: str,
+        account: Account,
+    ) -> tuple[Mapping[str, Any], str]:
+        """Wait for one owned sibling leg to become durably fully filled.
+
+        This is intentionally fail-closed.  It performs only the existing
+        OMS recovery/read path and never submits, cancels, or replaces an
+        order.  A timeout, partial/rejected/ambiguous state, or recovery
+        failure is returned to the per-leg admission gate so GenericOMS can
+        persist the normal Stage 6 reconciliation stop and leave the next
+        sibling unattempted.
+        """
+
+        deadline = self._now() + timedelta(seconds=self.dispatch_wait_seconds)
+        last = self.repository.get_intent(intent_id) or {"id": intent_id, "legs": ()}
+        while True:
+            last, verified, state = self._leg_fill_state(intent_id=intent_id, leg_id=leg_id)
+            if verified:
+                return last, "FULL"
+            if state in {
+                "UNKNOWN_INTENT",
+                "MISSING_LEG",
+                "MALFORMED_FILL_QUANTITY",
+                "UNSUBMITTED",
+                LegStatus.REJECTED.value,
+                LegStatus.CANCELLED.value,
+                LegStatus.FAILED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                return last, state
+            now = self._now()
+            if now >= deadline:
+                return last, "TIMEOUT"
+            try:
+                last = self.oms.recover_intent(intent_id, account=account)
+            except Exception as exc:
+                return {
+                    **dict(last),
+                    "status": "RECOVERY_ERROR",
+                    "error": str(exc),
+                }, "RECOVERY_ERROR"
+            _snapshot, verified, state = self._leg_fill_state(
+                intent_id=intent_id,
+                leg_id=leg_id,
+            )
+            if verified:
+                return _snapshot, "FULL"
+            if state in {
+                "UNKNOWN_INTENT",
+                "MISSING_LEG",
+                "MALFORMED_FILL_QUANTITY",
+                "UNSUBMITTED",
+                LegStatus.REJECTED.value,
+                LegStatus.CANCELLED.value,
+                LegStatus.FAILED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                return _snapshot, state
+            remaining = max(0.0, (deadline - self._now()).total_seconds())
+            if remaining <= 0:
+                return _snapshot, "TIMEOUT"
             self.sleep(min(self.dispatch_poll_seconds, remaining))
 
     @staticmethod
@@ -1504,6 +1655,51 @@ class Stage6PilotRunner:
                     source_intent_id=source_intent_id,
                 )
                 recorded_intents.add(intent_id)
+            # GenericOMS invokes this hook immediately before every sibling
+            # can reach the adapter.  Once a prior leg has been accepted, do
+            # not treat its WORKING ACK as enough to submit the next leg: wait
+            # for that exact owned leg to become durably FILLED first.  This
+            # keeps the existing account/RTH gate strict while preventing the
+            # first still-working order from being mistaken for a clean
+            # hand-off opportunity.
+            persisted_before_gate = self.repository.get_intent(intent_id)
+            prior_leg_was_durably_recovered = False
+            current_sequence = getattr(_leg, "sequence", None)
+            if persisted_before_gate is None or current_sequence is None:
+                raise ValueError("Stage 6 submission intent/leg ownership is unavailable")
+            try:
+                current_sequence = int(current_sequence)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Stage 6 submission leg sequence is invalid") from exc
+            prior_legs = sorted(
+                (
+                    row
+                    for row in persisted_before_gate.get("legs", ())
+                    if int(row.get("sequence", -1)) < current_sequence
+                ),
+                key=lambda row: int(row.get("sequence", -1)),
+            )
+            for prior_leg in prior_legs:
+                prior_id = str(prior_leg.get("id") or "").strip()
+                if not prior_id:
+                    raise ValueError("Stage 6 prior sibling leg identity is missing")
+                _prior_snapshot, prior_verified, prior_state = self._leg_fill_state(
+                    intent_id=intent_id,
+                    leg_id=prior_id,
+                )
+                if not prior_verified:
+                    _prior_snapshot, prior_state = self._wait_for_verified_leg_fill(
+                        intent_id=intent_id,
+                        leg_id=prior_id,
+                        account=account,
+                    )
+                    if prior_state != "FULL":
+                        self._last_submission_gate_outcome = prior_state
+                        raise ValueError(
+                            "prior Stage 6 sibling leg "
+                            f"{prior_id} returned {prior_state}; next leg remains unsubmitted"
+                        )
+                prior_leg_was_durably_recovered = True
             exit_target_books: set[str] | None = None
             if spec.action is IntentAction.EXIT:
                 # An EXIT batch is dispatched one book at a time.  The first
@@ -1530,7 +1726,12 @@ class Stage6PilotRunner:
             _facts, fact_reasons = self._fresh_broker_snapshot(
                 spec,
                 exit_target_books=exit_target_books,
-                transient_intent=_intent,
+                # A successful prior-leg wait has already persisted its
+                # exact fill and allocation.  Do not add that same exposure a
+                # second time as a transient claim while checking the next
+                # leg.  The first leg of an intent still uses the existing
+                # transient path because no sibling has been recovered yet.
+                transient_intent=None if prior_leg_was_durably_recovered else _intent,
             )
             _market, market_reasons = self._fresh_market_state(
                 spec,
@@ -3025,6 +3226,7 @@ class Stage6PilotRunner:
                 metadata={"pilot_run_id": spec.run_id},
             )
             try:
+                self._last_submission_gate_outcome = None
                 result = self.oms.submit_intent(
                     intent,
                     account=spec.account,
@@ -3038,6 +3240,7 @@ class Stage6PilotRunner:
                     IntentStatus.WORKING.value,
                     IntentStatus.SUBMITTING.value,
                     IntentStatus.RISK_APPROVED.value,
+                    IntentStatus.PARTIALLY_FILLED.value,
                 }:
                     final_result, wait_outcome = self._wait_for_verified_full_fill(
                         intent_id=intent.id,
@@ -3062,8 +3265,9 @@ class Stage6PilotRunner:
                 # any known exposure is left for the existing compensating
                 # exit/reconciliation path.
                 if wait_outcome != "FULL":
+                    reported_outcome = self._last_submission_gate_outcome or wait_outcome
                     stop_reasons.append(
-                        f"dispatch stopped after {sleeve.sleeve_id} returned {wait_outcome}"
+                        f"dispatch stopped after {sleeve.sleeve_id} returned {reported_outcome}"
                     )
                     break
             except Exception as exc:
