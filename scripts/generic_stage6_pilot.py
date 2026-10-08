@@ -8,6 +8,9 @@ Commands are intentionally asymmetric:
 * ``broker-preflight`` performs fresh account and provider market-state reads
   through the configured generic adapter, but never creates or submits an
   order.
+* ``historical-preflight`` performs one bounded, read-only historical order
+  snapshot query through the configured generic adapter.  It never persists
+  repository rows or invokes an order/recovery path.
 * ``recover`` performs broker-read-only restart recovery through the existing
   ``Stage6PilotRunner``/``GenericOMS`` path.  It may write recovered local
   ledger evidence, but never submits, cancels, replaces, hedges, or flattens.
@@ -49,7 +52,10 @@ from src.strategies.stat_arb.stage6_pilot import (  # noqa: E402
 )
 from src.trading_core.repository import SQLiteTradingRepository  # noqa: E402
 from src.trading_core.domain import ExecutionEvidenceMode  # noqa: E402
-from src.trading_core.ports import BrokerFactSnapshot  # noqa: E402
+from src.trading_core.ports import (  # noqa: E402
+    BrokerFactSnapshot,
+    BrokerHistoricalOrderFacts,
+)
 from src.trading_core.stage6_validation import (  # noqa: E402
     Stage6SessionOutcome,
     Stage6ValidationError,
@@ -78,6 +84,23 @@ def _parser() -> argparse.ArgumentParser:
     broker_preflight.add_argument(
         "--record-observation", action="store_true",
         help="persist this runner-generated PREFLIGHT observation for the supplied session",
+    )
+    historical_preflight = subparsers.add_parser(
+        "historical-preflight",
+        help=(
+            "read-only bounded historical order/fill facts through the generic adapter; "
+            "never persists or submits"
+        ),
+    )
+    historical_preflight.add_argument(
+        "--start",
+        required=True,
+        help="timezone-aware ISO-8601 start of the bounded historical window",
+    )
+    historical_preflight.add_argument(
+        "--end",
+        required=True,
+        help="timezone-aware ISO-8601 end of the bounded historical window",
     )
     baseline = subparsers.add_parser(
         "baseline",
@@ -145,6 +168,7 @@ def _parser() -> argparse.ArgumentParser:
         validate,
         dry_run,
         broker_preflight,
+        historical_preflight,
         baseline,
         sim_submit,
         recover,
@@ -263,6 +287,127 @@ def _summary(config: Stage6PilotConfig) -> dict[str, Any]:
         "rth_handoff_policy": config.execution.rth_handoff_policy,
         "execution_compatibility": STAGE6_EXECUTION_COMPATIBILITY,
         "mode": "DRY_RUN",
+    }
+
+
+def _required_timezone_aware_timestamp(value: object, label: str) -> datetime:
+    """Parse one explicit, timezone-aware historical query bound."""
+
+    text = str(value or "").strip()
+    if not text:
+        raise Stage6ConfigError(f"historical-preflight requires {label}")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise Stage6ConfigError(f"{label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise Stage6ConfigError(f"{label} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _historical_preflight_payload(
+    config: Stage6PilotConfig,
+    *,
+    requested_start: datetime,
+    requested_end: datetime,
+    runner: Any | None = None,
+    facts: BrokerHistoricalOrderFacts | None = None,
+    error: str | None = None,
+    broker_contacted: bool = False,
+) -> dict[str, Any]:
+    """Build the standalone historical-preflight evidence envelope.
+
+    This envelope intentionally contains only adapter facts and query
+    provenance.  It does not include a repository observation or any local
+    lifecycle state, so downstream repair tooling can require this document
+    as independent evidence rather than treating it as a current preflight.
+    """
+
+    if facts is not None and not isinstance(facts, BrokerHistoricalOrderFacts):
+        raise Stage6ConfigError("historical order provider returned an invalid result")
+    captured_at = facts.captured_at.isoformat() if facts is not None else None
+    complete = bool(facts is not None and facts.complete and not facts.error and not error)
+    if error:
+        facts_error = error
+    elif facts is None:
+        facts_error = "historical order facts unavailable"
+    else:
+        facts_error = facts.error
+    display_error = facts_error or "historical order facts unavailable"
+    orders = (
+        [runner._broker_order_payload(item) for item in facts.orders]
+        if facts is not None and runner is not None
+        else []
+    )
+    fills = (
+        [runner._broker_fill_payload(item) for item in facts.fills]
+        if facts is not None and runner is not None
+        else []
+    )
+    mode = facts.execution_evidence_mode.value if facts is not None else ExecutionEvidenceMode.UNAVAILABLE.value
+    scope = sorted(facts.execution_evidence_scope) if facts is not None else []
+    metadata = dict(facts.metadata) if facts is not None else {}
+    historical_facts = {
+        "account_id": facts.account_id if facts is not None else config.account.id,
+        "requested_start": (
+            facts.requested_start.isoformat() if facts is not None else requested_start.isoformat()
+        ),
+        "requested_end": (
+            facts.requested_end.isoformat() if facts is not None else requested_end.isoformat()
+        ),
+        "captured_at": captured_at,
+        "complete": complete,
+        "error": facts_error,
+        "execution_evidence_mode": mode,
+        "execution_evidence_scope": scope,
+        "orders": orders,
+        "fills": fills,
+        "metadata": metadata,
+        "provenance": {
+            "source": metadata.get("source"),
+            "query": "history_order_list_query",
+            "scope": scope,
+        },
+    }
+    mutation_counts = {
+        "order_intents": 0,
+        "order_legs": 0,
+        "broker_orders": 0,
+        "fills": 0,
+        "submission_calls": 0,
+        "cancel_calls": 0,
+        "replace_calls": 0,
+        "recovery_calls": 0,
+        "persistence_writes": 0,
+    }
+    return {
+        "mode": "HISTORICAL_PREFLIGHT",
+        "broker_contacted": broker_contacted,
+        "execution_path": "Stage6PilotRunner->GenericOMS->HistoricalOrderEvidenceProvider",
+        "account": {
+            "account_id": config.account.id,
+            "broker": config.account.broker,
+            "environment": config.account.environment.value,
+            "external_account_id": config.account.external_account_id,
+        },
+        "historical_facts": historical_facts,
+        "historical_preflight_passed": complete,
+        "captured_at": captured_at,
+        "requested_start": requested_start.isoformat(),
+        "requested_end": requested_end.isoformat(),
+        "orders": orders,
+        "fills": fills,
+        "execution_evidence_mode": mode,
+        "execution_evidence_scope": scope,
+        "provenance": historical_facts["provenance"],
+        "mutations": mutation_counts,
+        "broker_submission_count": 0,
+        "cancel_count": 0,
+        "replace_count": 0,
+        "orders_submitted": 0,
+        "recovery_calls": 0,
+        "stop_reasons": [] if complete else [display_error],
+        "error": None if complete else display_error,
     }
 
 
@@ -1971,6 +2116,56 @@ def _run(args: argparse.Namespace) -> tuple[int, Any]:
         raise Stage6ConfigError(
             "baseline requires --verify-flat; it performs a fresh read-only SIM account-facts check"
         )
+
+    if args.command == "historical-preflight":
+        if str(config.account.environment.value).upper() != "SIM":
+            raise Stage6ConfigError("historical-preflight accepts SIM accounts only")
+        requested_start = _required_timezone_aware_timestamp(args.start, "--start")
+        requested_end = _required_timezone_aware_timestamp(args.end, "--end")
+        if requested_end <= requested_start:
+            raise Stage6ConfigError("historical-preflight requires --end after --start")
+
+        # Constructing the repository/OMS objects is safe here: the command
+        # deliberately does not call repository initialization, validation,
+        # recovery, or any persistence method.  The only operational call is
+        # GenericOMS.strict_historical_order_facts(), which delegates to the
+        # adapter's bounded historical read capability.
+        repository = SQLiteTradingRepository(config.state_db)
+        adapter = None
+        connect_attempted = False
+        broker_contacted = False
+        runner = None
+        facts = None
+        error = None
+        try:
+            adapter = config.build_moomoo_adapter()
+            connect_attempted = True
+            adapter.connect()
+            broker_contacted = True
+            runner = config.build_runner(repository, adapter=adapter)
+            facts = runner.oms.strict_historical_order_facts(
+                config.account,
+                requested_start=requested_start,
+                requested_end=requested_end,
+            )
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            if connect_attempted and adapter is not None:
+                try:
+                    adapter.disconnect()
+                except Exception as exc:
+                    error = error or f"historical-preflight disconnect failed: {exc}"
+        payload = _historical_preflight_payload(
+            config,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            runner=runner,
+            facts=facts,
+            error=error,
+            broker_contacted=broker_contacted,
+        )
+        return (0 if payload["historical_preflight_passed"] else 2), payload
 
     repository = SQLiteTradingRepository(config.state_db)
     if args.command == "broker-preflight":

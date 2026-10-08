@@ -13,6 +13,7 @@ from src.trading_core.domain import (
     Account,
     AssetClass,
     Book,
+    BrokerOrderEvent,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     ExecutionEvidenceBaseline,
@@ -135,6 +136,198 @@ class _FactsAdapter:
             execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
             metadata={"source": "offline-test"},
         )
+
+
+class _MoomooSimRecoveryAdapter(_FactsAdapter):
+    """Minimal adapter-shaped SIM fixture for the recovery evidence bridge."""
+
+    def __init__(self, facts: BrokerFactSnapshot, terminal_order: BrokerOrderSnapshot) -> None:
+        super().__init__(facts)
+        self.terminal_order = terminal_order
+
+    def get_order(self, account: Account, external_order_id: str) -> BrokerOrderSnapshot | None:
+        if account.id != self.facts.account_id:
+            return None
+        if external_order_id != self.terminal_order.external_order_id:
+            return None
+        return self.terminal_order
+
+    def get_positions(self, account: Account) -> tuple[PositionSnapshot, ...]:
+        return self.facts.positions if account.id == self.facts.account_id else ()
+
+
+def _seed_moomoo_sim_fill_recovery(tmp_path, mode: ExecutionEvidenceMode):
+    repository = _repository(tmp_path)
+    account = _account()
+    intent = _intent()
+    repository.create_intent(intent)
+    repository.transition_intent(intent.id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(intent.id, IntentStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(intent.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.create_broker_order(
+        broker_order_id="moomoo-sim-broker-order",
+        order_leg_id=intent.legs[0].id,
+        account_id=account.id,
+        broker=account.broker,
+        attempt_number=1,
+        client_order_id="moomoo-sim-client-order",
+        submitted_quantity=Decimal("1"),
+        now=NOW,
+    )
+    repository.transition_broker_order("moomoo-sim-broker-order", BrokerOrderStatus.SUBMITTING, now=NOW)
+    repository.record_submission(
+        "moomoo-sim-broker-order",
+        status=BrokerOrderStatus.WORKING,
+        external_order_id="moomoo-sim-external-order",
+        metadata={"provider_status": "SUBMITTED"},
+        now=NOW,
+    )
+    repository.transition_leg(intent.legs[0].id, LegStatus.WORKING, now=NOW)
+    repository.transition_intent(intent.id, IntentStatus.WORKING, now=NOW)
+
+    external_order_id = "moomoo-sim-external-order"
+    dedupe_key = "moomoo-order-fill:moomoo-sim-external-order"
+    fill = BrokerFill(
+        external_order_id=external_order_id,
+        external_fill_id=None,
+        dedupe_key=dedupe_key,
+        quantity=Decimal("1"),
+        price=Decimal("101"),
+        filled_at=NOW + timedelta(seconds=1),
+        received_at=NOW + timedelta(seconds=2),
+        account_id=account.id,
+        evidence_reference=f"{external_order_id}:{dedupe_key}",
+        evidence_mode=mode,
+        instrument_id="compat-instrument",
+        metadata={
+            "_external_order_id": external_order_id,
+            "_evidence_reference": f"{external_order_id}:{dedupe_key}",
+            "_instrument_id": "compat-instrument",
+        },
+    )
+    position = PositionSnapshot(
+        id="moomoo-sim-position",
+        broker_snapshot_id="moomoo-sim-position-snapshot",
+        account_id=account.id,
+        instrument_id="compat-instrument",
+        signed_quantity=Decimal("1"),
+        average_price=Decimal("101"),
+        captured_at=NOW + timedelta(seconds=2),
+    )
+    facts = BrokerFactSnapshot(
+        account_id=account.id,
+        captured_at=NOW + timedelta(seconds=2),
+        complete=True,
+        positions=(position,),
+        open_orders=(),
+        fills=(fill,),
+        execution_evidence_mode=mode,
+        execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
+        metadata={"source": "moomoo-sim-order-snapshot"},
+    )
+    terminal_order = BrokerOrderSnapshot(
+        id="moomoo-sim-terminal-snapshot",
+        broker_snapshot_id="moomoo-sim-terminal-order-snapshot",
+        account_id=account.id,
+        instrument_id="compat-instrument",
+        external_order_id=external_order_id,
+        client_order_id="moomoo-sim-client-order",
+        side=Side.BUY,
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("1"),
+        status=BrokerOrderStatus.FILLED,
+        captured_at=NOW + timedelta(seconds=2),
+        order_time=NOW,
+    )
+    if mode is ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS:
+        repository.save_execution_evidence_baseline(
+            ExecutionEvidenceBaseline(
+                id="moomoo-sim-flat-baseline",
+                account_id=account.id,
+                captured_at=NOW,
+                evidence_mode=mode,
+                coverage=("CURRENT_ORDER_SNAPSHOTS",),
+                source_ledger_fingerprint="moomoo-sim-source-ledger",
+                source_order_ids=(),
+                position_fingerprint="flat-position-fingerprint",
+                open_order_fingerprint="flat-order-fingerprint",
+            )
+        )
+    adapter = _MoomooSimRecoveryAdapter(facts, terminal_order)
+    return account, repository, intent, adapter
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        ExecutionEvidenceMode.INDIVIDUAL_DEALS,
+    ),
+)
+def test_moomoo_sim_fill_recovery_persists_provider_evidence_mode(tmp_path, mode):
+    account, repository, intent, adapter = _seed_moomoo_sim_fill_recovery(tmp_path, mode)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=3))
+
+    recovered = oms.recover_intent(intent.id, account=account)
+
+    assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
+    with repository.transaction() as connection:
+        row = connection.execute(
+            "SELECT evidence_mode FROM core_fills WHERE broker_order_id = ?",
+            ("moomoo-sim-broker-order",),
+        ).fetchone()
+    assert row["evidence_mode"] == mode.value
+
+    # A fresh SIM cumulative snapshot has a new local receipt timestamp.  A
+    # restart must replay the same provider evidence idempotently and retain
+    # the original evidence mode instead of defaulting to individual deals.
+    restarted = GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=4))
+    restarted.recover_intent(intent.id, account=account)
+    with repository.transaction() as connection:
+        rows = connection.execute(
+            "SELECT evidence_mode FROM core_fills WHERE broker_order_id = ?",
+            ("moomoo-sim-broker-order",),
+        ).fetchall()
+    assert [item["evidence_mode"] for item in rows] == [mode.value]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        ExecutionEvidenceMode.INDIVIDUAL_DEALS,
+    ),
+)
+def test_moomoo_sim_validated_event_persists_provider_evidence_mode(tmp_path, mode):
+    account, repository, intent, adapter = _seed_moomoo_sim_fill_recovery(tmp_path, mode)
+    oms = GenericOMS(repository, adapter, clock=lambda: NOW + timedelta(seconds=3))
+    attempt = repository.broker_orders_for_leg(intent.legs[0].id)[0]
+    event = BrokerOrderEvent(
+        id="moomoo-sim-filled-event",
+        broker_order_id=attempt["id"],
+        dedupe_key="moomoo-sim-filled-event",
+        event_type="ORDER_STATUS",
+        event_at=NOW + timedelta(seconds=2),
+        received_at=NOW + timedelta(seconds=2),
+        broker_status=BrokerOrderStatus.FILLED,
+        external_order_id=attempt["external_order_id"],
+        account_id=account.id,
+        cumulative_filled_quantity=Decimal("1"),
+    )
+
+    recovered = oms._ingest_validated_broker_order_event(
+        event,
+        account=account,
+        fills=adapter.facts.fills,
+    )
+
+    assert recovered["legs"][0]["status"] == LegStatus.FILLED.value
+    with repository.transaction() as connection:
+        row = connection.execute(
+            "SELECT evidence_mode FROM core_fills WHERE broker_order_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert row["evidence_mode"] == mode.value
 
 
 def _facts(
