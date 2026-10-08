@@ -24,7 +24,12 @@ from src.trading_core.domain import (
     Side,
 )
 from src.trading_core.oms import GenericOMS, OMSExecutionError
-from src.trading_core.ports import BrokerFill, BrokerHistoricalOrderFacts, BrokerSubmissionResult
+from src.trading_core.ports import (
+    BrokerFactSnapshot,
+    BrokerFill,
+    BrokerHistoricalOrderFacts,
+    BrokerSubmissionResult,
+)
 from tests.test_generic_stage6_pilot import (
     MoomooAckPilotAdapter,
     NOW,
@@ -1481,6 +1486,119 @@ def test_direct_oms_compensating_exit_rejects_changed_selected_fill_identity(tmp
 
     assert len(adapter.submit_calls) == before_submit_count
     assert repository.book_intents(account.id, book_id=sleeves[0].book_id) == [source_row]
+
+
+def _synthetic_selected_fill_case(tmp_path):
+    account, sleeves, _repository, _adapter, runner = make_runner(tmp_path)
+    instrument_id = sleeves[0].instrument_ids[0]
+    external_order_id = "synthetic-order"
+    dedupe_key = "moomoo-order-fill:synthetic-order"
+    filled_at = NOW - timedelta(seconds=5)
+    attempt = {
+        "account_id": account.id,
+        "external_order_id": external_order_id,
+        "submitted_quantity": "1",
+        "submitted_at": (NOW - timedelta(seconds=10)).isoformat(),
+    }
+    durable_fill = {
+        "external_fill_id": None,
+        "dedupe_key": dedupe_key,
+        "quantity": "1",
+        "price": "100",
+        "fee": None,
+        "fee_currency": None,
+        "filled_at": filled_at.isoformat(),
+        # This is a local durable receipt time, not provider execution time.
+        "received_at": NOW.isoformat(),
+        "evidence_mode": ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS.value,
+        "metadata": {
+            "_broker_fill_account_id": account.id,
+            "_external_order_id": external_order_id,
+            "_instrument_id": instrument_id,
+            "_evidence_reference": f"{external_order_id}:{dedupe_key}",
+        },
+    }
+    broker_fill = BrokerFill(
+        external_order_id=external_order_id,
+        dedupe_key=dedupe_key,
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        filled_at=filled_at,
+        # A fresh cumulative snapshot necessarily has a new local receipt time.
+        received_at=NOW + timedelta(seconds=30),
+        account_id=account.id,
+        evidence_reference=f"{external_order_id}:{dedupe_key}",
+        evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        instrument_id=instrument_id,
+        metadata={
+            "_external_order_id": external_order_id,
+            "_instrument_id": instrument_id,
+        },
+    )
+    expected_rows = (
+        {
+            "instrument_id": instrument_id,
+            "external_order_id": external_order_id,
+            "attempt": attempt,
+            "fill": durable_fill,
+        },
+    )
+    facts = BrokerFactSnapshot(
+        account_id=account.id,
+        captured_at=NOW,
+        complete=True,
+        fills=(broker_fill,),
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
+    )
+    return account, runner, broker_fill, facts, expected_rows
+
+
+def test_selected_synthetic_fill_proof_ignores_local_receipt_timestamp(tmp_path):
+    account, runner, broker_fill, facts, expected_rows = _synthetic_selected_fill_case(tmp_path)
+
+    matched = runner.oms._validate_exact_selected_fill_facts(
+        account=account,
+        facts=facts,
+        expected_rows=expected_rows,
+        source="test compensating exit",
+    )
+
+    assert matched == {"synthetic-order": [broker_fill]}
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "expected_reason"),
+    (
+        ("quantity", Decimal("2"), "fill quantity differs"),
+        ("price", Decimal("101"), "fill price differs"),
+        ("filled_at", NOW + timedelta(seconds=1), "fill timestamp differs"),
+        ("account_id", "foreign-account", "provider fill account provenance differs"),
+        ("instrument_id", "foreign-instrument", "provider fill instrument provenance differs"),
+        (
+            "evidence_mode",
+            ExecutionEvidenceMode.INDIVIDUAL_DEALS,
+            "execution evidence mode differs",
+        ),
+    ),
+)
+def test_selected_synthetic_fill_proof_keeps_execution_identity_strict(
+    tmp_path,
+    field,
+    replacement,
+    expected_reason,
+):
+    account, runner, broker_fill, facts, expected_rows = _synthetic_selected_fill_case(tmp_path)
+    changed_fill = replace(broker_fill, **{field: replacement})
+    changed_facts = replace(facts, fills=(changed_fill,))
+
+    with pytest.raises(OMSExecutionError, match=expected_reason):
+        runner.oms._validate_exact_selected_fill_facts(
+            account=account,
+            facts=changed_facts,
+            expected_rows=expected_rows,
+            source="test compensating exit",
+        )
 
 
 def test_partial_exit_residual_uses_remaining_book_basis(tmp_path):

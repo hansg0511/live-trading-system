@@ -11416,11 +11416,14 @@ class GenericOMS:
         if broker_fill.fee_currency != durable_fill.get("fee_currency"):
             return "fill fee currency differs"
         durable_filled_at = self._parse_timestamp(durable_fill.get("filled_at"))
-        durable_received_at = self._parse_timestamp(durable_fill.get("received_at"))
         if durable_filled_at is None or broker_fill.filled_at != durable_filled_at:
             return "fill timestamp differs"
-        if durable_received_at is None or broker_fill.received_at != durable_received_at:
-            return "fill receipt timestamp differs"
+        # ``received_at`` is the local observation time, not provider-side
+        # execution identity.  In particular, Moomoo SIM's cumulative-order
+        # fallback creates a new receipt timestamp each time the same filled
+        # order is observed.  Keep the broker execution timestamp and every
+        # other immutable/provenance check strict, but do not require two
+        # observations to have identical local ingestion times.
         durable_mode = str(durable_fill.get("evidence_mode") or "").strip()
         if durable_mode and broker_fill.evidence_mode.value != durable_mode:
             return "execution evidence mode differs"
