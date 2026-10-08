@@ -981,6 +981,14 @@ def _run_validation_command(args: argparse.Namespace, config: Stage6PilotConfig)
             result = evaluate_stage6_session(evidence)
         except Stage6ValidationError as exc:
             raise Stage6ConfigError(str(exc)) from exc
+        if result.outcome is Stage6SessionOutcome.CLEAN_PASS:
+            try:
+                config.build_runner(repository).verify_durable_session_evidence(
+                    config.spec(),
+                    result.evidence,
+                )
+            except ValueError as exc:
+                raise Stage6ConfigError(str(exc)) from exc
         repository.save_stage6_validation_session(result)
         payload = result.as_dict()
         payload["broker_contacted"] = False

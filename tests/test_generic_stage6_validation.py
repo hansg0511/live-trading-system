@@ -431,12 +431,16 @@ def test_validation_cli_records_phases_finalizes_and_reports_without_broker(tmp_
     ]) == 0
     capsys.readouterr()
 
+    # The document is structurally CLEAN_PASS-shaped, but it is fabricated:
+    # it has no retained FINAL observation and its IDs/orders are not a
+    # durable execution graph.  The supported finalization boundary must
+    # retain no clean result from this input.
     assert stage6_cli([
         "session-finalize", "--config", str(config_path), "--evidence", str(evidence_path), "--json",
-    ]) == 0
+    ]) == 2
     finalized = capsys.readouterr().out
-    assert "CLEAN_PASS" in finalized
-    assert "orders_submitted" in finalized
+    assert "CLEAN_PASS durable repository verification failed" in finalized
+    assert "FINAL observation" in finalized
 
     assert stage6_cli([
         "session-status", "--config", str(config_path), "--session-id", "cli-session", "--json",

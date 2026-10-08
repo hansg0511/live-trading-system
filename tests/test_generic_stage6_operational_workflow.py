@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import copy
 import json
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from scripts.generic_stage6_pilot import (
 import scripts.generic_stage6_pilot as stage6_cli
 from src.strategies.stat_arb.stage6_config import Stage6PilotConfig
 from src.trading_core.repository import SQLiteTradingRepository
+from src.trading_core.stage6_validation import Stage6SessionOutcome, evaluate_stage6_session
 from tests.test_generic_stage6_config_cli import _config_dict
 from tests.test_generic_stage6_pilot import (
     NOW,
@@ -529,21 +531,61 @@ def test_clean_preflight_dryrun_finalstate_includes_verified_retired_baseline(tm
     assert final["final"]["all_orders_attributable"] is True
 
 
+def _retired_baseline_cli_values(values: dict, tmp_path: Path) -> dict:
+    """Adapt the checked test config to the real imported baseline identity."""
+
+    account_id = "moomoo:sim:5077333"
+    instrument_ids = (
+        ("generic-sim-smoke:us-aapl", "US.AAPL"),
+        ("generic-sim-smoke:us-msft", "US.MSFT"),
+    )
+    values = json.loads(json.dumps(values))
+    values["state_db"] = str(tmp_path / "retired-stage6.db")
+    values["account"]["id"] = account_id
+    values["account"]["metadata"] = {
+        "allocation_capacity": "20",
+        "account_capacity": "20",
+    }
+    values["strategy"]["name"] = "Stage 6 test strategy"
+    values["strategy"]["config"] = {}
+    for sleeve in values["sleeves"]:
+        sleeve["account_id"] = account_id
+    for pair, (instrument_id, symbol) in zip(values["sleeves"][0]["pair"], instrument_ids, strict=True):
+        pair["instrument_id"] = instrument_id
+        pair["symbol"] = symbol.split(".", 1)[1]
+        pair["moomoo_symbol"] = symbol
+    values["allocation_update"]["account_id"] = account_id
+    values["targets"][0]["instrument_ids"] = [item[0] for item in instrument_ids]
+    return values
+
+
+@pytest.mark.parametrize("include_retired_baseline", (False, True), ids=("clean", "retired-baseline"))
 def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
     tmp_path,
     monkeypatch,
     capsys,
+    include_retired_baseline,
 ):
     values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    if include_retired_baseline:
+        _baseline_account, _baseline_sleeves, _baseline_repository, baseline_adapter, _baseline_runner = (
+            make_retired_baseline_runner(tmp_path)
+        )
+        values = _retired_baseline_cli_values(values, tmp_path)
+        baseline_adapter.facts = replace(baseline_adapter.facts, captured_at=runtime_now)
+        adapter = CliWorkflowAdapter()
+        adapter.facts = baseline_adapter.facts
+    else:
+        adapter = CliWorkflowAdapter()
     config_path = tmp_path / "entry.json"
     config_path.write_text(json.dumps(values), encoding="utf-8")
     config = Stage6PilotConfig.load(config_path)
-    adapter = CliWorkflowAdapter()
     _install_cli_fake(monkeypatch, adapter, now=runtime_now)
 
     # Bootstrap the exact repository/config boundary through the supported
     # CLI. Every later evidence artifact is captured from a CLI result.
-    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    dry_code, dry_payload = _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])
+    assert dry_code == 0, json.dumps(dry_payload, indent=2, sort_keys=True)
     preflight_path = tmp_path / "preflight.json"
     preflight_code, preflight = _run_cli(
         capsys,
@@ -657,6 +699,93 @@ def test_cli_clean_fake_broker_workflow_builds_and_finalizes_durable_evidence(
             args.append("--fresh-process")
         args.append("--json")
         assert _run_cli(capsys, args)[0] == 0
+
+    def record_phase_observations(session_id: str) -> None:
+        for command, artifact in (
+            ("session-preflight", preflight_path),
+            ("session-recover", recovery_path),
+            ("session-final", final_path),
+        ):
+            phase_artifact = tmp_path / f"{session_id}-{command}.json"
+            phase_value = json.loads(artifact.read_text(encoding="utf-8"))
+            phase_value["session_id"] = session_id
+            phase_artifact.write_text(json.dumps(phase_value), encoding="utf-8")
+            args = [
+                command, "--config", str(config_path), "--session-id", session_id,
+                "--evidence", str(phase_artifact), "--commit-sha", "offline-test",
+                "--execution-compatibility", "stage6-execution-v2", "--trading-date", "2026-10-07",
+            ]
+            if command == "session-recover":
+                args.append("--fresh-process")
+            args.append("--json")
+            assert _run_cli(capsys, args)[0] == 0
+
+    # These documents remain structurally acceptable to the pure evaluator,
+    # but each mutation conflicts with the canonical durable graph.  The CLI
+    # finalization boundary must reject every one before persistence.
+    tamper_cases = {
+        "external-order": lambda value: value["entry"]["actual_orders"][0].update(
+            {"order_id": "forged-external-order", "external_order_id": "forged-external-order"}
+        ),
+        "fill-dedupe": lambda value: value["entry"]["actual_orders"][0]["fills"][0].update(
+            {"dedupe_key": "forged-dedupe-key"}
+        ),
+        "fill-price": lambda value: value["entry"]["actual_orders"][0]["fills"][0].update(
+            {"price": "999.99"}
+        ),
+        "provenance": lambda value: value["execution_provenance"]["entry"][entry_intent_ids[0]].update(
+            {"process_id": "forged-submission-process"}
+        ),
+    }
+    durable_gate_rejections = 0
+    for label, mutate in tamper_cases.items():
+        tampered = copy.deepcopy(evidence)
+        tampered["session_id"] = f"tampered-{label}"
+        mutate(tampered)
+        pure_result = evaluate_stage6_session(tampered)
+        if label == "external-order":
+            assert pure_result.outcome is Stage6SessionOutcome.INVALID
+        else:
+            assert pure_result.outcome is Stage6SessionOutcome.CLEAN_PASS
+        tampered_path = tmp_path / f"tampered-{label}.json"
+        tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+        record_phase_observations(tampered["session_id"])
+        tampered_code, tampered_result = _run_cli(
+            capsys,
+            [
+                "session-finalize", "--config", str(config_path),
+                "--session-id", tampered["session_id"], "--evidence", str(tampered_path), "--json",
+            ],
+        )
+        assert tampered_code == 2
+        if tampered_result.get("status") == "BLOCKED":
+            durable_gate_rejections += 1
+            assert "durable repository verification" in tampered_result["error"]
+        else:
+            assert tampered_result["result"] in {"FAILED", "INVALID"}
+            assert tampered_result["counted_for_completion"] is False
+    assert durable_gate_rejections >= 1
+
+    # Observations captured under another session cannot be borrowed by a
+    # candidate CLEAN_PASS document, even when all durable execution rows are
+    # otherwise valid.
+    observation_session = "observation-session-only"
+    record_phase_observations(observation_session)
+    wrong_session = copy.deepcopy(evidence)
+    wrong_session["session_id"] = "candidate-session-without-observations"
+    wrong_session_path = tmp_path / "wrong-session.json"
+    wrong_session_path.write_text(json.dumps(wrong_session), encoding="utf-8")
+    wrong_code, wrong_result = _run_cli(
+        capsys,
+        [
+            "session-finalize", "--config", str(config_path),
+            "--session-id", wrong_session["session_id"], "--evidence", str(wrong_session_path), "--json",
+        ],
+    )
+    assert wrong_code == 2
+    assert wrong_result["status"] == "BLOCKED"
+    assert "exactly one PREFLIGHT observation" in wrong_result["error"]
+
     finalize_code, finalized = _run_cli(
         capsys,
         ["session-finalize", "--config", str(config_path), "--session-id", session_id, "--evidence", str(evidence_path), "--json"],

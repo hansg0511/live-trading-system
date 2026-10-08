@@ -1738,6 +1738,140 @@ class Stage6PilotRunner:
             evidence["evidence_builder_missing"] = list(dict.fromkeys(missing))
         return evidence
 
+    def verify_durable_session_evidence(
+        self,
+        spec: Stage6PilotSpec,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        """Verify a candidate CLEAN_PASS against the durable repository graph.
+
+        ``evaluate_stage6_session`` intentionally remains a pure document
+        validator.  This boundary is the repository-backed companion used
+        immediately before a clean result is persisted: it rebuilds the
+        order/fill/provenance/inverse/date evidence from durable rows and
+        binds the three required phase sections to the immutable observations
+        retained for this session.  A caller may submit a structurally valid
+        document, but it cannot turn fabricated IDs, fills, provenance, or
+        phase observations into a clean persisted session.
+        """
+
+        if not isinstance(evidence, Mapping):
+            raise ValueError("CLEAN_PASS durable repository verification requires an evidence object")
+        session_id = str(evidence.get("session_id") or "").strip()
+        if not session_id:
+            raise ValueError("CLEAN_PASS durable repository verification requires session_id")
+
+        observations = self.repository.stage6_validation_observations(session_id)
+        expected_phases = {"PREFLIGHT", "RECOVERY", "FINAL"}
+        observations_by_phase: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        observation_errors: list[str] = []
+        for row in observations:
+            row_session_id = str(row.get("session_id") or "").strip()
+            row_account_id = str(row.get("account_id") or "").strip()
+            phase = str(row.get("phase") or "").strip().upper()
+            if row_session_id != session_id:
+                observation_errors.append("retained observation has a different session identity")
+            if row_account_id != spec.account.id:
+                observation_errors.append(
+                    f"retained {phase or 'unknown'} observation belongs to another account"
+                )
+            if phase not in expected_phases:
+                observation_errors.append(f"retained observation has unsupported phase {phase!r}")
+                continue
+            if not isinstance(row.get("evidence"), Mapping):
+                observation_errors.append(f"retained {phase} observation evidence is not an object")
+                continue
+            observations_by_phase[phase].append(row)
+
+        for phase in sorted(expected_phases):
+            rows = observations_by_phase.get(phase, [])
+            if len(rows) != 1:
+                observation_errors.append(
+                    f"session must retain exactly one {phase} observation; found {len(rows)}"
+                )
+        if observation_errors:
+            raise ValueError(
+                "CLEAN_PASS durable repository verification failed: "
+                + "; ".join(dict.fromkeys(observation_errors))
+            )
+
+        phase_keys = {
+            "PREFLIGHT": "preflight",
+            "RECOVERY": "restart_recovery",
+            "FINAL": "final",
+        }
+        phase_evidence: dict[str, Mapping[str, Any]] = {}
+        for phase, key in phase_keys.items():
+            row_evidence = observations_by_phase[phase][0]["evidence"]
+            nested = row_evidence.get(key)
+            if not isinstance(nested, Mapping):
+                raise ValueError(
+                    "CLEAN_PASS durable repository verification failed: "
+                    f"{phase} observation lacks its {key} evidence"
+                )
+            phase_evidence[key] = nested
+
+        entry_intent_ids = evidence.get("entry_intent_ids")
+        exit_intent_ids = evidence.get("exit_intent_ids")
+        if not isinstance(entry_intent_ids, (list, tuple)) or not isinstance(exit_intent_ids, (list, tuple)):
+            raise ValueError(
+                "CLEAN_PASS durable repository verification failed: intent identity lists are required"
+            )
+        canonical = self.build_session_evidence(
+            spec,
+            session_id=session_id,
+            entry_intent_ids=tuple(str(value) for value in entry_intent_ids),
+            exit_intent_ids=tuple(str(value) for value in exit_intent_ids),
+            preflight=phase_evidence["preflight"],
+            recovery=phase_evidence["restart_recovery"],
+            final=phase_evidence["final"],
+            commit_sha=str(evidence.get("commit_sha") or "UNKNOWN"),
+            trading_date=str(evidence.get("us_trading_date") or "") or None,
+            execution_compatibility=str(evidence.get("execution_compatibility") or "") or None,
+        )
+        missing = canonical.get("evidence_builder_missing")
+        if isinstance(missing, list) and missing:
+            raise ValueError(
+                "CLEAN_PASS durable repository verification failed: "
+                + "; ".join(str(item) for item in missing)
+            )
+
+        critical_fields = (
+            "session_id",
+            "us_trading_date",
+            "derived_us_trading_date",
+            "started_at",
+            "completed_at",
+            "execution_compatibility",
+            "derived_execution_compatibility",
+            "account_id",
+            "environment",
+            "execution_path",
+            "execution_mode",
+            "supervised",
+            "run_ids",
+            "entry_intent_ids",
+            "exit_intent_ids",
+            "evidence_class",
+            "entry",
+            "exit",
+            "execution_provenance",
+            "provenance_complete",
+            "preflight",
+            "restart_recovery",
+            "final",
+        )
+        mismatches: list[str] = []
+        for field_name in critical_fields:
+            if _stable_value(evidence.get(field_name)) != _stable_value(canonical.get(field_name)):
+                mismatches.append(field_name)
+        if mismatches:
+            raise ValueError(
+                "CLEAN_PASS durable repository verification failed; evidence differs from canonical "
+                "durable evidence in: "
+                + ", ".join(mismatches)
+            )
+
     @staticmethod
     def _parse_history_timestamp(value: object, *, field: str) -> datetime:
         text = str(value or "").strip()
