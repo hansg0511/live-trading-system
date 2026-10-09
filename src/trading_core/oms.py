@@ -1779,6 +1779,7 @@ class GenericOMS:
             expected_rows=(*entry_rows, *exit_rows),
             requested_start=start,
             requested_end=observation_time,
+            allow_terminal_neutral_managed_sibling_fills=True,
         )
 
         closure = {
@@ -6176,13 +6177,17 @@ class GenericOMS:
     @staticmethod
     def _validate_authoritative_fill_identities(
         facts: BrokerFactSnapshot,
+        *,
+        reject_exact_duplicates: bool = False,
     ) -> tuple[BrokerFill, ...]:
         """Reject contradictory provider fill identities before any proof path.
 
         Exact replay rows are collapsed for recovery consumers.  A changed
         row sharing either the provider fill identity or its order/dedupe key
         is ambiguous and must block every safety boundary, including Stage 6
-        preflight and proof-gated compensation/residual submission.
+        preflight and proof-gated compensation/residual submission.  The
+        individual round-trip resolver can additionally reject exact replay
+        duplicates because it must classify every fresh extra row itself.
         """
         fills_by_identity: dict[tuple[str, str], BrokerFill] = {}
         fills_by_dedupe: dict[tuple[str, str], BrokerFill] = {}
@@ -6196,6 +6201,10 @@ class GenericOMS:
                 if prior_identity != broker_fill:
                     raise OMSExecutionError(
                         "authoritative account facts contain contradictory duplicate fill identity"
+                    )
+                if reject_exact_duplicates:
+                    raise OMSExecutionError(
+                        "authoritative account facts contain duplicate fill identity"
                     )
                 continue
             dedupe_identity = (str(broker_fill.external_order_id), str(broker_fill.dedupe_key))
@@ -6236,6 +6245,7 @@ class GenericOMS:
         *,
         max_age_seconds: int | float | None = None,
         require_no_open_orders: bool = False,
+        reject_exact_fill_duplicates: bool = False,
     ) -> tuple[BrokerFactSnapshot, tuple[PositionSnapshot, ...], tuple[BrokerOrderSnapshot, ...]]:
         """Read and validate one account-fact snapshot for a safety decision.
 
@@ -6371,7 +6381,10 @@ class GenericOMS:
                 raise OMSExecutionError(
                     f"authoritative fill {broker_fill.dedupe_key} has an invalid quantity"
                 )
-        validated_fills = self._validate_authoritative_fill_identities(facts)
+        validated_fills = self._validate_authoritative_fill_identities(
+            facts,
+            reject_exact_duplicates=reject_exact_fill_duplicates,
+        )
         if validated_fills != facts.fills:
             facts = replace(facts, fills=validated_fills)
         return facts, positions, open_orders
@@ -6457,6 +6470,7 @@ class GenericOMS:
         expected_rows: Sequence[Mapping[str, object]],
         requested_start: datetime,
         requested_end: datetime,
+        allow_terminal_neutral_managed_sibling_fills: bool = False,
     ) -> tuple[BrokerFactSnapshot, BrokerHistoricalOrderFacts]:
         """Validate the complete broker evidence set used by round-trip closure.
 
@@ -6466,7 +6480,9 @@ class GenericOMS:
         current and historical fill against the explicitly named durable rows.
         Unknown fills, duplicate evidence identities, stale history, and
         contradictory order/fill facts therefore fail closed before any local
-        terminal promotion.
+        terminal promotion.  ``allow_terminal_neutral_managed_sibling_fills``
+        is reserved for the individual resolver; the aggregate resolver keeps
+        the default exact-account fill set.
         """
         start = self._parse_timestamp(requested_start)
         end = self._parse_timestamp(requested_end)
@@ -6482,6 +6498,18 @@ class GenericOMS:
             attempt = row.get("attempt")
             if not isinstance(leg, Mapping) or not isinstance(attempt, Mapping):
                 raise OMSExecutionError("round-trip broker evidence lacks durable leg/attempt context")
+            claims = self.repository.broker_orders_for_external_order_id(external_id)
+            if len(claims) != 1 or str(claims[0].get("id")) != str(attempt.get("id")):
+                raise OMSExecutionError(
+                    f"round-trip external order {external_id} has an ambiguous or foreign durable claim"
+                )
+            attempt_metadata = attempt.get("metadata")
+            if not isinstance(attempt_metadata, Mapping):
+                attempt_metadata = self._attempt_metadata(dict(attempt))
+            if self._account_alias_mismatches(account, metadata=attempt_metadata):
+                raise OMSExecutionError(
+                    f"round-trip external order {external_id} has foreign account provenance"
+                )
             expected[external_id] = row
 
         if not expected:
@@ -6491,6 +6519,7 @@ class GenericOMS:
             account,
             max_age_seconds=self.TERMINAL_RECOVERY_WINDOW_SECONDS,
             require_no_open_orders=True,
+            reject_exact_fill_duplicates=allow_terminal_neutral_managed_sibling_fills,
         )
         if positions:
             raise OMSExecutionError("round-trip account is not flat")
@@ -6508,19 +6537,84 @@ class GenericOMS:
                 raise OMSExecutionError(f"{label} is invalid")
             return result
 
+        source_book_ids: set[str] = set()
+        if allow_terminal_neutral_managed_sibling_fills:
+            # The individual resolver is intentionally scoped to the books
+            # named by its selected durable rows.  Do not infer this scope
+            # from arbitrary account-wide broker facts: a missing local claim
+            # keeps the sibling exception unavailable (fail closed).
+            for row in expected.values():
+                attempt = row.get("attempt")
+                if not isinstance(attempt, Mapping):
+                    continue
+                intent_id = self.repository.intent_id_for_broker_order(str(attempt.get("id") or ""))
+                if not intent_id:
+                    continue
+                intent = self.repository.get_intent(intent_id)
+                if intent is not None and str(intent.get("account_id")) == account.id:
+                    book_id = str(intent.get("book_id") or "").strip()
+                    if book_id:
+                        source_book_ids.add(book_id)
+
         def validate_fill_groups(
             items: Sequence[BrokerFill],
             *,
             label: str,
+            allow_sibling_fills: bool = False,
         ) -> dict[str, tuple[BrokerFill, ...]]:
             grouped: dict[str, list[BrokerFill]] = {}
             seen_identity: set[tuple[str, str]] = set()
+            sibling_identities: set[tuple[str, str]] = set()
+            sibling_external_ids: set[str] = set()
+            closed_historical_identities: set[tuple[str, str]] = set()
+            closed_historical_external_ids: set[str] = set()
             for item in items:
                 if not isinstance(item, BrokerFill):
                     raise OMSExecutionError(f"{label} contains a non-normalized fill")
                 external_id = str(item.external_order_id).strip()
                 row = expected.get(external_id)
                 if row is None:
+                    if allow_sibling_fills and external_id in sibling_external_ids:
+                        raise OMSExecutionError(
+                            f"{label} contains multiple sibling fills for external order {external_id}"
+                        )
+                    if allow_sibling_fills and self._is_terminal_neutral_managed_sibling_fill(
+                        account=account,
+                        facts=facts,
+                        broker_fill=item,
+                        source_book_ids=source_book_ids,
+                    ):
+                        sibling_identity = (
+                            external_id,
+                            str(item.external_fill_id or item.dedupe_key).strip(),
+                        )
+                        if not sibling_identity[1] or sibling_identity in sibling_identities:
+                            raise OMSExecutionError(
+                                f"{label} contains a duplicate sibling fill identity {sibling_identity!r}"
+                            )
+                        sibling_identities.add(sibling_identity)
+                        sibling_external_ids.add(external_id)
+                        continue
+                    if allow_sibling_fills and self.is_proof_backed_closed_broker_fill(
+                        account=account,
+                        broker_fill=item,
+                    ):
+                        closed_historical_identity = (
+                            external_id,
+                            str(item.external_fill_id or item.dedupe_key).strip(),
+                        )
+                        if (
+                            not closed_historical_identity[1]
+                            or external_id in closed_historical_external_ids
+                            or closed_historical_identity in closed_historical_identities
+                        ):
+                            raise OMSExecutionError(
+                                f"{label} contains a duplicate proof-backed closed fill identity "
+                                f"{closed_historical_identity!r}"
+                            )
+                        closed_historical_identities.add(closed_historical_identity)
+                        closed_historical_external_ids.add(external_id)
+                        continue
                     raise OMSExecutionError(f"{label} contains unexpected fill {external_id}")
                 identity = (external_id, str(item.external_fill_id or item.dedupe_key).strip())
                 if not identity[1] or identity in seen_identity:
@@ -6576,7 +6670,11 @@ class GenericOMS:
                     raise OMSExecutionError(f"{label} fill {external_id} instrument mismatch")
             return {key: tuple(value) for key, value in grouped.items()}
 
-        validate_fill_groups(facts.fills, label="current account facts")
+        validate_fill_groups(
+            facts.fills,
+            label="current account facts",
+            allow_sibling_fills=allow_terminal_neutral_managed_sibling_fills,
+        )
         history = self._strict_historical_order_facts(
             account,
             requested_start=start,
@@ -6625,6 +6723,8 @@ class GenericOMS:
                 or order.status is not BrokerOrderStatus.FILLED
             ):
                 raise OMSExecutionError(f"historical order {external_id} conflicts with durable fill")
+        # The narrow exception is for additional *fresh* account fills only.
+        # Historical facts remain an exact proof window for the selected pair.
         validate_fill_groups(history.fills, label="historical order facts")
         return facts, history
 
@@ -11928,12 +12028,63 @@ class GenericOMS:
             expected_by_identity[identity] = row
             expected_by_external.setdefault(external_order_id, []).append(row)
 
+        # A compensating exit is scoped to one source book, but the account
+        # snapshot can also contain a completely separate managed book that
+        # was independently opened and closed.  Establish the source book
+        # boundary once so that only a proven, exposure-neutral sibling can be
+        # admitted below.  If a source claim cannot be attributed to a book,
+        # the sibling exception remains unavailable (fail closed).
+        source_book_ids: set[str] = set()
+        for row in expected_rows:
+            attempt = row.get("attempt")
+            if not isinstance(attempt, Mapping):
+                continue
+            attempt_id = str(attempt.get("id") or "").strip()
+            if not attempt_id:
+                continue
+            source_intent_id = self.repository.intent_id_for_broker_order(attempt_id)
+            if not source_intent_id:
+                continue
+            source_intent = self.repository.get_intent(source_intent_id)
+            if source_intent is not None and str(source_intent.get("account_id")) == account.id:
+                source_book_id = str(source_intent.get("book_id") or "").strip()
+                if source_book_id:
+                    source_book_ids.add(source_book_id)
+
         matched: dict[str, list[BrokerFill]] = {}
         matched_identities: set[tuple[str, str]] = set()
+        matched_sibling_identities: set[tuple[str, str]] = set()
+        matched_sibling_external_ids: set[str] = set()
         for broker_fill in facts.fills:
             external_order_id = str(broker_fill.external_order_id).strip()
             candidates = expected_by_external.get(external_order_id)
             if not candidates:
+                if (
+                    source.strip().lower() == "compensating exit"
+                    and external_order_id in matched_sibling_external_ids
+                ):
+                    raise OMSExecutionError(
+                        f"{source} fresh broker facts contain multiple sibling fills "
+                        f"for external order {external_order_id}"
+                    )
+                if source.strip().lower() == "compensating exit" and self._is_terminal_neutral_managed_sibling_fill(
+                    account=account,
+                    facts=facts,
+                    broker_fill=broker_fill,
+                    source_book_ids=source_book_ids,
+                ):
+                    sibling_identity = (
+                        external_order_id,
+                        str(broker_fill.external_fill_id or broker_fill.dedupe_key),
+                    )
+                    if sibling_identity in matched_sibling_identities:
+                        raise OMSExecutionError(
+                            f"{source} fresh broker facts contain a duplicate sibling fill identity "
+                            f"{sibling_identity!r}"
+                        )
+                    matched_sibling_identities.add(sibling_identity)
+                    matched_sibling_external_ids.add(external_order_id)
+                    continue
                 if self.is_proof_backed_closed_broker_fill(
                     account=account,
                     broker_fill=broker_fill,
@@ -11980,6 +12131,239 @@ class GenericOMS:
                 f"{source} fresh broker facts lack complete selected fill evidence: {missing!r}"
             )
         return matched
+
+    def _is_terminal_neutral_managed_sibling_fill(
+        self,
+        *,
+        account: Account,
+        facts: BrokerFactSnapshot,
+        broker_fill: BrokerFill,
+        source_book_ids: set[str],
+    ) -> bool:
+        """Authenticate one terminal, exposure-neutral sibling-book fill.
+
+        Individual proof paths must reject unknown or active account-wide
+        fills, but an independently managed book may have completed its own
+        round-trip without the current source book being explicitly resolved.
+        This exception is deliberately narrower than closed-history replay:
+        it requires one local broker claim, exact immutable fill provenance,
+        a different enabled book, a fully filled terminal intent, zero durable
+        book exposure, and zero current broker position for every instrument
+        in that sibling book.
+        """
+        try:
+            if not self.repository.book_mode_active(account.id) or not source_book_ids:
+                return False
+            if self._account_alias_mismatches(
+                account,
+                account_id=broker_fill.account_id,
+                metadata=broker_fill.metadata,
+            ):
+                return False
+            claims = self.repository.broker_orders_for_external_order_id(
+                broker_fill.external_order_id
+            )
+            if len(claims) != 1:
+                return False
+            claim = claims[0]
+            if str(claim.get("account_id")) != account.id:
+                return False
+            claim_metadata = claim.get("metadata")
+            if not isinstance(claim_metadata, Mapping):
+                claim_metadata = self._attempt_metadata(dict(claim))
+            claim_alias_mismatches = self._account_alias_mismatches(
+                account,
+                metadata=claim_metadata,
+            )
+            if claim_alias_mismatches:
+                return False
+            if str(claim.get("status")) != BrokerOrderStatus.FILLED.value:
+                return False
+            intent_id = self.repository.intent_id_for_broker_order(str(claim.get("id")))
+            if not intent_id:
+                return False
+            intent = self.repository.get_intent(intent_id)
+            if intent is None or str(intent.get("account_id")) != account.id:
+                return False
+            sibling_book_id = str(intent.get("book_id") or "").strip()
+            if not sibling_book_id or sibling_book_id in source_book_ids:
+                return False
+            strategy_id = str(intent.get("strategy_id") or "").strip()
+            if not strategy_id:
+                return False
+            declarations = self.repository.book_allocations(
+                account.id,
+                book_id=sibling_book_id,
+                strategy_id=strategy_id,
+                active_only=True,
+            )
+            if not any(
+                bool(row.get("book_enabled")) and bool(row.get("strategy_enabled"))
+                for row in declarations
+            ):
+                return False
+            if str(intent.get("status")) not in {
+                IntentStatus.FILLED.value,
+                IntentStatus.COMPLETED.value,
+            }:
+                return False
+            legs = tuple(intent.get("legs") or ())
+            if not legs or not all(str(leg.get("status")) == LegStatus.FILLED.value for leg in legs):
+                return False
+            if not self._all_legs_have_fill_evidence(intent_id):
+                return False
+            sibling_attempt_ids: set[str] = set()
+            sibling_external_ids: set[str] = set()
+            for sibling_leg in legs:
+                sibling_attempts = self.repository.broker_orders_for_leg(str(sibling_leg.get("id")))
+                if len(sibling_attempts) != 1:
+                    return False
+                sibling_attempt = sibling_attempts[0]
+                sibling_attempt_id = str(sibling_attempt.get("id") or "").strip()
+                sibling_external_id = str(sibling_attempt.get("external_order_id") or "").strip()
+                if (
+                    not sibling_attempt_id
+                    or sibling_attempt_id in sibling_attempt_ids
+                    or not sibling_external_id
+                    or sibling_external_id in sibling_external_ids
+                    or str(sibling_attempt.get("account_id")) != account.id
+                    or str(sibling_attempt.get("status")) != BrokerOrderStatus.FILLED.value
+                    or not self._attempt_has_complete_fill_evidence(sibling_attempt, sibling_leg)
+                ):
+                    return False
+                sibling_attempt_metadata = sibling_attempt.get("metadata")
+                if not isinstance(sibling_attempt_metadata, Mapping):
+                    sibling_attempt_metadata = self._attempt_metadata(dict(sibling_attempt))
+                if self._account_alias_mismatches(account, metadata=sibling_attempt_metadata):
+                    return False
+                sibling_stored_fills = self.repository.fills_for_broker_order(sibling_attempt_id)
+                if len(sibling_stored_fills) != 1:
+                    return False
+                sibling_stored_fill = sibling_stored_fills[0]
+                if (
+                    str(sibling_stored_fill.get("account_id") or account.id) != account.id
+                    or str(sibling_stored_fill.get("order_leg_id") or "") != str(sibling_leg.get("id"))
+                    or str(sibling_stored_fill.get("external_order_id") or sibling_external_id) != sibling_external_id
+                    or not str(
+                        sibling_stored_fill.get("external_fill_id")
+                        or sibling_stored_fill.get("dedupe_key")
+                        or ""
+                    ).strip()
+                ):
+                    return False
+                sibling_stored_metadata = sibling_stored_fill.get("metadata")
+                if not isinstance(sibling_stored_metadata, Mapping):
+                    return False
+                if (
+                    str(sibling_stored_metadata.get("_external_order_id") or sibling_external_id)
+                    != sibling_external_id
+                    or str(sibling_stored_metadata.get("_instrument_id") or sibling_leg.get("instrument_id"))
+                    != str(sibling_leg.get("instrument_id"))
+                    or str(sibling_stored_metadata.get(self._BROKER_FILL_ACCOUNT_ID_KEY) or account.id)
+                    != account.id
+                ):
+                    return False
+                sibling_attempt_ids.add(sibling_attempt_id)
+                sibling_external_ids.add(sibling_external_id)
+            claim_leg = next(
+                (
+                    leg
+                    for leg in legs
+                    if str(leg.get("id")) == str(claim.get("order_leg_id"))
+                ),
+                None,
+            )
+            if claim_leg is None or not self._attempt_has_complete_fill_evidence(claim, claim_leg):
+                return False
+            if not str(claim.get("external_order_id") or "").strip():
+                return False
+            stored_fills = self.repository.fills_for_broker_order(str(claim.get("id")))
+            if len(stored_fills) != 1:
+                return False
+            stored_fill = stored_fills[0]
+            claim_external_id = str(claim.get("external_order_id") or "").strip()
+            durable_external_id = str(stored_fill.get("external_order_id") or claim_external_id).strip()
+            if not claim_external_id or durable_external_id != claim_external_id:
+                return False
+            if str(stored_fill.get("account_id") or account.id) != account.id:
+                return False
+            if str(stored_fill.get("order_leg_id") or "") != str(claim_leg.get("id")):
+                return False
+            if not str(stored_fill.get("external_fill_id") or stored_fill.get("dedupe_key") or "").strip():
+                return False
+            if self._temporal_fill_mismatches(claim, broker_fill):
+                return False
+            mismatch = self._selected_fill_fact_mismatch(
+                account=account,
+                broker_fill=broker_fill,
+                row={
+                    "instrument_id": str(claim_leg.get("instrument_id")),
+                    "external_order_id": claim_external_id,
+                    "attempt": claim,
+                    "fill": stored_fill,
+                },
+            )
+            if mismatch is not None:
+                return False
+
+            sibling_instruments = {
+                str(leg.get("instrument_id"))
+                for leg in legs
+                if str(leg.get("instrument_id") or "").strip()
+            }
+            allocations = self.repository.book_position_allocations(
+                account.id,
+                book_id=sibling_book_id,
+            )
+            for allocation in allocations:
+                if str(allocation.get("account_id")) != account.id:
+                    return False
+                instrument_id = str(allocation.get("instrument_id") or "").strip()
+                if not instrument_id:
+                    return False
+                sibling_instruments.add(instrument_id)
+                try:
+                    quantity = Decimal(str(allocation.get("signed_quantity", "0")))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not quantity.is_finite():
+                    return False
+                if (
+                    quantity != 0
+                    and str(allocation.get("ownership_class", "")).upper()
+                    != OwnershipClass.MANAGED.value
+                ):
+                    return False
+            durable_exposure = self.repository.book_signed_exposure(
+                account.id,
+                sibling_book_id,
+            )
+            if any(Decimal(str(quantity)) != 0 for quantity in durable_exposure.values()):
+                return False
+            observed_positions: dict[str, Decimal] = {}
+            for position in facts.positions:
+                if self._account_alias_mismatches(
+                    account,
+                    account_id=getattr(position, "account_id", None),
+                    metadata=getattr(position, "metadata", None),
+                ):
+                    return False
+                instrument_id = str(position.instrument_id)
+                try:
+                    quantity = Decimal(str(position.signed_quantity))
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                if not quantity.is_finite():
+                    return False
+                observed_positions[instrument_id] = observed_positions.get(
+                    instrument_id,
+                    Decimal("0"),
+                ) + quantity
+            if any(observed_positions.get(instrument_id, Decimal("0")) != 0 for instrument_id in sibling_instruments):
+                return False
+            return True
+        except (KeyError, InvalidOperation, TypeError, ValueError, sqlite3.Error):
+            return False
 
     def _validate_compensating_source_fill_facts(
         self,

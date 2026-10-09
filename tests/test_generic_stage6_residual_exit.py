@@ -10,6 +10,7 @@ from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner, Stage6RunMod
 from src.trading_core.domain import (
     ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
     Book,
+    BookAllocation,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
     ExecutionEvidenceBaseline,
@@ -21,6 +22,8 @@ from src.trading_core.domain import (
     LegStatus,
     OrderIntent,
     OrderLeg,
+    OwnershipClass,
+    PositionAllocation,
     PositionSnapshot,
     RiskDecisionRecord,
     Side,
@@ -2249,6 +2252,179 @@ class _CompensatingHistoryAdapter(NettedPilotAdapter):
         )
 
 
+def _seed_terminal_managed_sibling_case(tmp_path):
+    """Seed a filled source pair plus a flat, independently managed sibling book."""
+    (
+        account,
+        sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _current_positions,
+        history,
+    ) = _seed_cumulative_compensating_case(tmp_path)
+    allocation_metadata = {
+        "allocation_source": "stage5_clean40",
+        "allocation_provenance": "sibling-proof-test",
+        "allocation_version": 1,
+    }
+    repository.apply_book_allocation_update(
+        account_id=account.id,
+        allocations=(
+            BookAllocation(
+                id="sibling-proof-allocation-a",
+                book_id=sleeves[0].book_id,
+                strategy_id=sleeves[0].strategy_id,
+                account_id=account.id,
+                capital_fraction=Decimal("0.50"),
+                effective_at=NOW,
+                metadata=allocation_metadata,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            BookAllocation(
+                id="sibling-proof-allocation-b",
+                book_id=sleeves[1].book_id,
+                strategy_id=sleeves[1].strategy_id,
+                account_id=account.id,
+                capital_fraction=Decimal("0.50"),
+                effective_at=NOW,
+                metadata=allocation_metadata,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ),
+        version=1,
+        effective_at=NOW,
+        provenance="sibling-proof-test",
+    )
+    sibling_instrument = sleeves[1].instrument_ids[0]
+    sibling_id = "terminal-managed-sibling"
+    sibling_leg_id = f"{sibling_id}-leg"
+    sibling_external_id = "terminal-managed-sibling-external"
+    sibling_dedupe_key = f"moomoo-order-fill:{sibling_external_id}"
+    sibling_evidence_reference = f"{sibling_external_id}:{sibling_dedupe_key}"
+    sibling = OrderIntent(
+        id=sibling_id,
+        idempotency_key=f"{sibling_id}-key",
+        strategy_id=sleeves[1].strategy_id,
+        account_id=account.id,
+        book_id=sleeves[1].book_id,
+        action=IntentAction.ENTER,
+        execution_policy=ExecutionPolicy(),
+        legs=(
+            OrderLeg(
+                id=sibling_leg_id,
+                intent_id=sibling_id,
+                sequence=0,
+                instrument_id=sibling_instrument,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(sibling)
+    repository.transition_intent(sibling_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(sibling_id, IntentStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(sibling_leg_id, LegStatus.SUBMITTING, now=NOW)
+    sibling_order_id = f"{sibling_id}-order"
+    repository.create_broker_order(
+        broker_order_id=sibling_order_id,
+        order_leg_id=sibling_leg_id,
+        account_id=account.id,
+        broker=account.broker,
+        attempt_number=1,
+        client_order_id=f"{sibling_leg_id}:1",
+        submitted_quantity=Decimal("1"),
+        now=NOW,
+    )
+    repository.transition_broker_order(sibling_order_id, BrokerOrderStatus.SUBMITTING, now=NOW)
+    repository.record_submission(
+        sibling_order_id,
+        status=BrokerOrderStatus.FILLED,
+        external_order_id=sibling_external_id,
+        now=NOW,
+        submitted_at=NOW,
+    )
+    # A pre-existing -1 basis plus the sibling +1 entry leaves the sibling
+    # book durably flat without manufacturing an unowned broker position.
+    repository.save_position_allocation(
+        PositionAllocation(
+            id="sibling-proof-basis",
+            account_id=account.id,
+            instrument_id=sibling_instrument,
+            strategy_id=sleeves[1].strategy_id,
+            book_id=sleeves[1].book_id,
+            ownership_class=OwnershipClass.MANAGED,
+            signed_quantity=Decimal("-1"),
+            source_intent_id=sibling_id,
+            updated_at=NOW,
+            metadata={"provenance": "sibling-proof-test"},
+        ),
+        _validation_token=repository._allocation_validation_capability(),
+    )
+    repository.record_fill(
+        Fill(
+            id=f"{sibling_id}-fill",
+            broker_order_id=sibling_order_id,
+            order_leg_id=sibling_leg_id,
+            dedupe_key=sibling_dedupe_key,
+            quantity=Decimal("1"),
+            price=Decimal("200"),
+            filled_at=NOW,
+            received_at=NOW,
+            account_id=account.id,
+            external_order_id=sibling_external_id,
+            evidence_reference=sibling_evidence_reference,
+            evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            metadata={
+                "_broker_fill_account_id": account.id,
+                "_external_order_id": sibling_external_id,
+                "_instrument_id": sibling_instrument,
+                "_evidence_reference": sibling_evidence_reference,
+            },
+        ),
+        now=NOW,
+        _validation_token=repository._fill_validation_capability(),
+    )
+    sibling_fill = BrokerFill(
+        external_order_id=sibling_external_id,
+        dedupe_key=sibling_dedupe_key,
+        quantity=Decimal("1"),
+        price=Decimal("200"),
+        filled_at=NOW,
+        received_at=NOW + timedelta(seconds=30),
+        account_id=account.id,
+        evidence_reference=sibling_evidence_reference,
+        evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        instrument_id=sibling_instrument,
+        metadata={
+            "_broker_fill_account_id": account.id,
+            "_external_order_id": sibling_external_id,
+            "_instrument_id": sibling_instrument,
+            "_evidence_reference": sibling_evidence_reference,
+        },
+    )
+    adapter.facts = replace(adapter.facts, fills=(*history.fills, sibling_fill))
+    return (
+        account,
+        sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        sibling_fill,
+        sibling_instrument,
+    )
+
+
 def _seed_cumulative_compensating_case(tmp_path):
     """Build a full source pair with empty current SIM fill rows."""
     account = make_account()
@@ -2465,6 +2641,422 @@ def test_selected_synthetic_fill_proof_ignores_local_receipt_timestamp(tmp_path)
     )
 
     assert matched == {"synthetic-order": [broker_fill]}
+
+
+def test_compensating_exit_accepts_terminal_flat_managed_sibling_fill(tmp_path):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        _sibling_fill,
+        _sibling_instrument,
+    ) = _seed_terminal_managed_sibling_case(tmp_path)
+
+    result = oms.submit_verified_compensating_exit(
+        source_intent_id=source_id,
+        expected_external_order_ids=external_ids,
+        account=account,
+    )
+
+    assert result["id"].startswith("stage6-compensating-exit-")
+    assert len(adapter.submit_calls) == 2
+    assert repository.get_intent(result["id"]) is not None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("foreign", "nonterminal", "nonzero_exposure", "provenance", "duplicate"),
+)
+def test_compensating_exit_rejects_unproven_managed_sibling_fill(tmp_path, failure):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        sibling_fill,
+        sibling_instrument,
+    ) = _seed_terminal_managed_sibling_case(tmp_path / failure)
+    if failure == "foreign":
+        adapter.facts = replace(adapter.facts, fills=(
+            *adapter.facts.fills[:-1],
+            replace(sibling_fill, account_id="foreign-account"),
+        ))
+    elif failure == "nonterminal":
+        with repository.transaction() as conn:
+            conn.execute(
+                "UPDATE core_order_intents SET status = ? WHERE id = ?",
+                (IntentStatus.WORKING.value, "terminal-managed-sibling"),
+            )
+    elif failure == "nonzero_exposure":
+        repository.save_position_allocation(
+            PositionAllocation(
+                id="sibling-proof-basis",
+                account_id=account.id,
+                instrument_id=sibling_instrument,
+                strategy_id="pilot-strategy",
+                book_id="pilot-book-b",
+                ownership_class=OwnershipClass.MANAGED,
+                signed_quantity=Decimal("1"),
+                source_intent_id="terminal-managed-sibling",
+                updated_at=NOW,
+                metadata={"provenance": "sibling-proof-test"},
+            ),
+            _validation_token=repository._allocation_validation_capability(),
+        )
+    elif failure == "provenance":
+        adapter.facts = replace(adapter.facts, fills=(
+            *adapter.facts.fills[:-1],
+            replace(sibling_fill, price=Decimal("201")),
+        ))
+    else:
+        adapter.facts = replace(
+            adapter.facts,
+            fills=(*adapter.facts.fills, replace(sibling_fill, price=Decimal("201"))),
+        )
+
+    with pytest.raises(OMSExecutionError):
+        oms.submit_verified_compensating_exit(
+            source_intent_id=source_id,
+            expected_external_order_ids=external_ids,
+            account=account,
+        )
+
+    assert adapter.submit_calls == []
+    assert not any(
+        str(row.get("id", "")).startswith("stage6-compensating-exit-")
+        for row in repository.book_intents(account.id)
+    )
+
+
+def test_compensating_exit_rejects_multiple_sibling_fills_for_one_external_order(tmp_path):
+    (
+        account,
+        _sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        external_ids,
+        sibling_fill,
+        _sibling_instrument,
+    ) = _seed_terminal_managed_sibling_case(tmp_path)
+    duplicate_reference = f"{sibling_fill.external_order_id}:duplicate-sibling-fill"
+    duplicate = replace(
+        sibling_fill,
+        external_fill_id="duplicate-sibling-fill",
+        dedupe_key="duplicate-sibling-fill",
+        evidence_reference=duplicate_reference,
+        metadata={
+            **sibling_fill.metadata,
+            "_evidence_reference": duplicate_reference,
+        },
+    )
+    adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills, duplicate))
+
+    with pytest.raises(OMSExecutionError, match="multiple sibling fills"):
+        oms.submit_verified_compensating_exit(
+            source_intent_id=source_id,
+            expected_external_order_ids=external_ids,
+            account=account,
+        )
+
+    assert adapter.submit_calls == []
+    assert not any(
+        str(row.get("id", "")).startswith("stage6-compensating-exit-")
+        for row in repository.book_intents(account.id)
+    )
+
+
+def _seed_individual_roundtrip_with_terminal_sibling(tmp_path):
+    (
+        account,
+        sleeves,
+        repository,
+        adapter,
+        oms,
+        source_id,
+        _external_ids,
+        sibling_fill,
+        _sibling_instrument,
+    ) = _seed_terminal_managed_sibling_case(tmp_path)
+    source = repository.get_intent(source_id)
+    assert source is not None
+    exit_id = "individual-roundtrip-exit"
+    exit_legs = tuple(
+        OrderLeg(
+            id=f"{exit_id}-leg-{index}",
+            intent_id=exit_id,
+            sequence=index,
+            instrument_id=str(leg["instrument_id"]),
+            side=Side.SELL if str(leg["side"]) == Side.BUY.value else Side.BUY,
+            quantity=Decimal(str(leg["quantity"])),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        for index, leg in enumerate(source["legs"])
+    )
+    exit_intent = OrderIntent(
+        id=exit_id,
+        idempotency_key=f"{exit_id}-key",
+        strategy_id=str(source["strategy_id"]),
+        account_id=account.id,
+        book_id=str(source["book_id"]),
+        action=IntentAction.EXIT,
+        execution_policy=ExecutionPolicy(),
+        legs=exit_legs,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(exit_intent)
+    repository.transition_intent(exit_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(exit_id, IntentStatus.SUBMITTING, now=NOW)
+    exit_orders = []
+    exit_broker_fills = []
+    for leg in exit_legs:
+        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        order_id = f"{leg.id}-order"
+        external_id = f"{order_id}-external"
+        repository.create_broker_order(
+            broker_order_id=order_id,
+            order_leg_id=leg.id,
+            account_id=account.id,
+            broker=account.broker,
+            attempt_number=1,
+            client_order_id=f"{leg.id}:1",
+            submitted_quantity=leg.quantity,
+            now=NOW,
+        )
+        repository.transition_broker_order(order_id, BrokerOrderStatus.SUBMITTING, now=NOW)
+        repository.record_submission(
+            order_id,
+            status=BrokerOrderStatus.FILLED,
+            external_order_id=external_id,
+            now=NOW,
+            submitted_at=NOW - timedelta(seconds=3),
+        )
+        dedupe_key = f"moomoo-order-fill:{external_id}"
+        filled_at = NOW - timedelta(seconds=2)
+        metadata = {
+            "_broker_fill_account_id": account.id,
+            "_external_order_id": external_id,
+            "_instrument_id": leg.instrument_id,
+            "_evidence_reference": f"{external_id}:{dedupe_key}",
+        }
+        durable_fill = Fill(
+            id=f"{order_id}-fill",
+            broker_order_id=order_id,
+            order_leg_id=leg.id,
+            dedupe_key=dedupe_key,
+            quantity=leg.quantity,
+            price=Decimal("100"),
+            filled_at=filled_at,
+            received_at=NOW,
+            account_id=account.id,
+            external_order_id=external_id,
+            evidence_reference=f"{external_id}:{dedupe_key}",
+            evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            metadata=metadata,
+        )
+        repository.record_fill(
+            durable_fill,
+            now=NOW,
+            _validation_token=repository._fill_validation_capability(),
+        )
+        exit_broker_fills.append(
+            BrokerFill(
+                external_order_id=external_id,
+                dedupe_key=dedupe_key,
+                quantity=leg.quantity,
+                price=Decimal("100"),
+                filled_at=filled_at,
+                received_at=NOW,
+                account_id=account.id,
+                evidence_reference=f"{external_id}:{dedupe_key}",
+                evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+                instrument_id=leg.instrument_id,
+                metadata=metadata,
+            )
+        )
+        exit_orders.append(
+            BrokerOrderSnapshot(
+                id=f"history-{external_id}",
+                broker_snapshot_id="history-snapshot",
+                account_id=account.id,
+                instrument_id=leg.instrument_id,
+                external_order_id=external_id,
+                side=leg.side,
+                quantity=leg.quantity,
+                filled_quantity=leg.quantity,
+                status=BrokerOrderStatus.FILLED,
+                captured_at=NOW,
+                order_time=NOW - timedelta(seconds=3),
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                metadata={"external_symbol": leg.instrument_id.upper()},
+            )
+        )
+
+    adapter.facts = replace(
+        adapter.facts,
+        positions=(),
+        fills=(*adapter.facts.fills[:-1], *exit_broker_fills, sibling_fill),
+    )
+    adapter.history = replace(
+        adapter.history,
+        orders=(*adapter.history.orders, *exit_orders),
+        fills=(*adapter.history.fills, *exit_broker_fills),
+    )
+    with repository.transaction() as connection:
+        connection.execute(
+            "UPDATE core_order_intents SET created_at = ? WHERE id = ?",
+            ((NOW - timedelta(seconds=20)).isoformat(), source_id),
+        )
+    oms.clock = lambda: NOW + timedelta(seconds=5)
+    return account, repository, adapter, oms, source_id, exit_id
+
+
+def test_individual_roundtrip_ignores_exact_terminal_flat_managed_sibling_fill(tmp_path):
+    account, repository, adapter, oms, entry_id, exit_id = _seed_individual_roundtrip_with_terminal_sibling(tmp_path)
+
+    result = oms.resolve_verified_roundtrip(
+        entry_intent_id=entry_id,
+        exit_intent_id=exit_id,
+        account=account,
+    )
+
+    assert result["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent(entry_id)["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent(exit_id)["status"] == IntentStatus.COMPLETED.value
+    assert not getattr(adapter, "submit_calls", [])
+
+
+def test_individual_roundtrip_ignores_exact_proof_backed_closed_same_book_fill(tmp_path):
+    account, repository, adapter, oms, entry_id, exit_id = _seed_individual_roundtrip_with_terminal_sibling(tmp_path)
+    source_book_id = str(repository.get_intent(entry_id)["book_id"])
+    with repository.transaction() as connection:
+        connection.execute(
+            "UPDATE core_order_intents SET book_id = ? WHERE id = ?",
+            (source_book_id, "terminal-managed-sibling"),
+        )
+        connection.execute(
+            "UPDATE core_position_allocations SET book_id = ? WHERE id = ?",
+            (source_book_id, "sibling-proof-basis"),
+        )
+    repository.mark_verified_roundtrip_intents(
+        ("terminal-managed-sibling",),
+        closure_metadata={
+            "version": 1,
+            "reason": "fresh_broker_and_historical_proof_of_verified_flat_roundtrip",
+            "account_id": account.id,
+            "book_id": source_book_id,
+            "intent_ids": ["terminal-managed-sibling"],
+        },
+        now=NOW,
+        _resolution_capability=repository._resolution_capability(),
+    )
+
+    result = oms.resolve_verified_roundtrip(
+        entry_intent_id=entry_id,
+        exit_intent_id=exit_id,
+        account=account,
+    )
+
+    assert result["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent(entry_id)["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent(exit_id)["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent("terminal-managed-sibling")["status"] == IntentStatus.COMPLETED.value
+    assert not getattr(adapter, "submit_calls", [])
+
+
+def test_individual_roundtrip_rejects_same_book_unclosed_history_atomically(tmp_path):
+    account, repository, adapter, oms, entry_id, exit_id = _seed_individual_roundtrip_with_terminal_sibling(tmp_path)
+    source_book_id = str(repository.get_intent(entry_id)["book_id"])
+    with repository.transaction() as connection:
+        connection.execute(
+            "UPDATE core_order_intents SET book_id = ? WHERE id = ?",
+            (source_book_id, "terminal-managed-sibling"),
+        )
+        connection.execute(
+            "UPDATE core_position_allocations SET book_id = ? WHERE id = ?",
+            (source_book_id, "sibling-proof-basis"),
+        )
+
+    before_entry = repository.get_intent(entry_id)
+    before_exit = repository.get_intent(exit_id)
+    before_events = repository.operational_events(account.id, limit=1000)
+    with pytest.raises(OMSExecutionError):
+        oms.resolve_verified_roundtrip(
+            entry_intent_id=entry_id,
+            exit_intent_id=exit_id,
+            account=account,
+        )
+    assert repository.get_intent(entry_id) == before_entry
+    assert repository.get_intent(exit_id) == before_exit
+    assert repository.operational_events(account.id, limit=1000) == before_events
+    assert repository.get_intent("terminal-managed-sibling")["status"] == IntentStatus.FILLED.value
+    assert not getattr(adapter, "submit_calls", [])
+
+
+@pytest.mark.parametrize("mutation", ("unknown", "same_book", "nonterminal", "economics", "residual", "duplicate"))
+def test_individual_roundtrip_rejects_unproven_sibling_fill_atomically(tmp_path, mutation):
+    account, repository, adapter, oms, entry_id, exit_id = _seed_individual_roundtrip_with_terminal_sibling(
+        tmp_path / mutation
+    )
+    sibling = adapter.facts.fills[-1]
+    if mutation == "unknown":
+        adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills[:-1], replace(sibling, external_order_id="unknown")))
+    elif mutation == "same_book":
+        with repository.transaction() as connection:
+            connection.execute(
+                "UPDATE core_order_intents SET book_id = ? WHERE id = ?",
+                ("pilot-book-a", "terminal-managed-sibling"),
+            )
+    elif mutation == "nonterminal":
+        with repository.transaction() as connection:
+            connection.execute(
+                "UPDATE core_order_intents SET status = ? WHERE id = ?",
+                (IntentStatus.WORKING.value, "terminal-managed-sibling"),
+            )
+    elif mutation == "economics":
+        adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills[:-1], replace(sibling, price=Decimal("201"))))
+    elif mutation == "residual":
+        with repository.transaction() as connection:
+            connection.execute(
+                "UPDATE core_position_allocations SET signed_quantity = ? WHERE id = ?",
+                ("1", "sibling-proof-basis"),
+            )
+    else:
+        duplicate = replace(
+            sibling,
+            external_fill_id="duplicate-sibling-fill",
+            dedupe_key="duplicate-sibling-fill",
+            evidence_reference=f"{sibling.external_order_id}:duplicate-sibling-fill",
+            metadata={
+                **sibling.metadata,
+                "_evidence_reference": f"{sibling.external_order_id}:duplicate-sibling-fill",
+            },
+        )
+        adapter.facts = replace(adapter.facts, fills=(*adapter.facts.fills, duplicate))
+
+    before_entry = repository.get_intent(entry_id)
+    before_exit = repository.get_intent(exit_id)
+    before_events = repository.operational_events(account.id, limit=1000)
+    with pytest.raises(OMSExecutionError):
+        oms.resolve_verified_roundtrip(
+            entry_intent_id=entry_id,
+            exit_intent_id=exit_id,
+            account=account,
+        )
+    assert repository.get_intent(entry_id) == before_entry
+    assert repository.get_intent(exit_id) == before_exit
+    assert repository.operational_events(account.id, limit=1000) == before_events
 
 
 @pytest.mark.parametrize(

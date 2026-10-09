@@ -796,7 +796,12 @@ class Stage6PilotConfig:
 
         if adapter is None:
             adapter = _DryRunAdapter()
-        return Stage6PilotRunner(repository, GenericOMS(repository, adapter, clock=clock), clock=clock)
+        return Stage6PilotRunner(
+            repository,
+            GenericOMS(repository, adapter, clock=clock),
+            clock=clock,
+            dispatch_wait_seconds=self.execution.policy.timeout_seconds,
+        )
 
     def build_moomoo_adapter(self) -> Any:
         """Create the SIM-only adapter; caller must explicitly connect it."""

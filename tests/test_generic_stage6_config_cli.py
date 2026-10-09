@@ -157,6 +157,18 @@ def test_config_materializes_policy_resolver_and_deterministic_confirmation(tmp_
     assert config.spec().execution_policy == config.execution.policy
 
 
+@pytest.mark.parametrize("timeout_seconds", [300, 17])
+def test_build_runner_propagates_configured_dispatch_timeout(tmp_path, timeout_seconds):
+    values = _config_dict(tmp_path)
+    values["execution_policy"]["timeout_seconds"] = timeout_seconds
+    config = Stage6PilotConfig.load(_write_values(tmp_path, values, f"timeout-{timeout_seconds}.json"))
+    repository = SQLiteTradingRepository(config.state_db)
+
+    runner = config.build_runner(repository)
+
+    assert runner.dispatch_wait_seconds == float(timeout_seconds)
+
+
 def test_confirmation_binds_account_routing_db_and_provider_mapping(tmp_path):
     base_values = _config_dict(tmp_path)
     base = Stage6PilotConfig.load(_write_values(tmp_path, base_values, "base.json"))
