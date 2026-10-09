@@ -22,6 +22,7 @@ from src.trading_core.domain import (
     OrderIntent,
     OrderLeg,
     PositionSnapshot,
+    RiskDecisionRecord,
     Side,
 )
 from src.trading_core.oms import GenericOMS, OMSExecutionError
@@ -449,8 +450,10 @@ def _seed_partial_exit_with_terminal_zero_sibling(
     sleeves,
     *,
     source_id: str = "partial-exit-zero-sibling",
+    planned_sibling: bool = False,
+    source_entry_id_override: str | None = None,
 ):
-    """Seed a completed pair followed by a partial EXIT with a proven zero-fill sibling."""
+    """Seed a completed pair followed by a partial EXIT with a zero sibling."""
     first_instrument, second_instrument = sleeves[0].instrument_ids
     entry_id = f"{source_id}-entry"
     entry_legs = (
@@ -565,6 +568,32 @@ def _seed_partial_exit_with_terminal_zero_sibling(
         action=IntentAction.EXIT,
         execution_policy=ExecutionPolicy(),
         legs=exit_legs,
+        metadata=(
+            {
+                "verified_compensating_exit": True,
+                "source_intent_id": source_entry_id_override or entry_id,
+                "source_external_order_ids": [
+                    f"{entry_legs[0].id}-external",
+                    f"{entry_legs[1].id}-external",
+                ],
+                "source_fill_evidence": [
+                    {
+                        "instrument_id": first_instrument,
+                        "external_order_id": f"{entry_legs[0].id}-external",
+                        "quantity": "1",
+                        "price": "100",
+                    },
+                    {
+                        "instrument_id": second_instrument,
+                        "external_order_id": f"{entry_legs[1].id}-external",
+                        "quantity": "1",
+                        "price": "100",
+                    },
+                ],
+            }
+            if planned_sibling
+            else {}
+        ),
         created_at=NOW,
         updated_at=NOW,
     )
@@ -573,6 +602,8 @@ def _seed_partial_exit_with_terminal_zero_sibling(
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in exit_legs:
         repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        if planned_sibling and leg.id == f"{source_id}-leg-b":
+            continue
         order_id = f"{leg.id}-order"
         repository.create_broker_order(
             broker_order_id=order_id,
@@ -616,42 +647,49 @@ def _seed_partial_exit_with_terminal_zero_sibling(
         _validation_token=repository._fill_validation_capability(),
     )
 
-    second_order_id = f"{source_id}-leg-b-order"
     second_external = f"{source_id}-external-b"
-    zero_result = BrokerSubmissionResult(
-        broker_order_id=second_order_id,
-        # The provider created an external order and then terminally rejected
-        # it; ``accepted`` describes the transport admission, not a fill.
-        accepted=True,
-        status=BrokerOrderStatus.REJECTED,
-        external_order_id=second_external,
-        cumulative_filled_quantity=Decimal("0"),
-        no_fill_asserted=True,
-        authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
-        submitted_quantity=Decimal("1"),
-        instrument_id=second_instrument,
-        raw_payload={
-            "response": [{
-                "order_id": second_external,
-                "order_status": BrokerOrderStatus.REJECTED.value,
-                "code": second_instrument,
-                "qty": 1,
-                "dealt_qty": 0,
-                "dealt_avg_price": 0,
-            }],
-        },
-    )
-    zero_metadata = GenericOMS._submission_metadata(zero_result)
-    zero_metadata["terminal_zero_fill_proof"] = True
-    repository.transition_broker_order(second_order_id, BrokerOrderStatus.WORKING, now=NOW)
-    repository.record_submission(
-        second_order_id,
-        status=BrokerOrderStatus.REJECTED,
-        external_order_id=second_external,
-        metadata=zero_metadata,
-        now=NOW,
-    )
-    repository.transition_leg(f"{source_id}-leg-b", LegStatus.REJECTED, now=NOW)
+    if planned_sibling:
+        repository.transition_leg(
+            f"{source_id}-leg-b",
+            LegStatus.RECONCILIATION_REQUIRED,
+            now=NOW,
+        )
+    else:
+        second_order_id = f"{source_id}-leg-b-order"
+        zero_result = BrokerSubmissionResult(
+            broker_order_id=second_order_id,
+            # The provider created an external order and then terminally rejected
+            # it; ``accepted`` describes the transport admission, not a fill.
+            accepted=True,
+            status=BrokerOrderStatus.REJECTED,
+            external_order_id=second_external,
+            cumulative_filled_quantity=Decimal("0"),
+            no_fill_asserted=True,
+            authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+            submitted_quantity=Decimal("1"),
+            instrument_id=second_instrument,
+            raw_payload={
+                "response": [{
+                    "order_id": second_external,
+                    "order_status": BrokerOrderStatus.REJECTED.value,
+                    "code": second_instrument,
+                    "qty": 1,
+                    "dealt_qty": 0,
+                    "dealt_avg_price": 0,
+                }],
+            },
+        )
+        zero_metadata = GenericOMS._submission_metadata(zero_result)
+        zero_metadata["terminal_zero_fill_proof"] = True
+        repository.transition_broker_order(second_order_id, BrokerOrderStatus.WORKING, now=NOW)
+        repository.record_submission(
+            second_order_id,
+            status=BrokerOrderStatus.REJECTED,
+            external_order_id=second_external,
+            metadata=zero_metadata,
+            now=NOW,
+        )
+        repository.transition_leg(f"{source_id}-leg-b", LegStatus.REJECTED, now=NOW)
     current = repository.get_intent(source_id)
     if current is not None and current["status"] != IntentStatus.RECONCILIATION_REQUIRED.value:
         repository.transition_intent(source_id, IntentStatus.RECONCILIATION_REQUIRED, now=NOW)
@@ -739,9 +777,13 @@ def _install_terminal_zero_history(
         status=status,
         captured_at=NOW,
         order_time=NOW,
+        external_account_id=account.external_account_id,
+        authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
     )
 
     def get_historical_order_facts(_account, requested_start, requested_end):  # type: ignore[no-untyped-def]
+        if requested_end <= requested_start:
+            requested_end = requested_start + timedelta(microseconds=1)
         return BrokerHistoricalOrderFacts(
             account_id=account.id,
             requested_start=requested_start,
@@ -755,6 +797,633 @@ def _install_terminal_zero_history(
         )
 
     adapter.get_historical_order_facts = get_historical_order_facts
+
+
+def _seed_filled_residual_exit(
+    repository,
+    account,
+    sleeves,
+    source_id: str,
+    *,
+    side: Side = Side.BUY,
+    quantity: str = "1",
+    residual_suffix: str = "",
+    metadata_kind: str = "residual",
+    source_intent_id_override: str | None = None,
+):
+    """Add one exact MSFT residual EXIT linked to a partial EXIT source."""
+    instrument_id = sleeves[0].instrument_ids[1]
+    residual_id = f"{source_id}-residual{residual_suffix}"
+    leg_id = f"{residual_id}-leg"
+    linked_source_id = source_intent_id_override or source_id
+    metadata = {
+        "verified_residual_exit": metadata_kind == "residual",
+        "verified_compensating_exit": metadata_kind == "compensating",
+        "source_intent_id": linked_source_id,
+        "source_external_order_ids": [f"{source_id}-external-a"],
+    }
+    residual = OrderIntent(
+        id=residual_id,
+        idempotency_key=f"{residual_id}-key",
+        strategy_id="pilot-strategy",
+        account_id=account.id,
+        book_id=sleeves[0].book_id,
+        action=IntentAction.EXIT,
+        execution_policy=ExecutionPolicy(),
+        legs=(
+            OrderLeg(
+                id=leg_id,
+                intent_id=residual_id,
+                sequence=0,
+                instrument_id=instrument_id,
+                side=side,
+                quantity=Decimal(quantity),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ),
+        metadata=metadata,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository.create_intent(residual)
+    repository.transition_intent(residual_id, IntentStatus.RISK_APPROVED, now=NOW)
+    repository.transition_intent(residual_id, IntentStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=NOW)
+    order_id = f"{leg_id}-order"
+    external_id = f"{residual_id}-external"
+    repository.create_broker_order(
+        broker_order_id=order_id,
+        order_leg_id=leg_id,
+        account_id=account.id,
+        broker=account.broker,
+        attempt_number=1,
+        client_order_id=f"{leg_id}:1",
+        submitted_quantity=Decimal(quantity),
+        now=NOW,
+    )
+    repository.transition_broker_order(order_id, BrokerOrderStatus.SUBMITTING, now=NOW)
+    repository.record_submission(
+        order_id,
+        status=BrokerOrderStatus.FILLED,
+        external_order_id=external_id,
+        now=NOW,
+    )
+    repository.record_fill(
+        Fill(
+            id=f"{residual_id}-fill",
+            broker_order_id=order_id,
+            order_leg_id=leg_id,
+            dedupe_key=f"{residual_id}-deal",
+            quantity=Decimal(quantity),
+            price=Decimal("102"),
+            filled_at=NOW,
+            received_at=NOW,
+            account_id=account.id,
+            external_order_id=external_id,
+            evidence_reference=f"{residual_id}-deal",
+            metadata={
+                "_broker_fill_account_id": account.id,
+                "_external_order_id": external_id,
+                "_instrument_id": instrument_id,
+            },
+        ),
+        now=NOW,
+        _validation_token=repository._fill_validation_capability(),
+    )
+    repository.transition_intent(residual_id, IntentStatus.RECONCILIATION_REQUIRED, now=NOW)
+    return residual_id, leg_id, order_id, external_id
+
+
+def _install_chain_history(adapter, repository, account, intent_ids):
+    """Install complete cumulative historical facts for a local chain fixture."""
+    orders = []
+    fills = []
+    for intent_id in intent_ids:
+        intent = repository.get_intent(intent_id)
+        assert intent is not None
+        for leg in intent["legs"]:
+            attempts = repository.broker_orders_for_leg(str(leg["id"]))
+            if not attempts:
+                continue
+            assert len(attempts) == 1
+            attempt = attempts[0]
+            external_id = str(attempt["external_order_id"])
+            orders.append(
+                BrokerOrderSnapshot(
+                    id=f"history-{external_id}",
+                    broker_snapshot_id="history-chain",
+                    account_id=account.id,
+                    instrument_id=str(leg["instrument_id"]),
+                    external_order_id=external_id,
+                    client_order_id=str(attempt["client_order_id"]),
+                    side=Side(str(leg["side"])),
+                    quantity=Decimal(str(leg["quantity"])),
+                    filled_quantity=Decimal(str(leg["cumulative_filled_quantity"])),
+                    status=BrokerOrderStatus.FILLED,
+                    captured_at=NOW,
+                    order_time=NOW,
+                    external_account_id=account.external_account_id,
+                    authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                )
+            )
+            durable = repository.fills_for_broker_order(str(attempt["id"]))
+            assert len(durable) == 1
+            fill = durable[0]
+            fills.append(
+                BrokerFill(
+                    external_order_id=external_id,
+                    dedupe_key=str(fill["dedupe_key"]),
+                    quantity=Decimal(str(fill["quantity"])),
+                    price=Decimal(str(fill["price"])),
+                    filled_at=NOW,
+                    received_at=NOW,
+                    account_id=account.id,
+                    instrument_id=str(leg["instrument_id"]),
+                    evidence_reference=f"{external_id}:{fill['dedupe_key']}",
+                    fee=(
+                        Decimal(str(fill["fee"]))
+                        if fill.get("fee") not in (None, "")
+                        else None
+                    ),
+                    fee_currency=fill.get("fee_currency"),
+                    evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+                )
+            )
+
+    adapter.facts = replace(
+        adapter.facts,
+        captured_at=NOW,
+        positions=(),
+        open_orders=(),
+        fills=(),
+        execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+        execution_evidence_scope=frozenset({"CURRENT_ORDER_SNAPSHOTS"}),
+    )
+
+    def get_historical_order_facts(_account, requested_start, requested_end):  # type: ignore[no-untyped-def]
+        if requested_end <= requested_start:
+            requested_end = requested_start + timedelta(microseconds=1)
+        return BrokerHistoricalOrderFacts(
+            account_id=account.id,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            captured_at=NOW,
+            complete=True,
+            orders=tuple(orders),
+            fills=tuple(fills),
+            execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
+        )
+
+    adapter.get_historical_order_facts = get_historical_order_facts
+
+
+def _prepare_planned_exit_chain(
+    tmp_path,
+    *,
+    residual_side: Side = Side.BUY,
+    residual_quantity: str = "1",
+    source_entry_id_override: str | None = None,
+):
+    account, sleeves, repository, adapter, runner = make_runner(tmp_path)
+    seeded = _seed_partial_exit_with_terminal_zero_sibling(
+        repository,
+        account,
+        sleeves,
+        source_id="partial-exit-planned-chain",
+        planned_sibling=True,
+        source_entry_id_override=source_entry_id_override,
+    )
+    residual_id, _residual_leg_id, _residual_order_id, _residual_external = _seed_filled_residual_exit(
+        repository,
+        account,
+        sleeves,
+        seeded["source_id"],
+        side=residual_side,
+        quantity=residual_quantity,
+    )
+    _install_chain_history(
+        adapter,
+        repository,
+        account,
+        (seeded["entry_id"], seeded["source_id"], residual_id),
+    )
+    return account, sleeves, repository, adapter, runner, seeded, residual_id
+
+
+def test_partial_exit_planned_sibling_closes_entire_provenance_chain(tmp_path):
+    account, sleeves, repository, adapter, runner, seeded, residual_id = _prepare_planned_exit_chain(tmp_path)
+    runner.oms._require_reconciliation(
+        seeded["source_id"],
+        account,
+        category="STAGE6_SUBMISSION_GATE_BLOCKED",
+        entity_type="ORDER_LEG",
+        entity_key=f"{seeded['source_id']}-leg-b",
+        details={"error": "fresh account facts blocked the next leg", "adapter_invoked": False},
+    )
+    entry = repository.get_intent(seeded["entry_id"])
+    assert entry is not None
+    for leg in entry["legs"]:
+        attempt = repository.broker_orders_for_leg(str(leg["id"]))[0]
+        runner.oms._require_reconciliation(
+            seeded["entry_id"],
+            account,
+            category="BROKER_TERMINAL_EVIDENCE_MISSING",
+            entity_type="BROKER_ORDER",
+            entity_key=str(attempt["id"]),
+            details={"external_order_id": str(attempt["external_order_id"])},
+        )
+        runner.oms._record_recovery_action(
+            intent=entry,
+            account=account,
+            action_key=f"TERMINAL_ORDER_EVIDENCE:{attempt['id']}",
+            state="RECONCILIATION_REQUIRED",
+            summary="test source blocker",
+            observed_positions={},
+            remaining_quantities={},
+            metadata={"external_order_id": str(attempt["external_order_id"])},
+        )
+
+    result = runner.resolve_compensated_partial(
+        make_spec(account, sleeves),
+        intent_id=seeded["source_id"],
+    )
+
+    assert result["status"] == IntentStatus.CANCELLED.value
+    assert result["chain_intent_ids"] == sorted(
+        (seeded["entry_id"], seeded["source_id"], residual_id)
+    )
+    assert result["never_submitted_leg_ids"] == [f"{seeded['source_id']}-leg-b"]
+    assert repository.get_intent(seeded["entry_id"])["status"] == IntentStatus.COMPLETED.value
+    source_snapshot = repository.get_intent(seeded["source_id"])
+    assert source_snapshot is not None
+    assert source_snapshot["status"] == IntentStatus.CANCELLED.value
+    assert {leg["status"] for leg in source_snapshot["legs"]} == {
+        LegStatus.FILLED.value,
+        LegStatus.CANCELLED.value,
+    }
+    assert repository.get_intent(residual_id)["status"] == IntentStatus.COMPLETED.value
+    assert repository.broker_orders_for_leg(f"{seeded['source_id']}-leg-b") == []
+    assert repository.open_reconciliation_issues(account.id) == []
+    assert repository.open_recovery_actions(account.id) == []
+    assert adapter.submit_calls == []
+
+
+def test_stage6_submission_gate_records_exact_never_submitted_leg_issue(tmp_path):
+    """The real pre-adapter hook emits the resolver-owned gate blocker shape."""
+    account, sleeves, repository, adapter, runner = make_runner(tmp_path)
+    intent_id = "stage6-gate-reproduction"
+    legs = (
+        OrderLeg(
+            id=f"{intent_id}-leg-a",
+            intent_id=intent_id,
+            sequence=0,
+            instrument_id=sleeves[0].instrument_ids[0],
+            side=Side.BUY,
+            quantity=Decimal("1"),
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+        OrderLeg(
+            id=f"{intent_id}-leg-b",
+            intent_id=intent_id,
+            sequence=1,
+            instrument_id=sleeves[0].instrument_ids[1],
+            side=Side.SELL,
+            quantity=Decimal("1"),
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+    )
+    intent = OrderIntent(
+        id=intent_id,
+        idempotency_key=f"{intent_id}-key",
+        strategy_id="pilot-strategy",
+        account_id=account.id,
+        book_id=None,
+        action=IntentAction.ENTER,
+        execution_policy=ExecutionPolicy(),
+        legs=legs,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    risk = RiskDecisionRecord(
+        id=f"{intent_id}-risk",
+        intent_id=intent_id,
+        approved=True,
+        reason="stage6 gate reproduction",
+        evaluated_at=NOW,
+    )
+
+    def block_second_leg(_intent, leg, _account):  # type: ignore[no-untyped-def]
+        if leg.sequence == 1:
+            raise RuntimeError("fresh account facts blocked the next leg")
+
+    persisted = runner.oms.submit_intent(
+        intent,
+        account=account,
+        risk_decision=risk,
+        _before_submit_leg=block_second_leg,
+    )
+
+    assert persisted["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    gate_issues = [
+        issue
+        for issue in repository.open_reconciliation_issues(account.id)
+        if issue["category"] == "STAGE6_SUBMISSION_GATE_BLOCKED"
+    ]
+    assert len(gate_issues) == 1
+    gate = gate_issues[0]
+    assert gate["entity_type"] == "ORDER_LEG"
+    assert gate["entity_key"] == f"{intent_id}-leg-b"
+    assert gate["issue_key"] == f"STAGE6_SUBMISSION_GATE_BLOCKED:ORDER_LEG:{intent_id}-leg-b"
+    assert runner.oms._issue_details(gate) == {
+        "error": "fresh account facts blocked the next leg",
+        "adapter_invoked": False,
+    }
+    assert repository.broker_orders_for_leg(f"{intent_id}-leg-b") == []
+    assert len(repository.broker_orders_for_leg(f"{intent_id}-leg-a")) == 1
+    assert len(adapter.submit_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "nonflat",
+        "open_orders",
+        "history_missing",
+        "history_mismatch",
+        "history_fill_mismatch",
+        "residual_history_fill_mismatch",
+        "history_authority_missing",
+        "history_account_alias_missing",
+        "history_fill_account_missing",
+        "history_fill_instrument_missing",
+        "planned_marker",
+        "planned_attempt",
+        "planned_fill",
+        "gate_true",
+        "gate_missing",
+        "gate_malformed",
+        "gate_wrong_leg",
+        "extra_residual",
+        "extra_compensating",
+        "residual_side",
+        "residual_quantity",
+        "unrelated_blocker",
+        "source_provenance",
+    ),
+)
+
+
+def test_partial_exit_planned_sibling_proof_rejects_adversarial_facts(tmp_path, failure):
+    account, sleeves, repository, adapter, runner, seeded, residual_id = _prepare_planned_exit_chain(
+        tmp_path,
+        residual_side=Side.SELL if failure == "residual_side" else Side.BUY,
+        residual_quantity="2" if failure == "residual_quantity" else "1",
+        source_entry_id_override="wrong-entry" if failure == "source_provenance" else None,
+    )
+    if failure == "nonflat":
+        adapter.facts = replace(
+            adapter.facts,
+            positions=(
+                PositionSnapshot(
+                    id="unexpected-position",
+                    broker_snapshot_id="unexpected-facts",
+                    account_id=account.id,
+                    instrument_id=sleeves[0].instrument_ids[0],
+                    signed_quantity=Decimal("1"),
+                    average_price=Decimal("100"),
+                    captured_at=NOW,
+                ),
+            ),
+        )
+    elif failure == "open_orders":
+        adapter.facts = replace(
+            adapter.facts,
+            open_orders=(
+                BrokerOrderSnapshot(
+                    id="unexpected-open-order",
+                    broker_snapshot_id="unexpected-facts",
+                    account_id=account.id,
+                    instrument_id=sleeves[0].instrument_ids[0],
+                    external_order_id="unexpected-open-order",
+                    side=Side.SELL,
+                    quantity=Decimal("1"),
+                    filled_quantity=Decimal("0"),
+                    status=BrokerOrderStatus.WORKING,
+                    captured_at=NOW,
+                    order_time=NOW,
+                ),
+            ),
+        )
+    elif failure in {
+        "history_missing",
+        "history_mismatch",
+        "history_fill_mismatch",
+        "residual_history_fill_mismatch",
+        "history_authority_missing",
+        "history_account_alias_missing",
+        "history_fill_account_missing",
+        "history_fill_instrument_missing",
+        "planned_marker",
+    }:
+        original_history = adapter.get_historical_order_facts
+
+        def altered_history(account_arg, start, end):  # type: ignore[no-untyped-def]
+            history = original_history(account_arg, start, end)
+            if failure == "history_missing":
+                return replace(history, complete=False, error="history unavailable")
+            if failure == "history_fill_mismatch":
+                return replace(
+                    history,
+                    fills=(replace(history.fills[0], price=Decimal("999")), *history.fills[1:]),
+                )
+            if failure == "residual_history_fill_mismatch":
+                return replace(
+                    history,
+                    fills=(*history.fills[:-1], replace(history.fills[-1], price=Decimal("999"))),
+                )
+            if failure == "history_authority_missing":
+                return replace(
+                    history,
+                    orders=(replace(history.orders[0], authority=None), *history.orders[1:]),
+                )
+            if failure == "history_account_alias_missing":
+                return replace(
+                    history,
+                    orders=(replace(history.orders[0], external_account_id=None), *history.orders[1:]),
+                )
+            if failure == "history_fill_account_missing":
+                return replace(
+                    history,
+                    fills=(replace(history.fills[0], account_id=None), *history.fills[1:]),
+                )
+            if failure == "history_fill_instrument_missing":
+                return replace(
+                    history,
+                    fills=(replace(history.fills[0], instrument_id=None), *history.fills[1:]),
+                )
+            if failure == "planned_marker":
+                planned_leg_id = f"{seeded['source_id']}-leg-b"
+                return replace(
+                    history,
+                    orders=(
+                        *history.orders,
+                        BrokerOrderSnapshot(
+                            id="history-planned-marker",
+                            broker_snapshot_id="history-planned-marker",
+                            account_id=account.id,
+                            instrument_id=seeded["second_instrument"],
+                            external_order_id="history-unrelated-order",
+                            client_order_id=f"{planned_leg_id}:1",
+                            side=Side.BUY,
+                            quantity=Decimal("1"),
+                            filled_quantity=Decimal("0"),
+                            status=BrokerOrderStatus.REJECTED,
+                            captured_at=NOW,
+                            order_time=NOW,
+                            external_account_id=account.external_account_id,
+                            authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                        ),
+                    ),
+                )
+            return replace(
+                history,
+                orders=(replace(history.orders[0], quantity=Decimal("2")), *history.orders[1:]),
+            )
+        adapter.get_historical_order_facts = altered_history
+    elif failure == "gate_true":
+        runner.oms._require_reconciliation(
+            seeded["source_id"],
+            account,
+            category="STAGE6_SUBMISSION_GATE_BLOCKED",
+            entity_type="ORDER_LEG",
+            entity_key=f"{seeded['source_id']}-leg-b",
+            details={"error": "fresh facts blocked", "adapter_invoked": True},
+        )
+    elif failure == "gate_missing":
+        runner.oms._require_reconciliation(
+            seeded["source_id"],
+            account,
+            category="STAGE6_SUBMISSION_GATE_BLOCKED",
+            entity_type="ORDER_LEG",
+            entity_key=f"{seeded['source_id']}-leg-b",
+            details={"error": "fresh facts blocked"},
+        )
+    elif failure == "gate_malformed":
+        runner.oms._require_reconciliation(
+            seeded["source_id"],
+            account,
+            category="STAGE6_SUBMISSION_GATE_BLOCKED",
+            entity_type="ORDER_LEG",
+            entity_key=f"{seeded['source_id']}-leg-b",
+            details={"error": "fresh facts blocked", "adapter_invoked": "false"},
+        )
+    elif failure == "gate_wrong_leg":
+        runner.oms._require_reconciliation(
+            seeded["source_id"],
+            account,
+            category="STAGE6_SUBMISSION_GATE_BLOCKED",
+            entity_type="ORDER_LEG",
+            entity_key=f"{seeded['source_id']}-wrong-leg",
+            details={"error": "fresh facts blocked", "adapter_invoked": False},
+        )
+    elif failure == "extra_residual":
+        _seed_filled_residual_exit(
+            repository,
+            account,
+            sleeves,
+            seeded["source_id"],
+            residual_suffix="-extra",
+        )
+    elif failure == "extra_compensating":
+        _seed_filled_residual_exit(
+            repository,
+            account,
+            sleeves,
+            seeded["source_id"],
+            residual_suffix="-extra",
+            metadata_kind="compensating",
+            source_intent_id_override=seeded["entry_id"],
+        )
+
+    elif failure == "planned_attempt":
+        planned_leg_id = f"{seeded['source_id']}-leg-b"
+        order_id = f"{planned_leg_id}-unexpected-order"
+        repository.create_broker_order(
+            broker_order_id=order_id,
+            order_leg_id=planned_leg_id,
+            account_id=account.id,
+            broker=account.broker,
+            attempt_number=1,
+            client_order_id=f"{planned_leg_id}:1",
+            submitted_quantity=Decimal("1"),
+            now=NOW,
+        )
+        repository.transition_broker_order(order_id, BrokerOrderStatus.SUBMITTING, now=NOW)
+    elif failure == "planned_fill":
+        planned_leg_id = f"{seeded['source_id']}-leg-b"
+        order_id = f"{planned_leg_id}-unexpected-order"
+        external_id = f"{planned_leg_id}-unexpected-external"
+        repository.create_broker_order(
+            broker_order_id=order_id,
+            order_leg_id=planned_leg_id,
+            account_id=account.id,
+            broker=account.broker,
+            attempt_number=1,
+            client_order_id=f"{planned_leg_id}:1",
+            submitted_quantity=Decimal("1"),
+            now=NOW,
+        )
+        # Model a durable fill claim without using the normal fill API, whose
+        # lifecycle transition would intentionally reject this corrupt planned
+        # sibling before the resolver can exercise its proof gate.
+        with repository.transaction() as conn:
+            conn.execute(
+                """UPDATE core_broker_orders
+                   SET external_order_id = ?, status = ?, submitted_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (external_id, BrokerOrderStatus.FILLED.value, NOW.isoformat(), NOW.isoformat(), order_id),
+            )
+            conn.execute(
+                """INSERT INTO core_fills
+                   (id, broker_order_id, order_leg_id, external_fill_id, dedupe_key,
+                    quantity, price, fee, fee_currency, filled_at, received_at,
+                    evidence_mode, metadata_json)
+                   VALUES (?, ?, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, '{}')""",
+                (
+                    f"{planned_leg_id}-unexpected-fill",
+                    order_id,
+                    planned_leg_id,
+                    f"{planned_leg_id}-unexpected-deal",
+                    "1",
+                    "100",
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                    ExecutionEvidenceMode.INDIVIDUAL_DEALS.value,
+                ),
+            )
+    elif failure == "unrelated_blocker":
+        runner.oms._require_reconciliation(
+            seeded["source_id"],
+            account,
+            category="UNRELATED_BLOCKER",
+            entity_type="ACCOUNT",
+            entity_key=account.id,
+            details={"reason": "unrelated test blocker"},
+        )
+
+    with pytest.raises(OMSExecutionError):
+        runner.resolve_compensated_partial(
+            make_spec(account, sleeves),
+            intent_id=seeded["source_id"],
+        )
+
+    assert adapter.submit_calls == []
+    assert repository.get_intent(seeded["source_id"])["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert repository.get_intent(residual_id)["status"] == IntentStatus.RECONCILIATION_REQUIRED.value
 
 
 class _CancelPartialAdapter(PilotFakeAdapter):
@@ -1081,9 +1750,11 @@ def test_compensated_resolver_accepts_partial_source_leg_after_terminal_cancel(t
         side=Side.BUY,
         quantity=Decimal("2"),
         filled_quantity=Decimal("1"),
-        status=BrokerOrderStatus.PARTIALLY_FILLED,
+        status=BrokerOrderStatus.CANCELLED,
         captured_at=NOW,
         order_time=NOW,
+        external_account_id=account.external_account_id,
+        authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
     )
     adapter._filled_orders[first_external] = replace(
         source_snapshot,
@@ -1092,7 +1763,12 @@ def test_compensated_resolver_accepts_partial_source_leg_after_terminal_cancel(t
 
     def history_without_zero(_account, requested_start, requested_end):  # type: ignore[no-untyped-def]
         snapshots = tuple(
-            item for external_id, item in adapter._filled_orders.items()
+            replace(
+                item,
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+            )
+            for external_id, item in adapter._filled_orders.items()
             if external_id != first_external
         ) + (source_snapshot,)
         return BrokerHistoricalOrderFacts(

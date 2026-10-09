@@ -12,6 +12,7 @@ import pytest
 
 from src.strategies.stat_arb.stage6_pilot import Stage6PilotRunner, Stage6RunMode
 from src.trading_core.domain import (
+    ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
     Book,
     BrokerOrderSnapshot,
     BrokerOrderStatus,
@@ -123,7 +124,11 @@ class HistoricalCliWorkflowAdapter(CliWorkflowAdapter):
 
     def get_historical_order_facts(self, account, requested_start, requested_end):  # type: ignore[no-untyped-def]
         orders = tuple(
-            snapshot
+            replace(
+                snapshot,
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+            )
             for snapshot in self._filled_orders.values()
             if snapshot.account_id == account.id and snapshot.status.value == "FILLED"
         )
@@ -274,11 +279,24 @@ class CliPartialPairWorkflowAdapter(HistoricalCliWorkflowAdapter):
 
     def get_historical_order_facts(self, account, requested_start, requested_end):  # type: ignore[no-untyped-def]
         orders_by_external = {
-            str(snapshot.external_order_id): snapshot
+            str(snapshot.external_order_id): replace(
+                snapshot,
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+            )
             for snapshot in self._filled_orders.values()
             if snapshot.account_id == account.id
         }
-        orders_by_external.update(self._history_orders)
+        orders_by_external.update(
+            {
+                str(external_id): replace(
+                    snapshot,
+                    external_account_id=account.external_account_id,
+                    authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
+                )
+                for external_id, snapshot in self._history_orders.items()
+            }
+        )
         fills = tuple(
             fill for fill in self.facts.fills
             if fill.account_id in (None, account.id)
@@ -1254,6 +1272,78 @@ def test_cli_partial_exit_rejected_zero_fill_residual_and_resolution(
     assert final["final"]["flat"] is True
     assert final["final"]["no_open_orders"] is True
     assert len(adapter.submit_calls) == 1
+
+
+def test_cli_partial_exit_planned_sibling_resolves_exact_three_intent_chain(
+    tmp_path, monkeypatch, capsys
+):
+    """The public resolver closes entry, partial comp, and linked residual atomically by proof scope."""
+
+    values, runtime_now = _fresh_cli_values(tmp_path, monkeypatch)
+    config_path = tmp_path / "partial-exit-planned-chain.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    adapter = CliPartialPairWorkflowAdapter()
+    _install_cli_fake(monkeypatch, adapter, now=runtime_now)
+    monkeypatch.setattr(residual_fixtures, "NOW", runtime_now)
+
+    assert _run_cli(capsys, ["dry-run", "--config", str(config_path), "--json"])[0] == 0
+    config = Stage6PilotConfig.load(config_path)
+    repository = SQLiteTradingRepository(config.state_db)
+    sleeves = make_sleeves(config.account.id)
+    seeded = residual_fixtures._seed_partial_exit_with_terminal_zero_sibling(
+        repository,
+        config.account,
+        sleeves,
+        source_id="cli-partial-exit-planned-chain",
+        planned_sibling=True,
+    )
+    residual_id, _leg_id, _order_id, _external_id = residual_fixtures._seed_filled_residual_exit(
+        repository,
+        config.account,
+        sleeves,
+        seeded["source_id"],
+    )
+    residual_fixtures._install_chain_history(
+        adapter,
+        repository,
+        config.account,
+        (seeded["entry_id"], seeded["source_id"], residual_id),
+    )
+
+    code, payload = _run_cli(
+        capsys,
+        [
+            "resolve-compensated-partial",
+            "--config",
+            str(config_path),
+            "--intent-id",
+            seeded["source_id"],
+            "--json",
+        ],
+    )
+
+    assert code == 0, json.dumps(payload, indent=2, sort_keys=True, default=str)
+    assert payload["broker_contacted"] is True
+    assert payload["orders_submitted"] == 0
+    assert payload["status"] == IntentStatus.CANCELLED.value
+    assert repository.get_intent(seeded["entry_id"])["status"] == IntentStatus.COMPLETED.value
+    assert repository.get_intent(seeded["source_id"])["status"] == IntentStatus.CANCELLED.value
+    assert repository.get_intent(residual_id)["status"] == IntentStatus.COMPLETED.value
+    assert repository.open_reconciliation_issues(config.account.id) == []
+    assert repository.open_recovery_actions(config.account.id) == []
+    assert adapter.submit_calls == []
+    assert adapter.cancel_calls == []
+
+    final_code, final = _run_cli(
+        capsys, ["final-state", "--config", str(config_path), "--json"]
+    )
+    # Reconciliation closure does not manufacture a verified Stage 6
+    # execution baseline, so the historical Oct 7 session remains non-pass.
+    assert final_code == 2, json.dumps(final, indent=2, sort_keys=True)
+    assert final["final_state_passed"] is False
+    assert final["final"]["flat"] is True
+    assert final["final"]["no_open_orders"] is True
+    assert adapter.submit_calls == []
 
 
 def test_cli_compensation_rth_closes_after_first_leg_and_remains_recoverable(

@@ -10,6 +10,7 @@ import shutil
 import pytest
 
 from src.trading_core.domain import (
+    ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
     Account,
     AssetClass,
     Book,
@@ -479,6 +480,31 @@ class _CompensatedPartialAdapter:
         return self.facts
 
     def get_historical_order_facts(self, account, start, end):
+        fills = tuple(
+            BrokerFill(
+                external_order_id=order.external_order_id,
+                dedupe_key=f"history-fill:{order.external_order_id}",
+                quantity=order.filled_quantity,
+                price=(
+                    Decimal("101")
+                    if any(
+                        token in order.external_order_id.lower()
+                        for token in ("compensation", "compensated-exit")
+                    )
+                    else Decimal("100")
+                ),
+                filled_at=order.order_time or order.captured_at,
+                received_at=order.captured_at,
+                account_id=account.id,
+                instrument_id=order.instrument_id,
+                evidence_reference=(
+                    f"{order.external_order_id}:history-fill:{order.external_order_id}"
+                ),
+                evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
+            )
+            for order in self.orders
+            if order.filled_quantity > 0
+        )
         return BrokerHistoricalOrderFacts(
             account_id=account.id,
             requested_start=start,
@@ -486,6 +512,7 @@ class _CompensatedPartialAdapter:
             captured_at=end,
             complete=True,
             orders=self.orders,
+            fills=fills,
             execution_evidence_mode=ExecutionEvidenceMode.CUMULATIVE_ORDER_SNAPSHOTS,
             execution_evidence_scope=frozenset({"HISTORICAL_ORDER_SNAPSHOTS"}),
             metadata={"source": "offline-compensated-proof"},
@@ -666,6 +693,8 @@ def _seed_compensated_partial(repository: SQLiteTradingRepository):
             status=BrokerOrderStatus.FILLED,
             captured_at=NOW,
             order_time=NOW,
+            external_account_id=_account().external_account_id,
+            authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
         ),
         BrokerOrderSnapshot(
             id="proof-exit-snapshot",
@@ -679,6 +708,8 @@ def _seed_compensated_partial(repository: SQLiteTradingRepository):
             status=BrokerOrderStatus.FILLED,
             captured_at=NOW,
             order_time=NOW,
+            external_account_id=_account().external_account_id,
+            authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
         ),
     )
     return entry, exit_intent, snapshots
@@ -814,6 +845,32 @@ def test_compensated_closure_proves_capacity_neutral_intent_group(tmp_path):
         "compat-book",
         exclude_intent_ids=closed_ids,
     ) == {}
+
+
+def test_cancelled_zero_fill_with_broker_attempt_is_not_capacity_neutral(tmp_path):
+    repository = _repository(tmp_path)
+    entry, exit_intent, snapshots = _seed_compensated_partial(repository)
+    oms = GenericOMS(
+        repository,
+        _CompensatedPartialAdapter(snapshots),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+
+    oms.resolve_compensated_partial_intent(entry.id, account=_account())
+    repository.create_broker_order(
+        broker_order_id="late-cancelled-sibling-attempt",
+        order_leg_id="compensated-entry-leg-b",
+        account_id=_account().id,
+        broker=_account().broker,
+        attempt_number=1,
+        client_order_id="compensated-entry-leg-b:1",
+        submitted_quantity=Decimal("1"),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    closed_ids = oms._closed_historical_intent_ids(_account())
+    assert entry.id not in closed_ids
+    assert exit_intent.id not in closed_ids
 
 
 def test_proof_closed_intent_is_not_demoted_by_restart_recovery(tmp_path):
@@ -991,6 +1048,8 @@ def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_
             status=BrokerOrderStatus.FILLED,
             captured_at=NOW,
             order_time=NOW,
+                external_account_id=account.external_account_id,
+                authority=ADAPTER_ORDER_SNAPSHOT_AUTHORITY,
         )
 
     source_snapshot = add_filled_leg(source, source.legs[0], "partial-exit-source-external", "100")
@@ -1036,6 +1095,39 @@ def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_
     )
     repository.transition_intent(compensation_id, IntentStatus.COMPLETED, now=NOW)
 
+    for basis_id, instrument_id, quantity, side in (
+        ("basis-entry-a", "compat-instrument", "2", Side.BUY),
+        ("basis-entry-b", "compat-instrument-2", "2", Side.SELL),
+    ):
+        repository.create_intent(
+            OrderIntent(
+                id=basis_id,
+                idempotency_key=f"{basis_id}-key",
+                strategy_id="compat-strategy",
+                account_id=account.id,
+                book_id="compat-book",
+                action=IntentAction.ENTER,
+                status=IntentStatus.COMPLETED,
+                execution_policy=ExecutionPolicy(),
+                legs=(
+                    OrderLeg(
+                        id=f"{basis_id}-leg",
+                        intent_id=basis_id,
+                        sequence=0,
+                        instrument_id=instrument_id,
+                        side=side,
+                        quantity=Decimal(quantity),
+                        status=LegStatus.FILLED,
+                        cumulative_filled_quantity=Decimal(quantity),
+                        created_at=NOW,
+                        updated_at=NOW,
+                    ),
+                ),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
     for instrument_id, quantity, source_intent_id in (
         ("compat-instrument", "2", "basis-entry-a"),
         ("compat-instrument-2", "-2", "basis-entry-b"),
@@ -1049,7 +1141,7 @@ def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_
                 signed_quantity=Decimal(quantity),
                 strategy_id="compat-strategy",
                 book_id="compat-book",
-                source_intent_id=source_id,
+                source_intent_id=source_intent_id,
                 updated_at=NOW,
                 metadata={"provenance": "partial-exit-test-basis"},
             ),

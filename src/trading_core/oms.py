@@ -5712,7 +5712,10 @@ class GenericOMS:
                     IntentStatus.RECONCILIATION_REQUIRED.value,
                 }
                 or str(closure.get("reason", ""))
-                != "fresh_broker_and_historical_proof_of_compensated_partial_entry"
+                not in {
+                    "fresh_broker_and_historical_proof_of_compensated_partial_entry",
+                    "fresh_broker_and_historical_proof_of_compensated_partial_exit",
+                }
                 or str(closure.get("account_id", account.id)) != account.id
                 or not str(closure.get("verified_at", "")).strip()
             ):
@@ -5721,6 +5724,9 @@ class GenericOMS:
             if not isinstance(compensation_ids, list) or not compensation_ids:
                 continue
             candidate_ids = {intent_id, *(str(value) for value in compensation_ids)}
+            source_entry_id = str(closure.get("source_entry_intent_id") or "").strip()
+            if source_entry_id:
+                candidate_ids.add(source_entry_id)
             valid = True
             for candidate_id in candidate_ids:
                 candidate = self.repository.get_intent(candidate_id)
@@ -5751,6 +5757,17 @@ class GenericOMS:
                                 valid = False
                                 break
                         except (InvalidOperation, TypeError, ValueError):
+                            valid = False
+                            break
+                        # A zero cumulative quantity is not enough to make a
+                        # cancelled leg a never-submitted capacity-neutral
+                        # leg.  An attempted order (or a durable fill row)
+                        # must remain part of the live historical claim and
+                        # cannot be hidden by the closure envelope.
+                        if self.repository.broker_orders_for_leg(str(leg["id"])):
+                            valid = False
+                            break
+                        if self.repository.fills_for_leg(str(leg["id"])):
                             valid = False
                             break
                     else:
@@ -7854,6 +7871,37 @@ class GenericOMS:
         if source_action not in {IntentAction.ENTER.value, IntentAction.EXIT.value}:
             raise OMSExecutionError("compensated partial recovery supports only ENTER or EXIT intents")
 
+        # A verified compensating EXIT retains an exact provenance link to
+        # the fully-filled ENTER that created the exposure.  Keep that
+        # upstream intent in the same proof envelope when resolving a partial
+        # EXIT; otherwise the resolver could close the EXIT/residual pair
+        # while leaving the original entry's historical blockers alive.
+        source_entry_intent_id: str | None = None
+        source_entry: Mapping[str, object] | None = None
+        intent_metadata = intent.get("metadata")
+        if (
+            source_action == IntentAction.EXIT.value
+            and isinstance(intent_metadata, Mapping)
+            and intent_metadata.get("verified_compensating_exit") is True
+        ):
+            candidate_source_id = str(intent_metadata.get("source_intent_id") or "").strip()
+            if not candidate_source_id or candidate_source_id == intent_id:
+                raise OMSExecutionError("compensating EXIT has invalid source-entry provenance")
+            try:
+                source_entry = self._required_intent(candidate_source_id)
+            except KeyError as exc:
+                raise OMSExecutionError("compensating EXIT source-entry provenance is not durable") from exc
+            if (
+                str(source_entry.get("account_id")) != account.id
+                or str(source_entry.get("book_id") or "") != str(intent.get("book_id") or "")
+                or str(source_entry.get("strategy_id") or "") != str(intent.get("strategy_id") or "")
+                or str(source_entry.get("action")) != IntentAction.ENTER.value
+            ):
+                raise OMSExecutionError(
+                    "compensating EXIT source-entry provenance does not match account/book/strategy/action"
+                )
+            source_entry_intent_id = candidate_source_id
+
         # A partial EXIT may be completed by the explicit residual route when
         # one sibling exited and another sibling was durably rejected/cancelled
         # with authenticated zero-fill evidence.  Discover only an exact
@@ -7877,6 +7925,10 @@ class GenericOMS:
                     and str(metadata.get("source_intent_id")) == intent_id
                 ):
                     residual_candidate_ids.add(candidate_id)
+            if source_entry_intent_id is not None and len(residual_candidate_ids) != 1:
+                raise OMSExecutionError(
+                    "compensating EXIT chain must contain exactly one residual EXIT intent"
+                )
 
         # This scan may create the normal aged-terminal blocker.  The proof
         # below may resolve only the exact aged attempts it covers.
@@ -7933,6 +7985,30 @@ class GenericOMS:
                     for item in value
                 )
             return False
+
+        if source_action == IntentAction.EXIT.value and source_entry_intent_id is not None:
+            # The direct three-intent route is intentionally narrower than
+            # the generic partial-compensation resolver.  A second
+            # compensating EXIT for the same ENTER is an unresolved branch,
+            # even when its own fill is otherwise terminal and could be
+            # netted into the proof.
+            for candidate_row in self.repository.book_intents(
+                account.id, book_id=str(intent.get("book_id") or "")
+            ):
+                candidate_id = str(candidate_row.get("id") or "")
+                if candidate_id in {intent_id, *residual_candidate_ids}:
+                    continue
+                candidate = self.repository.get_intent(candidate_id)
+                candidate_metadata = candidate.get("metadata") if candidate is not None else None
+                if (
+                    isinstance(candidate_metadata, Mapping)
+                    and candidate_metadata.get("verified_compensating_exit") is True
+                    and str(candidate_metadata.get("source_intent_id") or "")
+                    == source_entry_intent_id
+                ):
+                    raise OMSExecutionError(
+                        "compensating EXIT chain has an extra compensating branch"
+                    )
 
         def validate_local_fill_leg(leg: Mapping[str, object]) -> tuple[dict[str, object], Decimal]:
             leg_id = str(leg["id"])
@@ -8093,11 +8169,76 @@ class GenericOMS:
                 )
             return {"leg": leg, "attempt": attempt}
 
+        source_entry_proofs: list[dict[str, object]] = []
+        if source_entry is not None:
+            if str(source_entry.get("status")) not in {
+                IntentStatus.FILLED.value,
+                IntentStatus.COMPLETED.value,
+                IntentStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                raise OMSExecutionError("compensating EXIT source entry is not terminal")
+            for source_leg in source_entry.get("legs", ()):
+                proof, _quantity = validate_local_fill_leg(source_leg)
+                source_entry_proofs.append(proof)
+            source_metadata = intent_metadata
+            declared_source_ids = {
+                str(value).strip()
+                for value in (
+                    source_metadata.get("source_external_order_ids", ())
+                    if isinstance(source_metadata, Mapping)
+                    else ()
+                )
+                if str(value).strip()
+            }
+            actual_source_ids = {
+                str(proof["attempt"].get("external_order_id") or "").strip()
+                for proof in source_entry_proofs
+            }
+            if declared_source_ids != actual_source_ids:
+                raise OMSExecutionError("compensating EXIT source-entry external-order provenance mismatches durable fills")
+            declared_fill_evidence = (
+                source_metadata.get("source_fill_evidence", ())
+                if isinstance(source_metadata, Mapping)
+                else ()
+            )
+            if not isinstance(declared_fill_evidence, (list, tuple)):
+                raise OMSExecutionError("compensating EXIT source-entry fill provenance is missing")
+            declared_by_instrument = {
+                str(item.get("instrument_id")): item
+                for item in declared_fill_evidence
+                if isinstance(item, Mapping) and str(item.get("instrument_id") or "").strip()
+            }
+            if len(declared_by_instrument) != len(source_entry_proofs):
+                raise OMSExecutionError("compensating EXIT source-entry fill provenance is incomplete")
+            for proof in source_entry_proofs:
+                leg = proof["leg"]
+                instrument = str(leg.get("instrument_id"))
+                declared = declared_by_instrument.get(instrument)
+                fills = proof.get("fills") or ()
+                if declared is None or len(fills) != 1:
+                    raise OMSExecutionError("compensating EXIT source-entry fill provenance is ambiguous")
+                fill = fills[0]
+                if (
+                    str(declared.get("external_order_id") or "")
+                    != str(proof["attempt"].get("external_order_id") or "")
+                    or parse_decimal(declared.get("quantity"), f"source entry {instrument} quantity")
+                    != parse_decimal(proof.get("verified_quantity"), f"source entry {instrument} fill quantity")
+                    or parse_decimal(declared.get("price"), f"source entry {instrument} price")
+                    != parse_decimal(fill.get("price"), f"source entry {instrument} durable price")
+                ):
+                    raise OMSExecutionError("compensating EXIT source-entry fill provenance mismatches durable fills")
+
         submitted_legs: list[dict[str, object]] = []
         unsent_legs: list[str] = []
+        never_submitted_legs: dict[str, dict[str, object]] = {}
         terminal_zero_legs: dict[str, dict[str, object]] = {}
         entry_by_instrument: dict[str, Decimal] = {}
         expected_external_ids: dict[str, dict[str, object]] = {}
+        for proof in source_entry_proofs:
+            external_id = str(proof["attempt"].get("external_order_id") or "").strip()
+            if not external_id or external_id in expected_external_ids:
+                raise OMSExecutionError("compensating EXIT source-entry order identity is ambiguous")
+            expected_external_ids[external_id] = proof
         for leg in intent["legs"]:
             status = str(leg.get("status"))
             attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
@@ -8111,6 +8252,7 @@ class GenericOMS:
                 }:
                     raise OMSExecutionError(f"leg {leg['id']} has ambiguous unsent evidence")
                 unsent_legs.append(str(leg["id"]))
+                never_submitted_legs[str(leg["id"])] = {"leg": leg}
                 continue
             if cumulative == 0:
                 zero_proof = validate_terminal_zero_leg(leg)
@@ -8125,6 +8267,8 @@ class GenericOMS:
                 proof, quantity = validate_local_fill_leg(leg)
             submitted_legs.append(proof)
             external_id = str(proof["attempt"].get("external_order_id"))
+            if external_id in expected_external_ids:
+                raise OMSExecutionError("compensated chain reuses a broker order identity")
             expected_external_ids[external_id] = proof
             instrument = str(leg.get("instrument_id"))
             signed = quantity if str(leg.get("side")) == Side.BUY.value else -quantity
@@ -8132,6 +8276,22 @@ class GenericOMS:
 
         if not submitted_legs or not unsent_legs:
             raise OMSExecutionError("intent is not a partial ENTER/EXIT with both filled and unsent legs")
+
+        if never_submitted_legs:
+            for row in self.repository.position_allocations(account.id):
+                if str(row.get("source_intent_id") or "") != intent_id:
+                    continue
+                allocation_quantity = parse_decimal(
+                    row.get("signed_quantity", "0"),
+                    f"allocation {row.get('id')} quantity",
+                )
+                if allocation_quantity == 0:
+                    continue
+                if any(
+                    str(row.get("instrument_id")) == str(proof["leg"].get("instrument_id"))
+                    for proof in never_submitted_legs.values()
+                ):
+                    raise OMSExecutionError("never-submitted leg has durable position allocation")
 
         facts, normalized_positions, normalized_open_orders = self._strict_authoritative_account_facts(
             account,
@@ -8183,6 +8343,11 @@ class GenericOMS:
         if not callable(history_getter):
             raise OMSExecutionError("bounded historical order facts are required")
         window_start = parse_time(intent.get("created_at"), "intent created_at")
+        if source_entry is not None:
+            window_start = min(
+                window_start,
+                parse_time(source_entry.get("created_at"), "source entry created_at"),
+            )
         history_requested_end = self._now()
         try:
             historical = history_getter(account, window_start, history_requested_end)
@@ -8214,6 +8379,226 @@ class GenericOMS:
         history_fills_by_external: dict[str, list[BrokerFill]] = {}
         for broker_fill in historical.fills:
             history_fills_by_external.setdefault(str(broker_fill.external_order_id), []).append(broker_fill)
+
+        def validate_historical_fill_evidence(
+            external_id: str,
+            proof: Mapping[str, object],
+            history_fills: Sequence[BrokerFill],
+        ) -> None:
+            """Bind provider deal economics to the exact durable fill rows."""
+            if not history_fills:
+                return
+            durable_fills = tuple(proof.get("fills") or ())
+            if historical.execution_evidence_mode is ExecutionEvidenceMode.INDIVIDUAL_DEALS:
+                if len(history_fills) != len(durable_fills):
+                    raise OMSExecutionError(
+                        f"individual-deal history count conflicts with durable fills for {external_id}"
+                    )
+                durable_by_identity = {
+                    str(fill.get("external_fill_id") or fill.get("dedupe_key") or "").strip(): fill
+                    for fill in durable_fills
+                }
+                historical_by_identity = {
+                    str(fill.external_fill_id or fill.dedupe_key).strip(): fill
+                    for fill in history_fills
+                }
+                if (
+                    len(durable_by_identity) != len(durable_fills)
+                    or len(historical_by_identity) != len(history_fills)
+                    or set(durable_by_identity) != set(historical_by_identity)
+                ):
+                    raise OMSExecutionError(
+                        f"individual-deal history identity conflicts with durable fills for {external_id}"
+                    )
+                for identity, durable_fill in durable_by_identity.items():
+                    historical_fill = historical_by_identity[identity]
+                    durable_fee = (
+                        parse_decimal(durable_fill.get("fee"), f"durable fill {identity} fee")
+                        if durable_fill.get("fee") not in (None, "")
+                        else None
+                    )
+                    if (
+                        historical_fill.quantity != parse_decimal(
+                            durable_fill.get("quantity"), f"durable fill {identity} quantity"
+                        )
+                        or historical_fill.price != parse_decimal(
+                            durable_fill.get("price"), f"durable fill {identity} price"
+                        )
+                        or historical_fill.fee != durable_fee
+                        or historical_fill.fee_currency != durable_fill.get("fee_currency")
+                    ):
+                        raise OMSExecutionError(
+                            f"individual-deal history economics conflict with durable fills for {external_id}"
+                        )
+            elif len(history_fills) == 1 and len(durable_fills) == 1:
+                durable_fill = durable_fills[0]
+                historical_fill = history_fills[0]
+                if (
+                    historical_fill.quantity != parse_decimal(
+                        durable_fill.get("quantity"), f"durable fill {external_id} quantity"
+                    )
+                    or historical_fill.price != parse_decimal(
+                        durable_fill.get("price"), f"durable fill {external_id} price"
+                    )
+                    or historical_fill.fee
+                    != (
+                        parse_decimal(durable_fill.get("fee"), f"durable fill {external_id} fee")
+                        if durable_fill.get("fee") not in (None, "")
+                        else None
+                    )
+                    or historical_fill.fee_currency != durable_fill.get("fee_currency")
+                ):
+                    raise OMSExecutionError(
+                        f"historical fill economics conflict with durable fills for {external_id}"
+                    )
+            elif durable_fills:
+                durable_value = sum(
+                    (
+                        parse_decimal(fill.get("quantity"), f"durable fill {external_id} quantity")
+                        * parse_decimal(fill.get("price"), f"durable fill {external_id} price")
+                        for fill in durable_fills
+                    ),
+                    Decimal("0"),
+                )
+                historical_value = sum(
+                    (fill.quantity * fill.price for fill in history_fills),
+                    Decimal("0"),
+                )
+                if historical_value != durable_value:
+                    raise OMSExecutionError(
+                        f"historical fill economics conflict with durable fills for {external_id}"
+                    )
+
+        def validate_historical_order_snapshot(
+            external_id: str,
+            proof: Mapping[str, object],
+            snapshot: BrokerOrderSnapshot,
+            *,
+            allowed_statuses: set[BrokerOrderStatus],
+            expected_filled_quantity: Decimal,
+        ) -> None:
+            """Require one adapter-authenticated, account-bound order row.
+
+            Historical rows are execution evidence, not merely a convenient
+            order-list lookup.  Keep this proof stricter than the ordinary
+            current-order compatibility path: the adapter authority marker,
+            both account aliases, and every normalized order field must be
+            present and exact before a local lifecycle claim can be closed.
+            """
+            if snapshot.authority != ADAPTER_ORDER_SNAPSHOT_AUTHORITY:
+                raise OMSExecutionError(
+                    f"historical order {external_id} lacks adapter order authority"
+                )
+            if not str(snapshot.external_account_id or "").strip():
+                raise OMSExecutionError(
+                    f"historical order {external_id} lacks external account provenance"
+                )
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=snapshot.account_id,
+                external_account_id=snapshot.external_account_id,
+                metadata=snapshot.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"historical order {external_id} has account provenance mismatch: {aliases}"
+                )
+            leg = proof["leg"]
+            expected_quantity = parse_decimal(
+                leg.get("quantity"), f"history {external_id} quantity"
+            )
+            quantity = parse_decimal(
+                proof.get("verified_quantity", expected_quantity),
+                f"history {external_id} filled quantity",
+            )
+            if (
+                snapshot.account_id != account.id
+                or snapshot.instrument_id != str(leg.get("instrument_id"))
+                or snapshot.side.value != str(leg.get("side"))
+                or snapshot.quantity != expected_quantity
+                or snapshot.filled_quantity != expected_filled_quantity
+                or snapshot.status not in allowed_statuses
+            ):
+                raise OMSExecutionError(
+                    f"historical order {external_id} conflicts with the durable leg"
+                )
+            if (
+                proof.get("verified_quantity") is not None
+                and expected_filled_quantity != quantity
+            ):
+                raise OMSExecutionError(
+                    f"historical order {external_id} filled quantity is not the proven quantity"
+                )
+            quantity_mismatches = self._broker_order_quantity_mismatches(
+                snapshot.status,
+                snapshot.quantity,
+                snapshot.filled_quantity,
+            )
+            if quantity_mismatches:
+                raise OMSExecutionError(
+                    f"historical order {external_id} has contradictory quantity facts: {quantity_mismatches}"
+                )
+            attempt = proof["attempt"]
+            try:
+                attempt_status = BrokerOrderStatus(str(attempt.get("status")))
+            except (TypeError, ValueError) as exc:
+                raise OMSExecutionError(
+                    f"durable attempt {external_id} has an invalid broker status"
+                ) from exc
+            if snapshot.status is not attempt_status:
+                raise OMSExecutionError(
+                    f"historical order {external_id} status conflicts with the durable attempt"
+                )
+            attempt_time = parse_time(
+                attempt.get("submitted_at"), f"attempt {external_id} submitted_at"
+            )
+            observed_time = snapshot.order_time or snapshot.captured_at
+            if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
+                raise OMSExecutionError(f"historical order {external_id} predates durable submission")
+
+        def validate_historical_fill_fact(
+            external_id: str,
+            proof: Mapping[str, object],
+            broker_fill: BrokerFill,
+        ) -> None:
+            """Require exact account/instrument/provenance on each history fill."""
+            leg = proof["leg"]
+            if not str(broker_fill.account_id or "").strip() or broker_fill.account_id != account.id:
+                raise OMSExecutionError(
+                    f"historical fill {external_id} lacks exact account provenance"
+                )
+            expected_instrument = str(leg.get("instrument_id") or "").strip()
+            if not expected_instrument or broker_fill.instrument_id != expected_instrument:
+                raise OMSExecutionError(
+                    f"historical fill {external_id} lacks exact instrument provenance"
+                )
+            aliases = self._account_alias_mismatches(
+                account,
+                account_id=broker_fill.account_id,
+                metadata=broker_fill.metadata,
+            )
+            if aliases:
+                raise OMSExecutionError(
+                    f"historical fill {external_id} has account provenance mismatch: {aliases}"
+                )
+            if (
+                broker_fill.evidence_mode is ExecutionEvidenceMode.UNAVAILABLE
+                or not str(broker_fill.evidence_reference or "").strip()
+            ):
+                raise OMSExecutionError(
+                    f"historical fill {external_id} lacks execution provenance"
+                )
+            try:
+                self._validate_broker_fill_provenance(
+                    proof["attempt"],
+                    broker_fill,
+                    expected_instrument_id=expected_instrument,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise OMSExecutionError(
+                    f"historical fill {external_id} provenance is invalid: {exc}"
+                ) from exc
+
         for external_id, proof in expected_external_ids.items():
             rows = history_by_external.get(external_id, [])
             if len(rows) != 1:
@@ -8225,24 +8610,17 @@ class GenericOMS:
                 proof.get("verified_quantity", requested), f"history {external_id} filled quantity"
             )
             partial_source = proof.get("partial_source") is True
-            if (
-                snapshot.account_id != account.id
-                or snapshot.instrument_id != str(leg.get("instrument_id"))
-                or snapshot.side.value != str(leg.get("side"))
-                or snapshot.quantity != requested
-                or snapshot.filled_quantity != quantity
-                or snapshot.status
-                not in (
+            validate_historical_order_snapshot(
+                external_id,
+                proof,
+                snapshot,
+                allowed_statuses=(
                     {BrokerOrderStatus.PARTIALLY_FILLED, BrokerOrderStatus.CANCELLED}
                     if partial_source
                     else {BrokerOrderStatus.FILLED}
-                )
-            ):
-                raise OMSExecutionError(f"historical order {external_id} conflicts with the durable leg")
-            attempt_time = parse_time(proof["attempt"].get("submitted_at"), f"attempt {external_id} submitted_at")
-            observed_time = snapshot.order_time or snapshot.captured_at
-            if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
-                raise OMSExecutionError(f"historical order {external_id} predates durable submission")
+                ),
+                expected_filled_quantity=quantity,
+            )
 
         for external_id, proof in terminal_zero_legs.items():
             rows = history_by_external.get(external_id, [])
@@ -8254,26 +8632,21 @@ class GenericOMS:
             leg = proof["leg"]
             attempt = proof["attempt"]
             submitted = parse_decimal(attempt.get("submitted_quantity"), f"history {external_id} quantity")
-            if (
-                snapshot.account_id != account.id
-                or snapshot.instrument_id != str(leg.get("instrument_id"))
-                or snapshot.side.value != str(leg.get("side"))
-                or snapshot.quantity != submitted
-                or snapshot.filled_quantity != 0
-                or snapshot.status
-                not in {
+            validate_historical_order_snapshot(
+                external_id,
+                proof,
+                snapshot,
+                allowed_statuses={
                     BrokerOrderStatus.CANCELLED,
                     BrokerOrderStatus.REJECTED,
                     BrokerOrderStatus.FAILED,
-                }
-            ):
+                },
+                expected_filled_quantity=Decimal("0"),
+            )
+            if snapshot.quantity != submitted:
                 raise OMSExecutionError(
                     f"historical order {external_id} contradicts terminal zero-fill proof"
                 )
-            attempt_time = parse_time(attempt.get("submitted_at"), f"attempt {external_id} submitted_at")
-            observed_time = snapshot.order_time or snapshot.captured_at
-            if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
-                raise OMSExecutionError(f"historical order {external_id} predates durable submission")
             if history_fills_by_external.get(external_id):
                 raise OMSExecutionError(
                     f"historical order facts contain a late fill for terminal zero-fill {external_id}"
@@ -8289,11 +8662,12 @@ class GenericOMS:
                 proof.get("verified_quantity", leg.get("quantity")), f"history {external_id} quantity"
             )
             total_history_quantity = Decimal("0")
+            if not history_fills:
+                raise OMSExecutionError(
+                    f"historical fills are missing for proven order {external_id}"
+                )
             for broker_fill in history_fills:
-                if broker_fill.account_id not in (None, account.id):
-                    raise OMSExecutionError(f"historical fill {external_id} belongs to another account")
-                if broker_fill.instrument_id not in (None, str(leg.get("instrument_id"))):
-                    raise OMSExecutionError(f"historical fill {external_id} has a foreign instrument")
+                validate_historical_fill_fact(external_id, proof, broker_fill)
                 if broker_fill.quantity <= 0 or not broker_fill.quantity.is_finite():
                     raise OMSExecutionError(f"historical fill {external_id} has invalid quantity")
                 total_history_quantity += broker_fill.quantity
@@ -8309,6 +8683,11 @@ class GenericOMS:
                 and total_history_quantity != expected_quantity
             ):
                 raise OMSExecutionError(f"individual-deal history lacks complete evidence for {external_id}")
+            validate_historical_fill_evidence(
+                external_id,
+                proof,
+                history_fills,
+            )
 
         linked_exits: list[dict[str, object]] = []
         linked_exit_intents_to_complete: set[str] = set()
@@ -8322,8 +8701,11 @@ class GenericOMS:
             if (
                 str(candidate.get("account_id")) != account.id
                 or str(candidate.get("book_id") or "") != str(intent.get("book_id") or "")
+                or str(candidate.get("strategy_id") or "") != str(intent.get("strategy_id") or "")
             ):
-                raise OMSExecutionError(f"linked compensation {candidate_id} has an account or book mismatch")
+                raise OMSExecutionError(
+                    f"linked compensation {candidate_id} has an account, strategy, or book mismatch"
+                )
             candidate_metadata = candidate.get("metadata")
             is_residual_completion = (
                 source_action == IntentAction.EXIT.value
@@ -8331,6 +8713,15 @@ class GenericOMS:
                 and candidate_metadata.get("verified_residual_exit") is True
                 and str(candidate_metadata.get("source_intent_id")) == intent_id
             )
+            if source_action == IntentAction.EXIT.value and source_entry_intent_id is not None:
+                if candidate_id not in residual_candidate_ids or not is_residual_completion:
+                    raise OMSExecutionError(
+                        f"compensating EXIT chain has an extra linked branch {candidate_id}"
+                    )
+                if str(candidate.get("action")) != IntentAction.EXIT.value:
+                    raise OMSExecutionError(
+                        f"residual linked intent {candidate_id} is not an EXIT"
+                    )
             allowed_compensation_actions = (
                 {IntentAction.EXIT.value, IntentAction.FLATTEN.value}
                 if source_action == IntentAction.ENTER.value
@@ -8362,6 +8753,8 @@ class GenericOMS:
                 proof, quantity = validate_local_fill_leg(leg)
                 positive_legs.append((proof, quantity))
                 external_id = str(proof["attempt"].get("external_order_id"))
+                if external_id in expected_external_ids:
+                    raise OMSExecutionError("compensated chain reuses a broker order identity")
                 expected_external_ids[external_id] = proof
             if positive_legs:
                 if unsubmitted_or_definite_rejection:
@@ -8386,6 +8779,15 @@ class GenericOMS:
                     linked_exit_intents_to_complete.add(candidate_id)
                 linked_exits.extend(positive_legs)
 
+        linked_candidate_ids = {
+            str(proof["leg"].get("intent_id"))
+            for proof, _quantity in linked_exits
+        }
+        if source_action == IntentAction.EXIT.value and source_entry_intent_id is not None:
+            if linked_candidate_ids != residual_candidate_ids or len(linked_candidate_ids) != 1:
+                raise OMSExecutionError(
+                    "compensating EXIT chain must resolve exactly one residual EXIT intent"
+                )
         if not linked_exits:
             raise OMSExecutionError("no linked compensating intent with durable fill evidence")
 
@@ -8404,34 +8806,33 @@ class GenericOMS:
                 proof.get("verified_quantity", requested), f"history {external_id} filled quantity"
             )
             partial_source = proof.get("partial_source") is True
-            if (
-                snapshot.account_id != account.id
-                or snapshot.instrument_id != str(leg.get("instrument_id"))
-                or snapshot.side.value != str(leg.get("side"))
-                or snapshot.quantity != requested
-                or snapshot.filled_quantity != quantity
-                or snapshot.status
-                not in (
+            validate_historical_order_snapshot(
+                external_id,
+                proof,
+                snapshot,
+                allowed_statuses=(
                     {BrokerOrderStatus.PARTIALLY_FILLED, BrokerOrderStatus.CANCELLED}
                     if partial_source
                     else {BrokerOrderStatus.FILLED}
-                )
-            ):
-                raise OMSExecutionError(f"historical order {external_id} conflicts with the durable leg")
-            attempt_time = parse_time(proof["attempt"].get("submitted_at"), f"attempt {external_id} submitted_at")
-            observed_time = snapshot.order_time or snapshot.captured_at
-            if observed_time < attempt_time - timedelta(seconds=self.BROKER_TIME_ORDER_TOLERANCE_SECONDS):
-                raise OMSExecutionError(f"historical order {external_id} predates durable submission")
+                ),
+                expected_filled_quantity=quantity,
+            )
             history_fills = history_fills_by_external.get(external_id, [])
             if history_fills:
                 history_quantity = sum((fill.quantity for fill in history_fills), Decimal("0"))
                 if history_quantity != quantity:
                     raise OMSExecutionError(f"historical fills for {external_id} do not equal the durable quantity")
                 for broker_fill in history_fills:
-                    if broker_fill.account_id not in (None, account.id):
-                        raise OMSExecutionError(f"historical fill {external_id} belongs to another account")
-                    if broker_fill.instrument_id not in (None, str(leg.get("instrument_id"))):
-                        raise OMSExecutionError(f"historical fill {external_id} has a foreign instrument")
+                    validate_historical_fill_fact(external_id, proof, broker_fill)
+            else:
+                raise OMSExecutionError(
+                    f"historical fills are missing for proven order {external_id}"
+                )
+            validate_historical_fill_evidence(
+                external_id,
+                proof,
+                history_fills,
+            )
         exit_by_instrument: dict[str, Decimal] = {}
         for proof, quantity in linked_exits:
             leg = proof["leg"]
@@ -8443,6 +8844,12 @@ class GenericOMS:
             for proof, _quantity in linked_exits
             if str(proof["leg"].get("intent_id")) in residual_candidate_ids
         }
+        chain_intent_ids = {
+            intent_id,
+            *(str(proof["leg"].get("intent_id")) for proof, _quantity in linked_exits),
+        }
+        if source_entry_intent_id is not None:
+            chain_intent_ids.add(source_entry_intent_id)
         if source_action == IntentAction.EXIT.value and residual_completion_ids:
             # A partial EXIT residual is a different proof shape from a
             # compensating ENTER: every positive source EXIT fill and every
@@ -8453,6 +8860,14 @@ class GenericOMS:
                 str(proof["leg"].get("instrument_id")): proof["leg"]
                 for proof in terminal_zero_legs.values()
             }
+            for proof in never_submitted_legs.values():
+                leg = proof["leg"]
+                instrument = str(leg.get("instrument_id"))
+                if instrument in zero_by_instrument:
+                    raise OMSExecutionError(
+                        "partial EXIT has both attempted and never-submitted zero-fill siblings"
+                    )
+                zero_by_instrument[instrument] = leg
             residual_by_instrument: dict[str, Decimal] = {}
             for proof, quantity in linked_exits:
                 candidate_id = str(proof["leg"].get("intent_id"))
@@ -8461,18 +8876,20 @@ class GenericOMS:
                 instrument = str(proof["leg"].get("instrument_id"))
                 source_zero_leg = zero_by_instrument.get(instrument)
                 if source_zero_leg is None:
-                    raise OMSExecutionError("partial EXIT residual does not match a terminal zero-fill sibling")
+                    raise OMSExecutionError(
+                        "partial EXIT residual does not match a terminal-zero or never-submitted sibling"
+                    )
                 if (
                     str(proof["leg"].get("side")) != str(source_zero_leg.get("side"))
-                    or quantity != parse_decimal(source_zero_leg.get("quantity"), "terminal zero sibling quantity")
+                    or quantity != parse_decimal(source_zero_leg.get("quantity"), "zero sibling quantity")
                 ):
-                    raise OMSExecutionError("partial EXIT residual quantity or side differs from zero-fill sibling")
+                    raise OMSExecutionError("partial EXIT residual quantity or side differs from zero sibling")
                 if instrument in residual_by_instrument:
-                    raise OMSExecutionError("partial EXIT residual reuses a zero-fill sibling instrument")
+                    raise OMSExecutionError("partial EXIT residual reuses a zero sibling instrument")
                 signed = quantity if str(proof["leg"].get("side")) == Side.BUY.value else -quantity
                 residual_by_instrument[instrument] = signed
             if set(residual_by_instrument) != set(zero_by_instrument):
-                raise OMSExecutionError("partial EXIT residual does not cover every zero-fill sibling")
+                raise OMSExecutionError("partial EXIT residual does not cover every zero sibling")
             try:
                 pre_source_basis = self.repository.book_signed_exposure(
                     account.id,
@@ -8499,16 +8916,64 @@ class GenericOMS:
         # entry that cannot be matched to one of those claims.
         all_markers = {intent_id, str(intent.get("idempotency_key") or "")}
         all_markers.update(str(leg["id"]) for leg in intent["legs"])
+        never_submitted_markers = {
+            str(leg_id)
+            for leg_id in never_submitted_legs
+            if str(leg_id).strip()
+        }
+        for proof in never_submitted_legs.values():
+            leg_metadata = proof["leg"].get("metadata")
+            if marker(leg_metadata, never_submitted_markers):
+                raise OMSExecutionError("never-submitted leg carries a durable order/fill marker")
+        if source_entry is not None:
+            all_markers.add(str(source_entry.get("id") or ""))
+            all_markers.add(str(source_entry.get("idempotency_key") or ""))
+            all_markers.update(str(leg["id"]) for leg in source_entry.get("legs", ()))
         for proof, _quantity in linked_exits:
             exit_intent = self._required_intent(str(proof["leg"].get("intent_id")))
             all_markers.add(str(exit_intent.get("id")))
             all_markers.add(str(exit_intent.get("idempotency_key") or ""))
+            all_markers.update(str(leg["id"]) for leg in exit_intent.get("legs", ()))
         all_markers.discard("")
         proof_external_ids = set(expected_external_ids) | set(terminal_zero_legs)
         for snapshot in historical.orders:
-            if marker(snapshot.client_order_id, all_markers) or marker(snapshot.metadata, all_markers):
-                if str(snapshot.external_order_id) not in proof_external_ids:
+            snapshot_external_id = str(snapshot.external_order_id)
+            if (
+                marker(snapshot.id, never_submitted_markers)
+                or marker(snapshot.broker_snapshot_id, never_submitted_markers)
+                or marker(snapshot_external_id, never_submitted_markers)
+                or marker(snapshot.client_order_id, never_submitted_markers)
+                or marker(snapshot.metadata, never_submitted_markers)
+            ):
+                raise OMSExecutionError("historical facts contain a broker claim for a never-submitted leg")
+            if (
+                marker(snapshot.id, all_markers)
+                or marker(snapshot.broker_snapshot_id, all_markers)
+                or marker(snapshot_external_id, all_markers)
+                or marker(snapshot.client_order_id, all_markers)
+                or marker(snapshot.metadata, all_markers)
+            ):
+                if snapshot_external_id not in proof_external_ids:
                     raise OMSExecutionError("historical facts contain an unmatched claim for the recovered intents")
+        for broker_fill in historical.fills:
+            fill_external_id = str(broker_fill.external_order_id)
+            if (
+                marker(fill_external_id, never_submitted_markers)
+                or marker(broker_fill.external_fill_id, never_submitted_markers)
+                or marker(broker_fill.dedupe_key, never_submitted_markers)
+                or marker(broker_fill.evidence_reference, never_submitted_markers)
+                or marker(broker_fill.metadata, never_submitted_markers)
+            ):
+                raise OMSExecutionError("historical facts contain a fill claim for a never-submitted leg")
+            if (
+                marker(fill_external_id, all_markers)
+                or marker(broker_fill.external_fill_id, all_markers)
+                or marker(broker_fill.dedupe_key, all_markers)
+                or marker(broker_fill.evidence_reference, all_markers)
+                or marker(broker_fill.metadata, all_markers)
+            ):
+                if fill_external_id not in proof_external_ids:
+                    raise OMSExecutionError("historical facts contain an unmatched fill claim for the recovered intents")
 
         book_id = str(intent.get("book_id") or "")
         local_book_totals: dict[str, Decimal] = {}
@@ -8597,6 +9062,43 @@ class GenericOMS:
                 str(details.get("terminal_status", "")) == BrokerOrderStatus.CANCELLED.value
                 and incoming_count > 0
             )
+
+        def proven_submission_gate_issue(issue: Mapping[str, object]) -> bool:
+            """Own only the real pre-adapter Stage 6 gate blocker.
+
+            The gate issue is safe to retire only for the exact planned leg
+            that has already passed the resolver's no-attempt, no-fill,
+            no-allocation, and historical-marker checks.  In particular,
+            ``adapter_invoked`` is an authenticated boolean fact here, not a
+            truthy string or an omitted/unknown field.
+            """
+            if (
+                str(issue.get("category", "")) != "STAGE6_SUBMISSION_GATE_BLOCKED"
+                or str(issue.get("entity_type", "")) != "ORDER_LEG"
+            ):
+                return False
+            leg_id = str(issue.get("entity_key", "")).strip()
+            proof = never_submitted_legs.get(leg_id)
+            if proof is None:
+                return False
+            leg = proof["leg"]
+            if str(leg.get("status", "")) not in {
+                LegStatus.PLANNED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                return False
+            if str(issue.get("issue_key", "")) != (
+                f"STAGE6_SUBMISSION_GATE_BLOCKED:ORDER_LEG:{leg_id}"
+            ):
+                return False
+            details = self._issue_details(issue)
+            if type(details.get("adapter_invoked")) is not bool:
+                return False
+            if details.get("adapter_invoked") is not False:
+                return False
+            if "intent_id" in details and str(details.get("intent_id")) != intent_id:
+                return False
+            return isinstance(details.get("error"), str) and bool(details["error"].strip())
         retired_book_ids = self._verified_retired_baseline_books(account)
         retired_allocation_ids: set[str] = set()
         if retired_book_ids:
@@ -8658,6 +9160,7 @@ class GenericOMS:
                 for field in (
                     "filled_entry_external_order_ids",
                     "filled_source_external_order_ids",
+                    "source_entry_external_order_ids",
                     "compensating_external_order_ids",
                     "terminal_zero_external_order_ids",
                 )
@@ -8767,13 +9270,17 @@ class GenericOMS:
         for issue in open_issues:
             issue_key = str(issue.get("issue_key"))
             category = str(issue.get("category", ""))
-            if issue_key in allowed_issue_keys or proven_partial_source_issue(issue):
+            if (
+                issue_key in allowed_issue_keys
+                or proven_partial_source_issue(issue)
+                or proven_submission_gate_issue(issue)
+            ):
                 issue_keys_to_resolve.add(issue_key)
                 continue
             if category == "MIXED_TERMINAL_LEGS":
                 other_id = str(issue.get("entity_key", ""))
-                if other_id == intent_id or related_proven_compensated_intent(other_id):
-                    if other_id == intent_id:
+                if other_id in chain_intent_ids or related_proven_compensated_intent(other_id):
+                    if other_id in chain_intent_ids:
                         issue_keys_to_resolve.add(issue_key)
                     continue
             if retired_capacity_issue(issue) or baseline_wrapper(issue):
@@ -8841,7 +9348,35 @@ class GenericOMS:
                 str(metadata.get("terminal_status", "")) == BrokerOrderStatus.CANCELLED.value
                 and incoming_count > 0
             )
+
+        def proven_submission_gate_action(action: Mapping[str, object]) -> bool:
+            """Own a derivative gate action only for the exact planned leg."""
+            if str(action.get("intent_id", "")) != intent_id:
+                return False
+            action_key = str(action.get("action_key", ""))
+            prefix = "STAGE6_SUBMISSION_GATE_BLOCKED:"
+            if not action_key.startswith(prefix):
+                return False
+            leg_id = action_key[len(prefix):].strip()
+            proof = never_submitted_legs.get(leg_id)
+            if proof is None or str(proof["leg"].get("status", "")) not in {
+                LegStatus.PLANNED.value,
+                LegStatus.RECONCILIATION_REQUIRED.value,
+            }:
+                return False
+            metadata = action.get("metadata")
+            if not isinstance(metadata, Mapping) or type(metadata.get("adapter_invoked")) is not bool:
+                return False
+            if metadata.get("adapter_invoked") is not False:
+                return False
+            if "entity_type" in metadata and str(metadata.get("entity_type")) != "ORDER_LEG":
+                return False
+            if "entity_key" in metadata and str(metadata.get("entity_key")) != leg_id:
+                return False
+            return True
         owned_intent_ids = {intent_id}
+        if source_entry_intent_id is not None:
+            owned_intent_ids.add(source_entry_intent_id)
         for proof, _quantity in linked_exits:
             owned_intent_ids.add(str(proof["leg"].get("intent_id")))
         action_keys_to_resolve: set[str] = set()
@@ -8854,7 +9389,10 @@ class GenericOMS:
             if proven_partial_source_action(action):
                 action_keys_to_resolve.add(action_key)
                 continue
-            if action_key == f"MIXED_TERMINAL_LEGS:{intent_id}":
+            if proven_submission_gate_action(action):
+                action_keys_to_resolve.add(action_key)
+                continue
+            if action_key == f"MIXED_TERMINAL_LEGS:{action_intent}" and action_intent in chain_intent_ids:
                 action_keys_to_resolve.add(action_key)
                 continue
             if action_key.startswith("MIXED_TERMINAL_LEGS:") and related_proven_compensated_intent(action_intent):
@@ -8936,6 +9474,11 @@ class GenericOMS:
             "filled_source_external_order_ids": sorted(
                 str(proof["attempt"].get("external_order_id")) for proof in submitted_legs
             ),
+            "source_entry_intent_id": source_entry_intent_id,
+            "source_entry_external_order_ids": sorted(
+                str(proof["attempt"].get("external_order_id"))
+                for proof in source_entry_proofs
+            ),
             "partial_source_leg_ids": sorted(
                 str(proof["leg"].get("id"))
                 for proof in submitted_legs
@@ -8950,6 +9493,7 @@ class GenericOMS:
                 str(proof["attempt"].get("external_order_id")) for proof, _quantity in linked_exits
             ),
             "terminal_zero_external_order_ids": sorted(terminal_zero_legs),
+            "never_submitted_leg_ids": sorted(never_submitted_legs),
             "compensating_intent_ids": sorted(
                 {
                     str(proof["leg"].get("intent_id"))
@@ -8957,6 +9501,7 @@ class GenericOMS:
                     if str(proof["leg"].get("intent_id", "")).strip()
                 }
             ),
+            "chain_intent_ids": sorted(chain_intent_ids),
             "unsent_leg_ids": sorted(unsent_legs),
             "account_id": account.id,
             "book_id": str(intent.get("book_id") or ""),
@@ -8967,6 +9512,24 @@ class GenericOMS:
             now=now,
             _resolution_capability=self.repository._resolution_capability(),
         )
+        if source_entry_intent_id is not None:
+            self.repository.mark_verified_filled_intent(
+                source_entry_intent_id,
+                closure_metadata={
+                    "reason": "fresh_broker_and_historical_proof_of_compensated_partial_chain",
+                    "account_id": account.id,
+                    "book_id": str(intent.get("book_id") or ""),
+                    "chain_intent_ids": sorted(chain_intent_ids),
+                    "source_entry_external_order_ids": proof_metadata[
+                        "source_entry_external_order_ids"
+                    ],
+                    "compensating_intent_id": intent_id,
+                    "residual_intent_ids": sorted(residual_completion_ids),
+                    "verified_at": now.isoformat(),
+                },
+                now=now,
+                _resolution_capability=self.repository._resolution_capability(),
+            )
         event_id = f"compensated-partial-intent:{intent_id}"
         if not any(event.get("id") == event_id for event in self.repository.operational_events(account.id, limit=1000)):
             self.repository.record_operational_event(
@@ -8976,7 +9539,7 @@ class GenericOMS:
                 mode=account.environment.value,
                 outcome=IntentStatus.CANCELLED.value,
                 occurred_at=now,
-                summary="Closed a partial entry only after fresh flat-account and complete historical-order proof of exact compensation.",
+                summary="Closed an exact compensated intent chain after fresh flat-account and complete historical-order proof.",
                 details={"intent_id": intent_id, "proof": proof_metadata},
             )
         return {
@@ -8987,6 +9550,10 @@ class GenericOMS:
             "filled_entry_external_order_ids": proof_metadata["filled_entry_external_order_ids"],
             "compensating_external_order_ids": proof_metadata["compensating_external_order_ids"],
             "terminal_zero_external_order_ids": proof_metadata["terminal_zero_external_order_ids"],
+            "source_entry_intent_id": proof_metadata["source_entry_intent_id"],
+            "source_entry_external_order_ids": proof_metadata["source_entry_external_order_ids"],
+            "never_submitted_leg_ids": proof_metadata["never_submitted_leg_ids"],
+            "chain_intent_ids": proof_metadata["chain_intent_ids"],
             "unsent_leg_ids": proof_metadata["unsent_leg_ids"],
         }
 

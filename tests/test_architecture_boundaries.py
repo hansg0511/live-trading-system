@@ -67,7 +67,7 @@ PAIR_TOKEN_BASELINE_EXEMPTIONS = {
 # required by the v4 contract, not a generic strategy dependency. Keep the
 # exact normalized source blob pinned so any further OMS change requires an
 # explicit compatibility review/bump.
-CURRENT_GENERIC_OMS_V4_BLOB = "8b1563b91f67572afe2bd5a72bece5236aa390da"
+CURRENT_GENERIC_OMS_V4_BLOB = "a69b2cd3d21ef987786011aa68e2591fd975d2fd"
 
 CURRENT_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",

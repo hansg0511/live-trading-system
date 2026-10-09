@@ -1474,6 +1474,14 @@ class SQLiteTradingRepository:
                 for value in (metadata.get("partial_source_leg_ids") or ())
                 if str(value).strip()
             }
+            never_submitted_leg_ids = {
+                str(value).strip()
+                for value in (metadata.get("never_submitted_leg_ids") or ())
+                if str(value).strip()
+            }
+            known_leg_ids = {str(leg["id"]) for leg in legs}
+            if not never_submitted_leg_ids.issubset(known_leg_ids):
+                raise ValueError("compensated closure names an unknown never-submitted leg")
             validate_transition(
                 IntentStatus.RECONCILIATION_REQUIRED,
                 IntentStatus.CANCELLED,
@@ -1506,7 +1514,22 @@ class SQLiteTradingRepository:
                 cumulative = Decimal(str(leg["cumulative_filled_quantity"] or "0"))
                 if not cumulative.is_finite() or cumulative != 0:
                     raise ValueError(f"compensated leg {leg['id']} has non-zero cumulative fill")
-                if current_leg in {LegStatus.PLANNED, LegStatus.RECONCILIATION_REQUIRED}:
+                attempt = conn.execute(
+                    "SELECT id FROM core_broker_orders WHERE order_leg_id = ? LIMIT 1",
+                    (str(leg["id"]),),
+                ).fetchone()
+                has_attempt = attempt is not None
+                if current_leg is LegStatus.PLANNED and has_attempt:
+                    raise ValueError(f"planned compensated leg {leg['id']} has a durable broker attempt")
+                if (
+                    current_leg in {LegStatus.PLANNED, LegStatus.RECONCILIATION_REQUIRED}
+                    and not has_attempt
+                    and str(leg["id"]) not in never_submitted_leg_ids
+                ):
+                    raise ValueError(
+                        f"compensated leg {leg['id']} lacks an explicit never-submitted proof"
+                    )
+                if current_leg in {LegStatus.PLANNED, LegStatus.RECONCILIATION_REQUIRED} and not has_attempt:
                     validate_transition(current_leg, LegStatus.CANCELLED, LEG_TRANSITIONS, entity="leg")
 
             existing = _decode(row["metadata_json"])
@@ -1515,10 +1538,19 @@ class SQLiteTradingRepository:
             merged = dict(existing)
             merged["compensated_partial_closure"] = metadata
             for leg in legs:
-                if LegStatus(str(leg["status"])) in {
-                    LegStatus.PLANNED,
-                    LegStatus.RECONCILIATION_REQUIRED,
-                }:
+                if (
+                    LegStatus(str(leg["status"]))
+                    in {
+                        LegStatus.PLANNED,
+                        LegStatus.RECONCILIATION_REQUIRED,
+                    }
+                    and str(leg["id"]) in never_submitted_leg_ids
+                ):
+                    if conn.execute(
+                        "SELECT 1 FROM core_broker_orders WHERE order_leg_id = ? LIMIT 1",
+                        (str(leg["id"]),),
+                    ).fetchone() is not None:
+                        raise ValueError(f"never-submitted compensated leg {leg['id']} has a durable broker attempt")
                     conn.execute(
                         "UPDATE core_order_legs SET status = ?, updated_at = ? WHERE id = ?",
                         (LegStatus.CANCELLED.value, timestamp, str(leg["id"])),
@@ -1607,6 +1639,87 @@ class SQLiteTradingRepository:
                 existing = {}
             merged = dict(existing)
             merged["verified_compensating_exit_closure"] = metadata
+            conn.execute(
+                "UPDATE core_order_intents SET status = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
+                (IntentStatus.COMPLETED.value, _json(merged), timestamp, intent_id),
+            )
+        return True
+
+    def mark_verified_filled_intent(
+        self,
+        intent_id: str,
+        *,
+        closure_metadata: Mapping[str, Any],
+        now: datetime | None = None,
+        _resolution_capability: object | None = None,
+    ) -> bool:
+        """Terminalize one fully-filled source after an exact proof envelope.
+
+        This is deliberately separate from round-trip closure: the source
+        ENTER remains an immutable filled claim while a linked partial EXIT
+        and residual EXIT carry the flattening proof.
+        """
+        if _resolution_capability is not self.__resolution_capability:
+            raise PermissionError("validated filled-intent capability is required")
+        timestamp = _timestamp(now or utc_now())
+        metadata = dict(closure_metadata)
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT status, action, account_id, metadata_json FROM core_order_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown intent: {intent_id}")
+            if str(row["action"]) != "ENTER":
+                raise ValueError("verified filled source must be an ENTER intent")
+            current = IntentStatus(str(row["status"]))
+            if current is IntentStatus.COMPLETED:
+                return True
+            if current not in {IntentStatus.FILLED, IntentStatus.RECONCILIATION_REQUIRED}:
+                raise ValueError("only a filled or reconciliation-required source can be terminalized")
+            legs = conn.execute(
+                """SELECT id, status, quantity, cumulative_filled_quantity
+                   FROM core_order_legs WHERE intent_id = ? ORDER BY sequence""",
+                (intent_id,),
+            ).fetchall()
+            if not legs:
+                raise ValueError("verified filled source must contain at least one leg")
+            for leg in legs:
+                if LegStatus(str(leg["status"])) is not LegStatus.FILLED:
+                    raise ValueError(f"source leg {leg['id']} is not FILLED")
+                requested = Decimal(str(leg["quantity"]))
+                cumulative = Decimal(str(leg["cumulative_filled_quantity"]))
+                if requested <= 0 or cumulative != requested:
+                    raise ValueError(f"source leg {leg['id']} has incomplete fill quantity")
+                attempts = conn.execute(
+                    """SELECT id, status, submitted_quantity
+                       FROM core_broker_orders WHERE order_leg_id = ?""",
+                    (str(leg["id"]),),
+                ).fetchall()
+                if (
+                    len(attempts) != 1
+                    or BrokerOrderStatus(str(attempts[0]["status"])) is not BrokerOrderStatus.FILLED
+                    or Decimal(str(attempts[0]["submitted_quantity"])) != requested
+                ):
+                    raise ValueError(f"source leg {leg['id']} lacks one exact filled attempt")
+                fills = conn.execute(
+                    "SELECT quantity, price FROM core_fills WHERE broker_order_id = ?",
+                    (str(attempts[0]["id"]),),
+                ).fetchall()
+                if (
+                    len(fills) != 1
+                    or Decimal(str(fills[0]["quantity"])) != requested
+                    or Decimal(str(fills[0]["price"])) <= 0
+                ):
+                    raise ValueError(f"source leg {leg['id']} lacks one exact durable fill")
+            if str(metadata.get("account_id", "")) != str(row["account_id"]):
+                raise ValueError("verified source closure account provenance is inconsistent")
+            validate_transition(current, IntentStatus.COMPLETED, INTENT_TRANSITIONS, entity="intent")
+            existing = _decode(row["metadata_json"])
+            if not isinstance(existing, Mapping):
+                existing = {}
+            merged = dict(existing)
+            merged["verified_filled_intent_closure"] = metadata
             conn.execute(
                 "UPDATE core_order_intents SET status = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
                 (IntentStatus.COMPLETED.value, _json(merged), timestamp, intent_id),
