@@ -68,8 +68,8 @@ INTENT_TRANSITIONS: Mapping[IntentStatus, frozenset[IntentStatus]] = {
 }
 
 LEG_TRANSITIONS: Mapping[LegStatus, frozenset[LegStatus]] = {
-    LegStatus.PLANNED: frozenset({LegStatus.SUBMITTING, LegStatus.CANCELLED, LegStatus.FAILED}),
-    LegStatus.SUBMITTING: frozenset(
+    LegStatus.PLANNED: frozenset({LegStatus.EXECUTING, LegStatus.CANCELLED, LegStatus.FAILED}),
+    LegStatus.EXECUTING: frozenset(
         {
             LegStatus.WORKING,
             LegStatus.PARTIALLY_FILLED,

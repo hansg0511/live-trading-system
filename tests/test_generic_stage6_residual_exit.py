@@ -88,7 +88,7 @@ def _seed_partial_source(
     repository.create_intent(intent)
     repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(leg_id, LegStatus.EXECUTING, now=NOW)
     repository.create_broker_order(
         broker_order_id=f"{source_id}-order",
         order_leg_id=leg_id,
@@ -211,7 +211,7 @@ def _seed_partial_enter_with_terminal_zero_sibling(
     repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in source.legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
     for leg in source.legs:
         if leg.id == second_leg_id and not include_terminal_zero_attempt:
             continue
@@ -369,7 +369,7 @@ def _seed_partial_enter_with_partial_sibling(
     repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in source.legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
         repository.create_broker_order(
             broker_order_id=f"{leg.id}-order",
             order_leg_id=leg.id,
@@ -497,7 +497,7 @@ def _seed_partial_exit_with_terminal_zero_sibling(
     repository.transition_intent(entry_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(entry_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in entry_legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
         order_id = f"{leg.id}-order"
         repository.create_broker_order(
             broker_order_id=order_id,
@@ -604,7 +604,7 @@ def _seed_partial_exit_with_terminal_zero_sibling(
     repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in exit_legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
         if planned_sibling and leg.id == f"{source_id}-leg-b":
             continue
         order_id = f"{leg.id}-order"
@@ -852,7 +852,7 @@ def _seed_filled_residual_exit(
     repository.create_intent(residual)
     repository.transition_intent(residual_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(residual_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(leg_id, LegStatus.EXECUTING, now=NOW)
     order_id = f"{leg_id}-order"
     external_id = f"{residual_id}-external"
     repository.create_broker_order(
@@ -2332,7 +2332,7 @@ def _seed_terminal_managed_sibling_case(tmp_path):
     repository.create_intent(sibling)
     repository.transition_intent(sibling_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(sibling_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(sibling_leg_id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(sibling_leg_id, LegStatus.EXECUTING, now=NOW)
     sibling_order_id = f"{sibling_id}-order"
     repository.create_broker_order(
         broker_order_id=sibling_order_id,
@@ -2471,7 +2471,7 @@ def _seed_cumulative_compensating_case(tmp_path):
     source_now = NOW - timedelta(seconds=10)
     external_ids: dict[str, str] = {}
     for leg in source_legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=source_now)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=source_now)
         broker_order_id = f"{leg.id}-order"
         external_order_id = f"{leg.id}-external"
         external_ids[leg.instrument_id] = external_order_id
@@ -2820,7 +2820,7 @@ def _seed_individual_roundtrip_with_terminal_sibling(tmp_path):
     exit_orders = []
     exit_broker_fills = []
     for leg in exit_legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
         order_id = f"{leg.id}-order"
         external_id = f"{order_id}-external"
         repository.create_broker_order(

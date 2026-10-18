@@ -435,3 +435,6 @@ VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Dedicated broker-event eviden
 
 INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
 VALUES (9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Durable Stage 6 supervised SIM validation evidence');
+
+INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+VALUES (10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'Leg EXECUTING status and atomic prepared broker attempts');

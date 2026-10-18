@@ -897,7 +897,7 @@ class GenericOMS:
                             now=self._now(),
                         )
                     return self._required_intent(intent_id)
-            outcome = self._submit_leg(intent, leg, account, stored_status=stored["status"])
+            outcome = self._submit_leg(intent, leg, account)
             if outcome == "accepted":
                 accepted_any = True
                 continue
@@ -2337,12 +2337,20 @@ class GenericOMS:
         intent: OrderIntent,
         leg: OrderLeg,
         account: Account,
-        *,
-        stored_status: str,
     ) -> str:
-        """Submit one leg, converting every post-submit exception to recon."""
+        """Atomically prepare one leg, then submit its durable attempt."""
+        # Preparation is intentionally outside the post-dispatch catch. If
+        # this transaction fails, no adapter call was possible and both the
+        # leg transition and attempt insertion roll back together.
+        attempt = self.repository.prepare_leg_execution_attempt(
+            order_leg_id=leg.id,
+            account_id=account.id,
+            broker=account.broker,
+            submitted_quantity=leg.quantity,
+            now=self._now(),
+        )
         try:
-            return self._submit_leg_impl(intent, leg, account, stored_status=stored_status)
+            return self._submit_leg_impl(intent, leg, account, attempt=attempt)
         except Exception as exc:
             # Once the adapter call has been attempted, even a malformed
             # response or a durable-write failure may hide a broker-side
@@ -2357,36 +2365,26 @@ class GenericOMS:
         leg: OrderLeg,
         account: Account,
         *,
-        stored_status: str,
+        attempt: Mapping[str, Any],
     ) -> str:
-        attempts = self.repository.broker_orders_for_leg(leg.id)
-        if attempts:
-            last = attempts[-1]
-            if last["status"] != BrokerOrderStatus.PREPARED.value:
-                if stored_status != LegStatus.RECONCILIATION_REQUIRED.value:
-                    self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED, now=self._now())
-                return "ambiguous"
-            broker_order_id = str(last["id"])
-            attempt_number = int(last["attempt_number"])
-            client_order_id = str(last["client_order_id"])
-        else:
-            if stored_status == LegStatus.PLANNED.value:
-                self.repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=self._now())
-            elif stored_status != LegStatus.SUBMITTING.value:
-                raise OMSExecutionError(f"cannot prepare attempt from leg status {stored_status}")
-            broker_order_id = str(uuid.uuid4())
-            attempt_number, client_order_id = self.repository.create_broker_order(
-                broker_order_id=broker_order_id,
-                order_leg_id=leg.id,
-                account_id=account.id,
-                broker=account.broker,
-                attempt_number=None,
-                client_order_id=None,
-                submitted_quantity=leg.quantity,
-                now=self._now(),
-            )
+        broker_order_id = str(attempt["id"])
+        attempt_number = int(attempt["attempt_number"])
+        client_order_id = str(attempt["client_order_id"])
+        if str(attempt["status"]) != BrokerOrderStatus.PREPARED.value:
+            current = next(item for item in self._required_intent(intent.id)["legs"] if item["id"] == leg.id)
+            if current["status"] != LegStatus.RECONCILIATION_REQUIRED.value:
+                self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED, now=self._now())
+            return "ambiguous"
 
-        self.repository.transition_broker_order(broker_order_id, BrokerOrderStatus.SUBMITTING, now=self._now())
+        # Claim PREPARED -> SUBMITTING under its own transaction. A second
+        # worker sees SUBMITTING and must reconcile rather than dispatching
+        # the same client-order identity again.
+        if not self.repository.begin_prepared_broker_order_submission(broker_order_id, now=self._now()):
+            current = next(item for item in self._required_intent(intent.id)["legs"] if item["id"] == leg.id)
+            if current["status"] != LegStatus.RECONCILIATION_REQUIRED.value:
+                self.repository.transition_leg(leg.id, LegStatus.RECONCILIATION_REQUIRED, now=self._now())
+            return "ambiguous"
+
         request = BrokerSubmitRequest(
             broker_order_id=broker_order_id,
             account_id=account.id,
@@ -4568,7 +4566,7 @@ class GenericOMS:
         if leg_status in {LegStatus.FILLED.value, LegStatus.RECONCILIATION_REQUIRED.value}:
             return
         if leg_status == LegStatus.PLANNED.value:
-            self.repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=self._now())
+            self.repository.transition_leg(leg_id, LegStatus.EXECUTING, now=self._now())
         self.repository.transition_leg(leg_id, LegStatus.RECONCILIATION_REQUIRED, now=self._now())
 
     def _force_leg_reconciliation(self, leg_id: str, leg_status: str) -> None:
@@ -4576,7 +4574,7 @@ class GenericOMS:
         if leg_status == LegStatus.RECONCILIATION_REQUIRED.value:
             return
         if leg_status == LegStatus.PLANNED.value:
-            self.repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=self._now())
+            self.repository.transition_leg(leg_id, LegStatus.EXECUTING, now=self._now())
         self.repository.transition_leg(leg_id, LegStatus.RECONCILIATION_REQUIRED, now=self._now())
 
     def _quarantine_multiple_attempts(self, intent_id: str, account: Account) -> bool:
@@ -5031,7 +5029,7 @@ class GenericOMS:
         if leg_status == target.value:
             return
         if leg_status == LegStatus.PLANNED.value and target is LegStatus.REJECTED:
-            self.repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=self._now())
+            self.repository.transition_leg(leg_id, LegStatus.EXECUTING, now=self._now())
         self.repository.transition_leg(leg_id, target, now=self._now())
 
     def _durable_filled_quantity(self, broker_order_id: str) -> Decimal:
@@ -9842,7 +9840,7 @@ class GenericOMS:
                 metadata={"leg_statuses": sorted(statuses)},
             )
             return
-        if statuses & {LegStatus.RECONCILIATION_REQUIRED.value, LegStatus.PLANNED.value, LegStatus.SUBMITTING.value}:
+        if statuses & {LegStatus.RECONCILIATION_REQUIRED.value, LegStatus.PLANNED.value, LegStatus.EXECUTING.value}:
             return
         # Hard account actions are blockers for lifecycle refresh.  A normal
         # WAIT/WORKING observation remains visible while an order is active,
@@ -10399,9 +10397,9 @@ class GenericOMS:
                 if target is BrokerOrderStatus.WORKING:
                     timed_out, stale, age = self._age_flags(intent, attempt, match, now)
                     if current_leg["status"] == LegStatus.PLANNED.value:
-                        self.repository.transition_leg(str(leg["id"]), LegStatus.SUBMITTING, now=self._now())
+                        self.repository.transition_leg(str(leg["id"]), LegStatus.EXECUTING, now=self._now())
                         self.repository.transition_leg(str(leg["id"]), LegStatus.WORKING, now=self._now())
-                    elif current_leg["status"] == LegStatus.SUBMITTING.value:
+                    elif current_leg["status"] == LegStatus.EXECUTING.value:
                         self.repository.transition_leg(str(leg["id"]), LegStatus.WORKING, now=self._now())
                     if timed_out or stale:
                         if current_leg["status"] != LegStatus.RECONCILIATION_REQUIRED.value:
@@ -13789,9 +13787,9 @@ class GenericOMS:
             leg = next(item for item in self._required_intent(intent_id)["legs"] if item["id"] == attempt["order_leg_id"])
             if target is BrokerOrderStatus.WORKING:
                 if leg["status"] == LegStatus.PLANNED.value:
-                    self.repository.transition_leg(str(leg["id"]), LegStatus.SUBMITTING, now=self._now())
+                    self.repository.transition_leg(str(leg["id"]), LegStatus.EXECUTING, now=self._now())
                     self.repository.transition_leg(str(leg["id"]), LegStatus.WORKING, now=self._now())
-                elif leg["status"] == LegStatus.SUBMITTING.value:
+                elif leg["status"] == LegStatus.EXECUTING.value:
                     self.repository.transition_leg(str(leg["id"]), LegStatus.WORKING, now=self._now())
                 self._record_recovery_action(
                     intent=intent,

@@ -323,7 +323,7 @@ def test_partial_fills_accumulate_and_duplicates_do_not_double_count(tmp_path):
     repository.create_intent(original)
     repository.transition_intent(original.id, IntentStatus.RISK_APPROVED)
     repository.transition_intent(original.id, IntentStatus.SUBMITTING)
-    repository.transition_leg(original.legs[0].id, LegStatus.SUBMITTING)
+    repository.transition_leg(original.legs[0].id, LegStatus.EXECUTING)
     repository.create_broker_order(
         broker_order_id="attempt",
         order_leg_id=original.legs[0].id,
@@ -402,7 +402,7 @@ def test_pre_stage3_fill_replay_is_idempotent_but_changed_evidence_conflicts(tmp
     repository.create_intent(original)
     repository.transition_intent(original.id, IntentStatus.RISK_APPROVED)
     repository.transition_intent(original.id, IntentStatus.SUBMITTING)
-    repository.transition_leg(original.legs[0].id, LegStatus.SUBMITTING)
+    repository.transition_leg(original.legs[0].id, LegStatus.EXECUTING)
     repository.create_broker_order(
         broker_order_id="legacy-attempt",
         order_leg_id=original.legs[0].id,

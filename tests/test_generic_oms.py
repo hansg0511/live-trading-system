@@ -386,7 +386,7 @@ def test_recovery_repairs_persisted_clean_rejection_and_only_exact_issue(tmp_pat
     repository.create_intent(order_intent)
     repository.transition_intent(order_intent.id, IntentStatus.RISK_APPROVED)
     repository.transition_intent(order_intent.id, IntentStatus.SUBMITTING)
-    repository.transition_leg(order_intent.legs[0].id, LegStatus.SUBMITTING)
+    repository.transition_leg(order_intent.legs[0].id, LegStatus.EXECUTING)
     repository.create_broker_order(
         broker_order_id="rejected-attempt",
         order_leg_id=order_intent.legs[0].id,
@@ -463,7 +463,7 @@ def test_restart_recovers_exact_client_order_match_without_submit(tmp_path):
     repository.create_intent(order_intent)
     repository.transition_intent(order_intent.id, IntentStatus.RISK_APPROVED)
     repository.transition_intent(order_intent.id, IntentStatus.SUBMITTING)
-    repository.transition_leg(order_intent.legs[0].id, LegStatus.SUBMITTING)
+    repository.transition_leg(order_intent.legs[0].id, LegStatus.EXECUTING)
     repository.create_broker_order(
         broker_order_id="attempt",
         order_leg_id=order_intent.legs[0].id,

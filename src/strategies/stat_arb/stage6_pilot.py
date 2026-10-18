@@ -492,7 +492,7 @@ class Stage6PilotRunner:
                 continue
             if str(leg.get("status")) not in {
                 LegStatus.WORKING.value,
-                LegStatus.SUBMITTING.value,
+                LegStatus.EXECUTING.value,
             }:
                 continue
             if self.repository.broker_orders_for_leg(str(leg.get("id"))):
@@ -620,7 +620,7 @@ class Stage6PilotRunner:
             return snapshot, False, status
         if not attempts and status in {
             LegStatus.PLANNED.value,
-            LegStatus.SUBMITTING.value,
+            LegStatus.EXECUTING.value,
         }:
             return snapshot, False, "UNSUBMITTED"
         return snapshot, False, status or "UNKNOWN"

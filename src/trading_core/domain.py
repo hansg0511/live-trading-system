@@ -77,7 +77,10 @@ class IntentStatus(_ValueEnum):
 
 class LegStatus(_ValueEnum):
     PLANNED = "PLANNED"
-    SUBMITTING = "SUBMITTING"
+    # A leg represents the strategy's execution workflow, not a broker-side
+    # order. The durable broker attempt owns the separate PREPARED ->
+    # SUBMITTING dispatch boundary.
+    EXECUTING = "EXECUTING"
     WORKING = "WORKING"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"

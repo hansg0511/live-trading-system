@@ -67,7 +67,11 @@ PAIR_TOKEN_BASELINE_EXEMPTIONS = {
 # required by the v4 contract, not a generic strategy dependency. Keep the
 # exact normalized source blob pinned so any further OMS change requires an
 # explicit compatibility review/bump.
-CURRENT_GENERIC_OMS_V4_BLOB = "a69b2cd3d21ef987786011aa68e2591fd975d2fd"
+# The reviewed V4 safety contract is retained while atomic leg preparation
+# narrows the local pre-dispatch crash window.  Keep the exact reviewed OMS
+# source pinned so later execution changes still require a compatibility
+# review.
+CURRENT_GENERIC_OMS_V4_BLOB = "1e1ea6a1683de593d8f82229d0690131ffcd4d06"
 
 CURRENT_LEGACY_SMOKE_BLOBS = {
     "scripts/sim_smoke_test.py": "2fb7744b391e2e0621a1c2ef76742d3174a3af9d",

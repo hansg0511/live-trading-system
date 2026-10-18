@@ -50,7 +50,7 @@ class ScriptedBroker:
     """Controllable orders, fills, positions and unreliable broker observations.
 
     Do not use for price matching or profitability backtests: fills occur only
-    when the test explicitly calls fill_order.
+    when a test explicitly calls fill_order or queues ``immediate_fill``.
     """
 
     def __init__(
@@ -84,8 +84,8 @@ class ScriptedBroker:
             raise ValueError("wrong account")
 
     def queue_submit(self, behavior: str) -> None:
-        """Behaviors: accept, reject, pre_send_failure, or lost_ack."""
-        if behavior not in {"accept", "reject", "pre_send_failure", "lost_ack"}:
+        """Behaviors: accept, immediate_fill, reject, pre_send_failure, or lost_ack."""
+        if behavior not in {"accept", "immediate_fill", "reject", "pre_send_failure", "lost_ack"}:
             raise ValueError("invalid scripted submission behavior")
         self.submit_behaviors.append(behavior)
 
@@ -128,6 +128,17 @@ class ScriptedBroker:
         )
         if behavior == "lost_ack":
             raise TimeoutError("broker accepted order but its acknowledgment was lost")
+        if behavior == "immediate_fill":
+            self.fill_order(order.external_id, order.quantity, "500")
+            return BrokerSubmissionResult(
+                broker_order_id=request.broker_order_id,
+                accepted=True,
+                status=BrokerOrderStatus.FILLED,
+                external_order_id=order.external_id,
+                client_order_id=order.client_id,
+                submitted_at=self.clock(),
+                cumulative_filled_quantity=order.filled,
+            )
         return BrokerSubmissionResult(
             broker_order_id=request.broker_order_id,
             accepted=True,

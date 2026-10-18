@@ -164,7 +164,7 @@ def _seed_moomoo_sim_fill_recovery(tmp_path, mode: ExecutionEvidenceMode):
     repository.create_intent(intent)
     repository.transition_intent(intent.id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(intent.id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(intent.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(intent.legs[0].id, LegStatus.EXECUTING, now=NOW)
     repository.create_broker_order(
         broker_order_id="moomoo-sim-broker-order",
         order_leg_id=intent.legs[0].id,
@@ -575,7 +575,7 @@ def _seed_compensated_partial(repository: SQLiteTradingRepository):
     repository.transition_intent(entry_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(entry_id, IntentStatus.SUBMITTING, now=NOW)
     for leg in entry.legs:
-        repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+        repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
     repository.create_broker_order(
         broker_order_id="compensated-entry-order-a",
         order_leg_id=entry.legs[0].id,
@@ -643,7 +643,7 @@ def _seed_compensated_partial(repository: SQLiteTradingRepository):
     repository.create_intent(exit_intent)
     repository.transition_intent(exit_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(exit_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(exit_intent.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(exit_intent.legs[0].id, LegStatus.EXECUTING, now=NOW)
     repository.create_broker_order(
         broker_order_id="compensated-exit-order-a",
         order_leg_id=exit_intent.legs[0].id,
@@ -752,7 +752,7 @@ def _seed_stale_compensating_link(
     repository.create_intent(stale)
     repository.transition_intent(intent_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(intent_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(leg_id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(leg_id, LegStatus.EXECUTING, now=NOW)
     broker_order_id = f"{intent_id}-order"
     repository.create_broker_order(
         broker_order_id=broker_order_id,
@@ -997,7 +997,7 @@ def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_
     repository.create_intent(source)
     repository.transition_intent(source_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(source_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(source.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(source.legs[0].id, LegStatus.EXECUTING, now=NOW)
     repository.transition_leg(source.legs[1].id, LegStatus.CANCELLED, now=NOW)
 
     def add_filled_leg(intent: OrderIntent, leg: OrderLeg, external_id: str, price: str) -> BrokerOrderSnapshot:
@@ -1086,7 +1086,7 @@ def test_compensated_partial_exit_accepts_current_source_link_and_restores_book_
     repository.create_intent(compensation)
     repository.transition_intent(compensation_id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(compensation_id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(compensation.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(compensation.legs[0].id, LegStatus.EXECUTING, now=NOW)
     compensation_snapshot = add_filled_leg(
         compensation,
         compensation.legs[0],
@@ -1374,7 +1374,7 @@ def test_account_fact_gate_accepts_durable_fill_with_repository_instrument_metad
     repository.create_intent(intent)
     repository.transition_intent(intent.id, IntentStatus.RISK_APPROVED, now=NOW)
     repository.transition_intent(intent.id, IntentStatus.SUBMITTING, now=NOW)
-    repository.transition_leg(intent.legs[0].id, LegStatus.SUBMITTING, now=NOW)
+    repository.transition_leg(intent.legs[0].id, LegStatus.EXECUTING, now=NOW)
     repository.transition_leg(intent.legs[0].id, LegStatus.WORKING, now=NOW)
     repository.create_broker_order(
         broker_order_id="compat-broker-order",

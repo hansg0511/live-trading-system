@@ -233,6 +233,7 @@ class SQLiteTradingRepository:
         with self.transaction() as conn:
             conn.executescript(self.schema_path.read_text(encoding="utf-8"))
             self._migrate_stage4_book_columns_conn(conn)
+            self._migrate_legacy_leg_submitting_status_conn(conn)
             # Additive migration for databases created before event evidence
             # fingerprints had dedicated columns.  Provider metadata remains
             # untouched, including any values that happen to look like OMS
@@ -279,6 +280,25 @@ class SQLiteTradingRepository:
             )
             self._audit_legacy_duplicate_fills_conn(conn)
             self._audit_legacy_duplicate_broker_orders_conn(conn)
+
+    @staticmethod
+    def _migrate_legacy_leg_submitting_status_conn(conn: sqlite3.Connection) -> None:
+        """Translate the pre-atomic leg label without touching broker attempts.
+
+        Older databases used ``SUBMITTING`` for a leg before a broker attempt
+        existed.  The replacement ``EXECUTING`` describes that local workflow
+        state without implying that the distinct broker-order dispatch boundary
+        was crossed.  A durable broker order retains its own status unchanged.
+        """
+        conn.execute(
+            "UPDATE core_order_legs SET status = ? WHERE status = ?",
+            (LegStatus.EXECUTING.value, "SUBMITTING"),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO core_schema_migrations(version, applied_at, description)
+               VALUES (10, ?, ?)""",
+            (_timestamp(utc_now()), "Leg EXECUTING status and atomic prepared broker attempts"),
+        )
 
     @staticmethod
     def _migrate_stage4_book_columns_conn(conn: sqlite3.Connection) -> None:
@@ -1106,7 +1126,7 @@ class SQLiteTradingRepository:
             status.value
             for status in (
                 LegStatus.PLANNED,
-                LegStatus.SUBMITTING,
+                LegStatus.EXECUTING,
                 LegStatus.WORKING,
                 LegStatus.PARTIALLY_FILLED,
                 LegStatus.RECONCILIATION_REQUIRED,
@@ -1832,7 +1852,7 @@ class SQLiteTradingRepository:
             IntentStatus.RECONCILIATION_REQUIRED,
         ))
         active_legs = tuple(status.value for status in (
-            LegStatus.SUBMITTING,
+            LegStatus.EXECUTING,
             LegStatus.WORKING,
             LegStatus.PARTIALLY_FILLED,
             LegStatus.RECONCILIATION_REQUIRED,
@@ -2053,6 +2073,174 @@ class SQLiteTradingRepository:
                 ),
             )
         return attempt_number, resolved_client_order_id
+
+    def prepare_leg_execution_attempt(
+        self,
+        *,
+        order_leg_id: str,
+        account_id: str,
+        broker: str,
+        submitted_quantity: Decimal,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically enter leg execution and retain one prepared attempt.
+
+        ``BEGIN IMMEDIATE`` in :meth:`transaction` serializes concurrent
+        callers.  Therefore the attempt sequence and client-order identity are
+        derived only while the selected leg is locked.  A restart can reuse a
+        durable PREPARED attempt, but any attempt that may have crossed the
+        broker dispatch boundary is returned unchanged for the caller to
+        quarantine rather than retry.
+        """
+        timestamp = _timestamp(now or utc_now())
+        with self.transaction() as conn:
+            leg = conn.execute(
+                """SELECT l.status, i.account_id
+                   FROM core_order_legs l
+                   JOIN core_order_intents i ON i.id = l.intent_id
+                   WHERE l.id = ?""",
+                (order_leg_id,),
+            ).fetchone()
+            if leg is None:
+                raise KeyError(f"Unknown leg: {order_leg_id}")
+            if str(leg["account_id"]) != account_id:
+                raise ValueError("broker order account does not match intent account")
+
+            existing = conn.execute(
+                "SELECT * FROM core_broker_orders WHERE order_leg_id = ? ORDER BY attempt_number",
+                (order_leg_id,),
+            ).fetchall()
+            current_leg = LegStatus(str(leg["status"]))
+            if existing:
+                latest = dict(existing[-1])
+                # A legacy database can contain a durable PREPARED attempt
+                # with an older PLANNED label. Update those related records
+                # atomically; all newly written records are created together
+                # below.
+                if (
+                    str(latest["status"]) == BrokerOrderStatus.PREPARED.value
+                    and current_leg is LegStatus.PLANNED
+                ):
+                    validate_transition(
+                        current_leg,
+                        LegStatus.EXECUTING,
+                        LEG_TRANSITIONS,
+                        entity="leg",
+                    )
+                    conn.execute(
+                        "UPDATE core_order_legs SET status = ?, updated_at = ? WHERE id = ?",
+                        (LegStatus.EXECUTING.value, timestamp, order_leg_id),
+                    )
+                latest["created"] = False
+                return latest
+
+            if current_leg not in {LegStatus.PLANNED, LegStatus.EXECUTING}:
+                raise ValueError(f"cannot prepare attempt from leg status {current_leg.value}")
+            if current_leg is LegStatus.PLANNED:
+                validate_transition(
+                    current_leg,
+                    LegStatus.EXECUTING,
+                    LEG_TRANSITIONS,
+                    entity="leg",
+                )
+                conn.execute(
+                    "UPDATE core_order_legs SET status = ?, updated_at = ? WHERE id = ?",
+                    (LegStatus.EXECUTING.value, timestamp, order_leg_id),
+                )
+
+            attempt_number = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM core_broker_orders WHERE order_leg_id = ?",
+                    (order_leg_id,),
+                ).fetchone()[0]
+            )
+            client_order_id = f"{order_leg_id}:{attempt_number}"
+            broker_order_id = str(uuid.uuid4())
+            self._insert_prepared_broker_order_conn(
+                conn,
+                broker_order_id=broker_order_id,
+                order_leg_id=order_leg_id,
+                account_id=account_id,
+                broker=broker,
+                attempt_number=attempt_number,
+                client_order_id=client_order_id,
+                submitted_quantity=submitted_quantity,
+                timestamp=timestamp,
+            )
+            return {
+                "id": broker_order_id,
+                "order_leg_id": order_leg_id,
+                "account_id": account_id,
+                "broker": broker,
+                "attempt_number": attempt_number,
+                "client_order_id": client_order_id,
+                "status": BrokerOrderStatus.PREPARED.value,
+                "submitted_quantity": _decimal(submitted_quantity),
+                "created": True,
+            }
+
+    @staticmethod
+    def _insert_prepared_broker_order_conn(
+        conn: sqlite3.Connection,
+        *,
+        broker_order_id: str,
+        order_leg_id: str,
+        account_id: str,
+        broker: str,
+        attempt_number: int,
+        client_order_id: str,
+        submitted_quantity: Decimal,
+        timestamp: str,
+    ) -> None:
+        """Insert the attempt portion of the atomic preparation boundary."""
+        conn.execute(
+            """INSERT INTO core_broker_orders
+               (id, order_leg_id, account_id, broker, attempt_number, external_order_id,
+                client_order_id, status, submitted_quantity, submitted_at, updated_at,
+                replaces_broker_order_id, metadata_json)
+               VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, NULL, '{}')""",
+            (
+                broker_order_id,
+                order_leg_id,
+                account_id,
+                broker,
+                attempt_number,
+                client_order_id,
+                BrokerOrderStatus.PREPARED.value,
+                _decimal(submitted_quantity),
+                timestamp,
+            ),
+        )
+
+    def begin_prepared_broker_order_submission(
+        self,
+        broker_order_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Claim a PREPARED attempt's one-way dispatch boundary exactly once."""
+        timestamp = _timestamp(now or utc_now())
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT status FROM core_broker_orders WHERE id = ?",
+                (broker_order_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown broker order: {broker_order_id}")
+            current = BrokerOrderStatus(str(row["status"]))
+            if current is not BrokerOrderStatus.PREPARED:
+                return False
+            validate_transition(
+                current,
+                BrokerOrderStatus.SUBMITTING,
+                BROKER_ORDER_TRANSITIONS,
+                entity="broker order",
+            )
+            conn.execute(
+                "UPDATE core_broker_orders SET status = ?, updated_at = ? WHERE id = ?",
+                (BrokerOrderStatus.SUBMITTING.value, timestamp, broker_order_id),
+            )
+            return True
 
     def record_submission(
         self,

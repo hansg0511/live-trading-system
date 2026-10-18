@@ -150,7 +150,7 @@ def _seed(repository: SQLiteTradingRepository):
         for leg_index, leg in enumerate(legs):
             attempt_id = f"{intent_id}-attempt-{leg_index}"
             external_id = f"external-{intent_index}-{leg_index}"
-            repository.transition_leg(leg.id, LegStatus.SUBMITTING, now=NOW)
+            repository.transition_leg(leg.id, LegStatus.EXECUTING, now=NOW)
             repository.create_broker_order(
                 broker_order_id=attempt_id,
                 order_leg_id=leg.id,
