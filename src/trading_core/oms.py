@@ -10055,7 +10055,12 @@ class GenericOMS:
         self._startup_safety_audit()
         intent = self._required_intent(intent_id)
         if account.id != str(intent["account_id"]):
-            return self._recover_intent_with_facts(intent_id, account=account)
+            self._record_account_identity_mismatch(
+                            intent=intent,
+                            supplied_account_id=account.id,
+                            source="recover_intent",
+                        )
+            return self._required_intent(intent_id)
         canonical = self._canonical_account_for_intent(
             intent,
             supplied=account,
