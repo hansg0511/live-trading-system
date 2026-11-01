@@ -2848,6 +2848,102 @@ def test_aged_terminal_history_creates_durable_account_safety_block(tmp_path):
     )
 
 
+def _fill_stage3_intent_completely(repository, order_intent, attempts, clock):
+    """Persist fully owned, exact fills without relying on broker-side mocks."""
+    for index, (leg, attempt) in enumerate(zip(order_intent.legs, attempts)):
+        key = f"aged-complete-{index}"
+        assert repository.record_fill(
+            Fill(
+                id=key,
+                broker_order_id=attempt["id"],
+                order_leg_id=leg.id,
+                external_fill_id=key,
+                dedupe_key=key,
+                quantity=Decimal("10"),
+                price=Decimal("101"),
+                filled_at=clock(),
+                received_at=clock(),
+                account_id=account().id,
+                external_order_id=attempt["external_order_id"],
+                evidence_reference=key,
+            ),
+            now=clock(),
+            _validation_token=repository._fill_validation_capability(),
+        )
+    assert repository.get_intent(order_intent.id)["status"] == IntentStatus.FILLED.value
+
+
+@pytest.mark.parametrize("terminal_status", (IntentStatus.FILLED, IntentStatus.COMPLETED))
+def test_aged_fully_filled_intent_with_durable_proof_stays_closed(tmp_path, terminal_status):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    _fill_stage3_intent_completely(repository, order_intent, attempts, clock)
+    if terminal_status is IntentStatus.COMPLETED:
+        repository.transition_intent(order_intent.id, IntentStatus.COMPLETED, now=clock())
+    clock.advance(2 * 86_400)
+
+    # The records are still older than the polling window; proof, not age,
+    # is what prevents the history quarantine.
+    assert repository.expired_terminal_attempts(
+        account().id, now=clock(), terminal_window_seconds=86_400
+    )
+    result = oms.recovery_status(order_intent.id, account=account())
+
+    assert result["intent_status"] == terminal_status.value
+    assert not any(
+        issue["category"] == "TERMINAL_HISTORY_EXPIRED"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )
+    assert not any(
+        action["action_key"].startswith("TERMINAL_HISTORY_EXPIRED:")
+        for action in repository.recovery_actions_for_intent(order_intent.id)
+    )
+
+
+def test_aged_filled_intent_with_damaged_fill_provenance_stays_blocked(tmp_path):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    _fill_stage3_intent_completely(repository, order_intent, attempts, clock)
+    stored_fill = repository.fills_for_broker_order(attempts[0]["id"])[0]
+    damaged_metadata = dict(stored_fill["metadata"])
+    damaged_metadata.pop("_evidence_reference")
+    with repository.transaction() as conn:
+        conn.execute(
+            "UPDATE core_fills SET metadata_json = ? WHERE id = ?",
+            (json.dumps(damaged_metadata, sort_keys=True), stored_fill["id"]),
+        )
+    clock.advance(2 * 86_400)
+
+    result = oms.recovery_status(order_intent.id, account=account())
+
+    assert result["intent_status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert any(
+        issue["category"] == "TERMINAL_HISTORY_EXPIRED"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )
+
+
+def test_aged_filled_label_without_durable_fills_stays_blocked(tmp_path):
+    repository, adapter, oms, order_intent, attempts, clock = setup(tmp_path)
+    # Simulate an inconsistent legacy database: terminal labels without deals.
+    old = (clock() - timedelta(days=2)).isoformat()
+    with repository.transaction() as conn:
+        conn.execute(
+            "UPDATE core_broker_orders SET status = ?, updated_at = ? WHERE account_id = ?",
+            (BrokerOrderStatus.FILLED.value, old, account().id),
+        )
+        conn.execute(
+            "UPDATE core_order_intents SET status = ?, updated_at = ? WHERE id = ?",
+            (IntentStatus.FILLED.value, old, order_intent.id),
+        )
+
+    result = oms.recovery_status(order_intent.id, account=account())
+
+    assert result["intent_status"] == IntentStatus.RECONCILIATION_REQUIRED.value
+    assert any(
+        issue["category"] == "TERMINAL_HISTORY_EXPIRED"
+        for issue in repository.open_reconciliation_issues(account().id)
+    )
+
+
 def test_aged_definite_no_submit_rejection_does_not_create_history_blocker(tmp_path):
     class DefiniteRejectAdapter(RecoveryAdapter):
         def submit_order(self, _account: Account, request) -> BrokerSubmissionResult:

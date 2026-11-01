@@ -5321,7 +5321,10 @@ class GenericOMS:
             if f"TERMINAL_HISTORY_EXPIRED:{row['broker_order_id']}" not in resolved_action_keys
             and not (
                 account is not None
-                and self._expired_attempt_is_durable_no_submit(row, account)
+                and (
+                    self._expired_attempt_is_durable_no_submit(row, account)
+                    or self._expired_attempt_has_complete_fill_closure(row, account)
+                )
             )
         ]
         fresh_authoritative_facts_valid = False
@@ -5519,6 +5522,10 @@ class GenericOMS:
             # no-submit assertion remains subject to the normal age guard.
             if self._expired_attempt_is_durable_no_submit(row, account):
                 continue
+            # Age alone is not an execution ambiguity. A fully filled intent
+            # with exact, uniquely owned durable fill proof stays terminal.
+            if self._expired_attempt_has_complete_fill_closure(row, account):
+                continue
             intent_id = str(row["intent_id"])
             action_key = f"TERMINAL_HISTORY_EXPIRED:{row['broker_order_id']}"
             actions = self.repository.recovery_actions_for_intent(intent_id)
@@ -5558,6 +5565,67 @@ class GenericOMS:
                     "recovery_window_seconds": self.TERMINAL_RECOVERY_WINDOW_SECONDS,
                 },
             )
+
+    def _expired_attempt_has_complete_fill_closure(
+        self,
+        row: Mapping[str, object],
+        account: Account,
+    ) -> bool:
+        """Exclude ordinary proof-backed fills from the aged-history quarantine.
+
+        The 24-hour window limits automatic terminal polling; it does not
+        invalidate a completed execution ledger. Require every leg to have
+        one fully filled attempt and exact durable fills, then verify account,
+        unique provider-order ownership, and persisted fill provenance.
+        Missing or contradictory proof remains subject to quarantine.
+        """
+        if (
+            str(row.get("account_id")) != account.id
+            or str(row.get("intent_status")) not in {
+                IntentStatus.FILLED.value,
+                IntentStatus.COMPLETED.value,
+            }
+            or str(row.get("broker_order_status")) != BrokerOrderStatus.FILLED.value
+        ):
+            return False
+        intent_id = str(row.get("intent_id") or "")
+        try:
+            intent = self.repository.get_intent(intent_id)
+            if intent is None or str(intent.get("account_id")) != account.id:
+                return False
+            if not self._all_legs_have_fill_evidence(intent_id):
+                return False
+            for leg in intent["legs"]:
+                attempts = self.repository.broker_orders_for_leg(str(leg["id"]))
+                # _all_legs_have_fill_evidence enforces exactly one attempt.
+                attempt = attempts[0]
+                external_id = str(attempt.get("external_order_id") or "").strip()
+                if (
+                    str(attempt.get("account_id")) != account.id
+                    or str(attempt.get("broker")) != account.broker
+                    or not external_id
+                ):
+                    return False
+                claims = self.repository.broker_orders_for_external_order_id(external_id)
+                if len(claims) != 1 or str(claims[0]["id"]) != str(attempt["id"]):
+                    return False
+                fills = self.repository.fills_for_broker_order(str(attempt["id"]))
+                if not fills:
+                    return False
+                for fill in fills:
+                    dedupe_key = str(fill.get("dedupe_key") or "").strip()
+                    metadata = fill.get("metadata")
+                    if (
+                        str(fill.get("order_leg_id")) != str(leg["id"])
+                        or not dedupe_key
+                        or not isinstance(metadata, Mapping)
+                        or str(metadata.get("_external_order_id") or "") != external_id
+                        or str(metadata.get("_evidence_reference") or "") != f"{external_id}:{dedupe_key}"
+                    ):
+                        return False
+        except (IndexError, KeyError, InvalidOperation, TypeError, ValueError, sqlite3.Error):
+            return False
+        return True
 
     def _expired_attempt_is_durable_no_submit(
         self,
